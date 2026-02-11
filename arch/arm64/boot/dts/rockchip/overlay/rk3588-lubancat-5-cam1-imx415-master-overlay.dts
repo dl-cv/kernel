@@ -3,7 +3,6 @@
 
 #include <dt-bindings/usb/pd.h>
 #include <dt-bindings/gpio/gpio.h>
-#include <dt-bindings/pwm/pwm.h>
 #include <dt-bindings/pinctrl/rockchip.h>
 #include <dt-bindings/input/rk-input.h>
 #include <dt-bindings/display/drm_mipi_dsi.h>
@@ -12,7 +11,7 @@
 
 / {
 /* Link path: sensor->csi2_dphy1->mipi2_csi2->rkcif_mipi_lvds2--->rkcif_mipi_lvds2_sditf->rkisp0_vir2 */
-/* IMX415 cam1 从模式：由 PWM XVS/XHS 触发，echo 1 > /sys/bus/i2c/devices/.../trigger 拍一帧 */
+/* IMX415 cam1 主模式：传感器内部生成帧同步，连续输出 */
 	fragment@0 {
 		target = <&i2c5>;
 		__overlay__ {
@@ -24,14 +23,8 @@
 		target = <&dcphy1_imx415>;
 		__overlay__ {
 			status = "okay";
-			rockchip,camera-module-sync-mode = "slave";
+			rockchip,camera-module-sync-mode = "internal_master";
 			rockchip,camera-module-mclk-always-on;
-			pwm-names = "xvs", "xhs";
-			/* 4K@30: VMAX=2250 => XVS period ~= XHS period * 2250 */
-			pwms = <&pwm14 0 33333750 PWM_POLARITY_INVERTED>,
-			       <&pwm15 0 14815 PWM_POLARITY_INVERTED>;
-			rockchip,xvs-duty-ns = <50000>;
-			rockchip,xhs-duty-ns = <500>;
 		};
 	};
 
@@ -114,26 +107,4 @@
 			status = "okay";
 		};
 	};
-
-	/* Enable PWMs for XVS/XHS trigger output (default: disabled in rk3588s.dtsi). */
-	fragment@12 {
-		target = <&pwm14>;
-
-		__overlay__ {
-			status = "okay";
-			pinctrl-names = "active";
-			pinctrl-0 = <&pwm14m2_pins>;
-		};
-	};
-
-	fragment@13 {
-		target = <&pwm15>;
-
-		__overlay__ {
-			status = "okay";
-			pinctrl-names = "active";
-			pinctrl-0 = <&pwm15m3_pins>;
-		};
-	};
 };
-

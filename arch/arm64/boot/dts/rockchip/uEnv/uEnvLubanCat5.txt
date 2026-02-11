@@ -56,8 +56,12 @@ dtoverlay=/dtb/overlay/rk3588-lubancat-5-hdmi1-vp2-overlay.dtbo
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam0-gc08a8-3264x2448-30fps-overlay.dtbo
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam0-gc2053-1920x1080-30fps-overlay.dtbo
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam0-gc4653-2560x1440-30fps-overlay.dtbo
-# cam1
+# cam1 IMX415（主/从二选一，不可同时加载）
+# 从模式：外部 XVS/XHS 触发，echo 1 > /sys/.../trigger 拍一帧
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam1-imx415-overlay.dtbo
+# 主模式：传感器内部连续出图
+#dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam1-imx415-master-overlay.dtbo
+# cam1 其他
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam1-imx415-1080p-overlay.dtbo
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam1-ov8858-3264x2448-15fps-overlay.dtbo
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5-cam1-ov8858-1632x1224-30fps-overlay.dtbo

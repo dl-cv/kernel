@@ -2142,15 +2142,54 @@ static struct pwm_device *imx415_devm_pwm_get_optional(struct device *dev,
 	return pwm;
 }
 
+/*
+ * ---------- XHS / XVS PWM helpers (slave trigger mode) ----------
+ *
+ * Design:
+ *   XHS – kept running continuously while streaming (line sync clock).
+ *   XVS – kept *enabled* at duty_cycle=0 (idle/silent).  To emit a pulse we
+ *          momentarily set duty_cycle=xvs_duty_ns, sleep for the duty period,
+ *          then set duty_cycle back to 0.  Keeping the PWM always enabled
+ *          avoids the RK3588 PWM "first cycle lost on re-enable" hardware
+ *          quirk that previously caused the second XVS pulse to be swallowed.
+ *
+ * Frame timing:
+ *   frame_ns is derived (in order of priority) from:
+ *     1) xhs_period * VTS   (most accurate)
+ *     2) DT xvs_pwm period  (DT encodes ~one frame worth of period)
+ *     3) mode fps            (last resort)
+ */
+
+/* Retrieve a reliable period for a PWM (state > args > 0). */
+static u64 imx415_pwm_period_ns(struct pwm_device *pwm)
+{
+	struct pwm_state st;
+	struct pwm_args ar;
+
+	if (!pwm)
+		return 0;
+	pwm_get_state(pwm, &st);
+	if (st.period)
+		return st.period;
+	pwm_get_args(pwm, &ar);
+	return ar.period;
+}
+
 static int imx415_set_xhs_pwm(struct imx415 *imx415, bool enable)
 {
 	struct pwm_state state;
+	struct pwm_args args;
 	int ret;
 
 	if (!imx415->xhs_pwm)
 		return 0;
 
-	pwm_init_state(imx415->xhs_pwm, &state);
+	pwm_get_state(imx415->xhs_pwm, &state);
+	pwm_get_args(imx415->xhs_pwm, &args);
+	if (!state.period && args.period)
+		state.period = args.period;
+	state.polarity = args.polarity;
+
 	if (enable) {
 		state.duty_cycle = imx415->xhs_duty_ns;
 		state.enabled = true;
@@ -2162,61 +2201,115 @@ static int imx415_set_xhs_pwm(struct imx415 *imx415, bool enable)
 	ret = pwm_apply_state(imx415->xhs_pwm, &state);
 	if (!ret)
 		imx415->xhs_pwm_enabled = enable;
-
 	return ret;
 }
 
-static int imx415_pulse_xvs_pwm(struct imx415 *imx415)
+/* Enable XVS PWM in "silent" state (duty=0) so it is ready for instant pulses. */
+static int imx415_xvs_pwm_arm(struct imx415 *imx415)
+{
+	struct pwm_state state;
+	struct pwm_args args;
+
+	if (!imx415->xvs_pwm)
+		return -ENODEV;
+
+	pwm_get_state(imx415->xvs_pwm, &state);
+	pwm_get_args(imx415->xvs_pwm, &args);
+	if (!state.period && args.period)
+		state.period = args.period;
+	state.polarity = args.polarity;
+	state.duty_cycle = 0;
+	state.enabled = true;
+	return pwm_apply_state(imx415->xvs_pwm, &state);
+}
+
+static void imx415_xvs_pwm_disarm(struct imx415 *imx415)
+{
+	struct pwm_state state;
+
+	if (!imx415->xvs_pwm)
+		return;
+
+	pwm_get_state(imx415->xvs_pwm, &state);
+	state.duty_cycle = 0;
+	state.enabled = false;
+	pwm_apply_state(imx415->xvs_pwm, &state);
+}
+
+/*
+ * Emit one XVS pulse.  The PWM must already be armed (enabled, duty=0).
+ * We set duty→active, sleep through the pulse, then set duty→0 again.
+ * Because the PWM stays enabled the whole time, the hardware counter is never
+ * reset and every duty change takes effect on the very next cycle boundary.
+ */
+static int imx415_pulse_xvs(struct imx415 *imx415)
 {
 	struct pwm_state state;
 	u32 duty_ns;
 	u32 wait_us;
-	u64 period_us;
 	int ret;
 
 	if (!imx415->xvs_pwm)
 		return -ENODEV;
 
-	pwm_init_state(imx415->xvs_pwm, &state);
+	pwm_get_state(imx415->xvs_pwm, &state);
 	duty_ns = imx415->xvs_duty_ns;
 	if (!duty_ns)
 		duty_ns = IMX415_XVS_DUTY_NS_DEFAULT;
-
 	if (state.period && duty_ns >= state.period)
 		return -EINVAL;
 
+	/* Activate the pulse. */
 	state.duty_cycle = duty_ns;
-	state.enabled = true;
 	ret = pwm_apply_state(imx415->xvs_pwm, &state);
 	if (ret)
 		return ret;
 
-	/*
-	 * We only need a single XVS pulse. The PWM runs periodically when enabled,
-	 * so we disable it before the next period to avoid extra pulses.
-	 */
-	period_us = div_u64(state.period, 1000);
-	wait_us = DIV_ROUND_UP(duty_ns, 1000) + 20;
-	if (wait_us < 50)
-		wait_us = 50;
-	if (period_us && wait_us >= period_us)
-		wait_us = (period_us > 1) ? (u32)(period_us - 1) : 1;
+	/* Wait for the active portion to complete. */
+	wait_us = DIV_ROUND_UP(duty_ns, 1000) + 30;
+	if (wait_us < 80)
+		wait_us = 80;
+	usleep_range(wait_us, wait_us + 30);
 
-	usleep_range(wait_us, wait_us + 20);
-
+	/* Go silent again. */
 	state.duty_cycle = 0;
-	state.enabled = false;
 	return pwm_apply_state(imx415->xvs_pwm, &state);
 }
 
-static int imx415_trigger_one_frame_locked(struct imx415 *imx415)
+/* Compute one-frame duration in ns. */
+static u64 imx415_frame_ns(struct imx415 *imx415)
 {
-	u32 xhs_count;
+	u64 xhs_period, xvs_period, frame;
+	u32 vts;
+
+	/* Method 1: VTS * XHS period. */
+	vts = imx415->cur_vts ? imx415->cur_vts : imx415->cur_mode->vts_def;
+	xhs_period = imx415_pwm_period_ns(imx415->xhs_pwm);
+	if (xhs_period) {
+		frame = (u64)vts * xhs_period;
+		if (frame)
+			return frame;
+	}
+
+	/* Method 2: DT XVS period (configured as ~one frame). */
+	xvs_period = imx415_pwm_period_ns(imx415->xvs_pwm);
+	if (xvs_period)
+		return xvs_period;
+
+	/* Method 3: mode fps. */
+	if (imx415->cur_mode->max_fps.denominator)
+		return div_u64((u64)imx415->cur_mode->max_fps.numerator *
+			       1000000000ULL,
+			       imx415->cur_mode->max_fps.denominator);
+
+	return 33333333ULL; /* 30fps fallback */
+}
+
+static int imx415_trigger_locked(struct imx415 *imx415, unsigned int pulses)
+{
+	u64 frame, t0;
+	unsigned int i;
 	int ret;
-	struct pwm_state xhs_state;
-	u64 frame_ns;
-	u32 frame_us;
-	u64 t0_ns;
 
 	if (imx415->dt_sync_mode != SLAVE_MODE)
 		return -EINVAL;
@@ -2224,72 +2317,53 @@ static int imx415_trigger_one_frame_locked(struct imx415 *imx415)
 		return -EBUSY;
 	if (!imx415->xvs_pwm)
 		return -ENODEV;
+	if (!pulses || pulses > 4)
+		pulses = 1;
 
-	/*
-	 * One frame requires exactly VMAX(VTS) lines worth of XHS pulses.
-	 * For the default 4K@30 mode: VTS = 0x08ca = 2250 (see mode->vts_def).
-	 */
-	xhs_count = imx415->cur_vts ? imx415->cur_vts : imx415->cur_mode->vts_def;
+	frame = imx415_frame_ns(imx415);
 
-	/*
-	 * Keep XHS running continuously (line sync). Each trigger outputs one XVS
-	 * pulse. The required XHS count per frame is VMAX/VTS (default 2250).
-	 *
-	 * To guarantee the "XHS count per frame" relationship when triggering
-	 * multiple times, enforce a minimum interval of one frame between triggers.
-	 */
+	/* Ensure XHS is running. */
 	if (imx415->xhs_pwm && !imx415->xhs_pwm_enabled) {
 		ret = imx415_set_xhs_pwm(imx415, true);
 		if (ret)
 			return ret;
 	}
 
-	pwm_init_state(imx415->xhs_pwm, &xhs_state);
-	frame_ns = (u64)xhs_count * xhs_state.period;
-	frame_us = (u32)DIV_ROUND_UP_ULL(frame_ns, 1000);
+	/* Honour minimum interval since last trigger. */
+	if (imx415->last_trigger_ns && frame) {
+		u64 elapsed = ktime_get_ns() - imx415->last_trigger_ns;
 
-	if (imx415->xhs_pwm_enabled) {
-		u64 now_ns;
+		if (elapsed < frame) {
+			u32 wait = (u32)DIV_ROUND_UP_ULL(frame - elapsed, 1000);
 
-		now_ns = ktime_get_ns();
-		if (imx415->last_trigger_ns && frame_ns &&
-		    now_ns - imx415->last_trigger_ns < frame_ns) {
-			u64 remain_ns = frame_ns - (now_ns - imx415->last_trigger_ns);
-			u32 remain_us = (u32)DIV_ROUND_UP_ULL(remain_ns, 1000);
-
-			if (remain_us)
-				usleep_range(remain_us, remain_us + 200);
+			if (wait)
+				usleep_range(wait, wait + 200);
 		}
 	}
 
-	/*
-	 * Some external sync setups require two XVS edges to delimit a complete
-	 * frame (between consecutive XVS pulses). Emit a second XVS pulse after
-	 * one frame interval so that a full frame can be generated/captured.
-	 */
-	t0_ns = ktime_get_ns();
-	ret = imx415_pulse_xvs_pwm(imx415);
-	if (!ret) {
-		imx415->trigger_count++;
+	for (i = 0; i < pulses; i++) {
+		t0 = ktime_get_ns();
+		ret = imx415_pulse_xvs(imx415);
+		if (ret)
+			return ret;
 		imx415->last_trigger_ns = ktime_get_ns();
-	}
 
-	if (!ret && imx415_use_pwm_trigger(imx415) && frame_ns) {
-		u64 now_ns = ktime_get_ns();
+		/* Inter-pulse gap: one frame period. */
+		if (i + 1 < pulses && frame) {
+			u64 elapsed = ktime_get_ns() - t0;
 
-		if (now_ns - t0_ns < frame_ns) {
-			u64 remain_ns = frame_ns - (now_ns - t0_ns);
-			u32 remain_us = (u32)DIV_ROUND_UP_ULL(remain_ns, 1000);
-
-			if (remain_us < 1000)
-				remain_us = 1000;
-			usleep_range(remain_us, remain_us + 500);
+			if (elapsed < frame) {
+				u32 wait = (u32)DIV_ROUND_UP_ULL(
+						frame - elapsed, 1000);
+				if (wait < 1000)
+					wait = 1000;
+				usleep_range(wait, wait + 500);
+			}
 		}
-
-		ret = imx415_pulse_xvs_pwm(imx415);
 	}
 
-	return ret;
+	imx415->trigger_count++;
+	return 0;
 }
 
 static ssize_t trigger_store(struct device *dev,
@@ -2308,7 +2382,11 @@ static ssize_t trigger_store(struct device *dev,
 		return count;
 
 	mutex_lock(&imx415->mutex);
-	ret = imx415_trigger_one_frame_locked(imx415);
+	/*
+	 * echo 1 > trigger  →  1 XVS pulse  (normal single-frame trigger)
+	 * echo 2 > trigger  →  2 XVS pulses (for testing / "bracket" capture)
+	 */
+	ret = imx415_trigger_locked(imx415, val);
 	mutex_unlock(&imx415->mutex);
 
 	return ret ? ret : count;
@@ -3256,6 +3334,10 @@ static int __imx415_start_stream(struct imx415 *imx415)
 		ret = imx415_set_xhs_pwm(imx415, true);
 		if (ret)
 			return ret;
+		/* Arm XVS in silent state so pulses are instant later. */
+		ret = imx415_xvs_pwm_arm(imx415);
+		if (ret)
+			return ret;
 	}
 
 	/*
@@ -3265,8 +3347,22 @@ static int __imx415_start_stream(struct imx415 *imx415)
 	 * may cause the XVS pulse to be ignored and prevents frame output.
 	 */
 	imx415->trigger_armed = imx415_use_pwm_trigger(imx415);
-	return imx415_write_reg(imx415->client, IMX415_REG_CTRL_MODE,
-				IMX415_REG_VALUE_08BIT, IMX415_MODE_STREAMING);
+	imx415->trigger_count = 0;
+	ret = imx415_write_reg(imx415->client, IMX415_REG_CTRL_MODE,
+			       IMX415_REG_VALUE_08BIT, IMX415_MODE_STREAMING);
+	if (ret)
+		return ret;
+
+	/*
+	 * In slave/trigger mode, exposure and gain take effect on the next frame
+	 * (n+1). To avoid the first trigger outputting a frame with default
+	 * exposure (white or black), force the first trigger to wait at least one
+	 * frame period so that the frame we output has valid exposure.
+	 */
+	if (imx415_use_pwm_trigger(imx415) || imx415->sync_mode == SLAVE_MODE)
+		imx415->last_trigger_ns = ktime_get_ns();
+
+	return 0;
 }
 
 static int __imx415_stop_stream(struct imx415 *imx415)
@@ -3278,9 +3374,12 @@ static int __imx415_stop_stream(struct imx415 *imx415)
 		imx415->is_first_streamoff = true;
 	ret = imx415_write_reg(imx415->client, IMX415_REG_CTRL_MODE,
 			       IMX415_REG_VALUE_08BIT, 1);
-	if (imx415->sync_mode == SLAVE_MODE)
+	if (imx415_use_pwm_trigger(imx415) || imx415->sync_mode == SLAVE_MODE) {
+		imx415_xvs_pwm_disarm(imx415);
 		imx415_set_xhs_pwm(imx415, false);
+	}
 	imx415->trigger_armed = false;
+	imx415->trigger_count = 0;
 	return ret;
 }
 
@@ -3595,7 +3694,7 @@ static int imx415_set_ctrl(struct v4l2_ctrl *ctrl)
 	u32 shr0 = 0;
 
 	if (ctrl->id == V4L2_CID_IMX415_USER_TRIGGER)
-		return imx415_trigger_one_frame_locked(imx415);
+		return imx415_trigger_locked(imx415, 1);
 
 	/* Propagate change of current control to all related controls */
 	switch (ctrl->id) {
@@ -3907,6 +4006,14 @@ static int imx415_probe(struct i2c_client *client,
 	if (IS_ERR(imx415->xhs_pwm))
 		return dev_err_probe(dev, PTR_ERR(imx415->xhs_pwm),
 				     "Failed to get xhs pwm\n");
+	/*
+	 * Make sure DT PWM args (period/polarity) are applied, even when the PWM
+	 * is currently disabled and the provider reports an empty state.
+	 */
+	if (imx415->xvs_pwm)
+		pwm_apply_args(imx415->xvs_pwm);
+	if (imx415->xhs_pwm)
+		pwm_apply_args(imx415->xhs_pwm);
 
 	ret = of_property_read_u32(node, DATA_LANES, &imx415->lanes);
 	if (ret) {
