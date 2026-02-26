@@ -112,7 +112,14 @@
  #define OF_FSIN_PULSE_US		"rockchip,fsin-pulse-us"
  #define OS08A20_FSIN_PULSE_US_DEFAULT	50u
 #define OF_FSIN_SETTLE_US		"rockchip,fsin-settle-us"
-#define OS08A20_FSIN_SETTLE_US_DEFAULT	200u
+/*
+ * Time to wait after enabling streaming and before asserting FSIN.
+ *
+ * Some receiver pipelines may miss the first frame if FSIN is asserted too
+ * early after toggling 0x0100 (MIPI/PLL/DPHY needs time to become stable),
+ * leading to "sometimes need multiple triggers for one frame".
+ */
+#define OS08A20_FSIN_SETTLE_US_DEFAULT	5000u
 
 /* Optional timing knobs for single-frame trigger */
 #define OF_TRIGGER_FRAME_WAIT_US	"rockchip,trigger-frame-wait-us"
@@ -365,6 +372,7 @@
  {
 	 u64 frame_ns;
 	 u32 frame_us;
+	u32 frame_interval_us;
 	u32 settle_us;
 	u32 vblank_val = 0;
 	u32 vts_now = 0;
@@ -430,8 +438,16 @@
  
 	if (os08a20->trigger_frame_wait_us)
 		base_wait_us = os08a20->trigger_frame_wait_us;
-	else
-		base_wait_us = (u32)DIV_ROUND_UP_ULL(frame_ns, 1000);
+	else {
+		/*
+		 * Wait long enough to cover worst-case phase between the FSIN edge
+		 * and the next frame start, plus one full frame. This improves the
+		 * reliability of "single echo -> single frame" when the sensor
+		 * needs up to 1 frame latency to lock to FSIN/start output.
+		 */
+		frame_interval_us = (u32)DIV_ROUND_UP_ULL(frame_ns, 1000);
+		base_wait_us = frame_interval_us * 2;
+	}
 
 	frame_us = base_wait_us + os08a20->trigger_frame_margin_us;
 	 if (frame_us < 1000)
@@ -452,11 +468,12 @@
 		}
 
 		dev_info(&client->dev,
-			 "trigger capture: OK (count=%u wait_us=%u base_wait_us=%u margin_us=%u vblank=%u vts=%u)\n",
+			 "trigger capture: OK (count=%u wait_us=%u base_wait_us=%u margin_us=%u settle_us=%u vblank=%u vts=%u)\n",
 			 os08a20->trigger_count,
 			 frame_us,
 			 base_wait_us,
 			 os08a20->trigger_frame_margin_us,
+			 settle_us,
 			 vblank_val,
 			 vts_now);
 	} else {

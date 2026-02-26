@@ -163,6 +163,7 @@ dtbo-$(CONFIG_CPU_RK3588) += \
 	rk3588-lubancat-5io-cam3-gc4653-2560x1440-30fps-overlay.dtbo \
 	rk3588-lubancat-5io-cam4-gc4653-2560x1440-30fps-overlay.dtbo \
 	rk3588-lubancat-5io-cam5-gc4653-2560x1440-30fps-overlay.dtbo \
+	rk3588-lubancat-5io-cam1-imx415-overlay.dtbo \
 	rk3588-lubancat-5io-cam0-imx415-3840x2160-30fps-overlay.dtbo \
 	rk3588-lubancat-5io-cam1-imx415-3840x2160-30fps-overlay.dtbo \
 	rk3588-lubancat-5io-cam2-imx415-3840x2160-15fps-overlay.dtbo \
