@@ -180,6 +180,13 @@
 #define IMX415_REG_XVS_XHS_DRV		0x30C1 /* [3:2]=XHS, [1:0]=XVS */
 #define IMX415_XMASTER_MASK		BIT(0)
 #define IMX415_XVS_XHS_DRV_MASK		0x0f
+/*
+ * XVS/XHS drive states (XVS_DRV/XHS_DRV 2-bit fields).
+ * - 3h: Hi-Z (used in slave mode to avoid conflicts with external driver)
+ * - 1h: Reception state (low level) — requested for master mode switch
+ */
+#define IMX415_XVS_XHS_DRV_HIZ		IMX415_XVS_XHS_DRV_MASK
+#define IMX415_XVS_XHS_DRV_RX_LOW	0x05 /* XVS=1, XHS=1 */
 
 /* Basic Readout Lines. Number of necessary readout lines in sensor */
 #define BRL_ALL				2228u
@@ -290,7 +297,7 @@ static inline bool imx415_use_pwm_trigger(const struct imx415 *imx415)
 	 * Treat "SLAVE_MODE + xvs pwm bound" as the explicit single-frame trigger
 	 * configuration (board uses PWM14/PWM15 as XVS/XHS).
 	 */
-	return imx415->dt_sync_mode == SLAVE_MODE && imx415->xvs_pwm;
+	return imx415->sync_mode == SLAVE_MODE && imx415->xvs_pwm;
 }
 
 static struct rkmodule_csi_dphy_param dcphy_param = {
@@ -2101,19 +2108,32 @@ static int imx415_apply_sync_mode_regs(struct imx415 *imx415)
 	u8 xmaster = 0;
 	u8 xvs_xhs_drv = 0;
 	int ret;
-	bool slave;
 
 	/*
 	 * SLAVE_MODE:
 	 * - XMASTER bit0 = 1
 	 * - XVS/XHS drv = Hi-Z (both set to 3) => 0x30C1[3:0] = 0b1111
 	 *
-	 * Other modes(default/master): clear these bits.
+	 * Master modes:
+	 * - XMASTER bit0 = 0
+	 * - XVS/XHS drv = reception state (low level) => 0x30C1[3:0] = 0b0101
+	 *
+	 * NO_SYNC_MODE:
+	 * - Keep default settings (XVS/XHS output) => 0x30C1[3:0] = 0b0000
 	 */
-	slave = imx415_use_pwm_trigger(imx415) || imx415->sync_mode == SLAVE_MODE;
-	if (slave) {
+	switch (imx415->sync_mode) {
+	case SLAVE_MODE:
 		xmaster = IMX415_XMASTER_MASK;
-		xvs_xhs_drv = IMX415_XVS_XHS_DRV_MASK;
+		xvs_xhs_drv = IMX415_XVS_XHS_DRV_HIZ;
+		break;
+	case INTERNAL_MASTER_MODE:
+	case EXTERNAL_MASTER_MODE:
+		xvs_xhs_drv = IMX415_XVS_XHS_DRV_RX_LOW;
+		break;
+	case NO_SYNC_MODE:
+	default:
+		xvs_xhs_drv = 0;
+		break;
 	}
 
 	ret = imx415_update_bits(imx415->client, IMX415_REG_XMASTER,
@@ -2123,6 +2143,96 @@ static int imx415_apply_sync_mode_regs(struct imx415 *imx415)
 
 	return imx415_update_bits(imx415->client, IMX415_REG_XVS_XHS_DRV,
 				  IMX415_XVS_XHS_DRV_MASK, xvs_xhs_drv);
+}
+
+static int imx415_set_xhs_pwm(struct imx415 *imx415, bool enable);
+
+static int imx415_set_sync_mode_locked(struct imx415 *imx415,
+				       enum rkmodule_sync_mode mode)
+{
+	enum rkmodule_sync_mode old = imx415->sync_mode;
+	bool old_slave = old == SLAVE_MODE;
+	bool new_slave = mode == SLAVE_MODE;
+	int ret;
+
+	switch (mode) {
+	case NO_SYNC_MODE:
+	case EXTERNAL_MASTER_MODE:
+	case INTERNAL_MASTER_MODE:
+	case SLAVE_MODE:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (old == mode)
+		return 0;
+
+	/*
+	 * If not streaming, just update the cached mode. The registers will be
+	 * applied on the next stream-on path.
+	 */
+	if (!imx415->streaming) {
+		imx415->sync_mode = mode;
+		imx415->trigger_armed = imx415_use_pwm_trigger(imx415);
+		imx415->trigger_count = 0;
+		return 0;
+	}
+
+	/* Enter standby to safely switch XMASTER / XVS-XHS settings. */
+	ret = imx415_write_reg(imx415->client, IMX415_REG_CTRL_MODE,
+			       IMX415_REG_VALUE_08BIT, IMX415_MODE_SW_STANDBY);
+	if (ret)
+		return ret;
+
+	/* Stop XHS PWM when leaving slave mode to avoid pin conflicts. */
+	if (old_slave && !new_slave) {
+		ret = imx415_set_xhs_pwm(imx415, false);
+		if (ret)
+			goto out_restore_old;
+	}
+
+	imx415->sync_mode = mode;
+
+	ret = imx415_apply_sync_mode_regs(imx415);
+	if (ret)
+		goto out_restore_old;
+
+	if (new_slave) {
+		ret = imx415_set_xhs_pwm(imx415, true);
+		if (ret)
+			goto out_restore_old;
+
+		/*
+		 * In slave/trigger mode, exposure and gain take effect on the
+		 * next frame (n+1). Ensure the first trigger waits at least one
+		 * frame period so that the output frame has valid exposure.
+		 */
+		imx415->last_trigger_ns = ktime_get_ns();
+	}
+
+	imx415->trigger_armed = imx415_use_pwm_trigger(imx415);
+	imx415->trigger_count = 0;
+
+	ret = imx415_write_reg(imx415->client, IMX415_REG_CTRL_MODE,
+			       IMX415_REG_VALUE_08BIT, IMX415_MODE_STREAMING);
+	if (ret)
+		goto out_restore_old;
+
+	return 0;
+
+out_restore_old:
+	imx415->sync_mode = old;
+	imx415_apply_sync_mode_regs(imx415);
+	if (old_slave)
+		imx415_set_xhs_pwm(imx415, true);
+	else
+		imx415_set_xhs_pwm(imx415, false);
+	imx415->trigger_armed = imx415_use_pwm_trigger(imx415);
+	imx415->trigger_count = 0;
+	imx415_write_reg(imx415->client, IMX415_REG_CTRL_MODE,
+			 IMX415_REG_VALUE_08BIT, IMX415_MODE_STREAMING);
+	return ret;
 }
 
 static struct pwm_device *imx415_devm_pwm_get_optional(struct device *dev,
@@ -2300,7 +2410,7 @@ static int imx415_trigger_locked(struct imx415 *imx415, unsigned int pulses)
 	u64 xhs_period_ns = 0;
 	u64 xvs_period_ns = 0;
 
-	if (imx415->dt_sync_mode != SLAVE_MODE)
+	if (imx415->sync_mode != SLAVE_MODE)
 		return -EINVAL;
 	if (!imx415->streaming)
 		return -EBUSY;
@@ -2400,8 +2510,53 @@ static ssize_t trigger_store(struct device *dev,
 
 static DEVICE_ATTR_WO(trigger);
 
+static ssize_t master_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx415 *imx415 = to_imx415(sd);
+	bool master;
+
+	mutex_lock(&imx415->mutex);
+	master = imx415->sync_mode != SLAVE_MODE;
+	mutex_unlock(&imx415->mutex);
+
+	return sysfs_emit(buf, "%u\n", master ? 1 : 0);
+}
+
+static ssize_t master_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx415 *imx415 = to_imx415(sd);
+	unsigned int val;
+	int ret;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	if (val > 1)
+		return -EINVAL;
+
+	mutex_lock(&imx415->mutex);
+	/*
+	 * echo 1 > master  -> switch to master mode (internal_master)
+	 * echo 0 > master  -> switch to slave mode
+	 */
+	ret = imx415_set_sync_mode_locked(imx415,
+					  val ? INTERNAL_MASTER_MODE : SLAVE_MODE);
+	mutex_unlock(&imx415->mutex);
+
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(master);
+
 static struct attribute *imx415_attrs[] = {
 	&dev_attr_trigger.attr,
+	&dev_attr_master.attr,
 	NULL
 };
 
@@ -3125,9 +3280,9 @@ static long imx415_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		*((u32 *)arg) = imx415_use_pwm_trigger(imx415) ? SLAVE_MODE : imx415->sync_mode;
 		break;
 	case RKMODULE_SET_SYNC_MODE:
-		/* In PWM trigger mode, sync_mode is fixed by DT (slave). */
-		if (!imx415_use_pwm_trigger(imx415))
-			imx415->sync_mode = *((u32 *)arg);
+		mutex_lock(&imx415->mutex);
+		ret = imx415_set_sync_mode_locked(imx415, *((u32 *)arg));
+		mutex_unlock(&imx415->mutex);
 		break;
 	case RKMODULE_GET_CSI_DPHY_PARAM:
 		if (imx415->cur_mode->hdr_mode == HDR_X2) {
