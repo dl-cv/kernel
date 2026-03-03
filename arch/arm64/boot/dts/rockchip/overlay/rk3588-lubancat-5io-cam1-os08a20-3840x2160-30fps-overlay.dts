@@ -32,16 +32,10 @@
 
 			/* Pulse width in microseconds (logical active time) */
 			rockchip,fsin-pulse-us = <50>;
-			/*
-			 * 触发时序调参（可选）：
-			 * - rockchip,fsin-settle-us：打 FSIN 脉冲前的等待(us)，默认 200
-			 * - rockchip,trigger-frame-margin-us：FSIN 后额外等待(us)，默认 0
-			 * - rockchip,trigger-frame-wait-us：覆盖等待一帧时间(us)，默认 0=自动
-			 */
-			//rockchip,fsin-settle-us = <200>;
-			//rockchip,trigger-frame-margin-us = <5000>;
-			//rockchip,trigger-frame-wait-us = <0>;
+			/* 触发间隔完全由外部输入控制 */
+			/* 默认曝光行数，用于 V4L2 曝光控件初始值（单位：行） */
 			rockchip,default-exposure = <30>;
+			/* 默认模拟增益，1024=1.0x，用于 V4L2 增益控件初始值 */
 			rockchip,default-analogue-gain = <1024>;
 		};
 	};
