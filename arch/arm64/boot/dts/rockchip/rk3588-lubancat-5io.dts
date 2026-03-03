@@ -357,6 +357,9 @@
 		compatible = "pwm-fan";
 		#cooling-cells = <2>;
 		pwms = <&pwm11 0 10000000 0>;
+		/* 默认中等转速(128/255)；终端可写 /sys/class/hwmon/hwmonX/pwm1 调速，manual_mode=1 时温控不覆盖 */
+		default-pwm = <128>;
+		pulses-per-revolution = <2>;
 		cooling-levels = <0 50 100 200 255>;
 		rockchip,temp-trips = <
 			40000	1

@@ -48,6 +48,7 @@ struct pwm_fan_ctx {
 	struct notifier_block thermal_nb;
 	struct thermal_trips *thermal_trips;
 	bool thermal_notifier_is_ok;
+	bool manual_mode;	/* when true, thermal notifier does not override pwm1 */
 };
 
 /* This handler assumes self resetting edge triggered interrupt. */
@@ -146,12 +147,37 @@ static ssize_t rpm_show(struct device *dev,
 	return sprintf(buf, "%u\n", ctx->rpm);
 }
 
+static ssize_t manual_mode_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%u\n", ctx->manual_mode ? 1 : 0);
+}
+
+static ssize_t manual_mode_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+	unsigned long val;
+
+	if (kstrtoul(buf, 10, &val) || val > 1)
+		return -EINVAL;
+
+	ctx->manual_mode = !!val;
+	return count;
+}
+
+static DEVICE_ATTR_RW(manual_mode);
+
 static SENSOR_DEVICE_ATTR_RW(pwm1, pwm, 0);
 static SENSOR_DEVICE_ATTR_RO(fan1_input, rpm, 0);
 
 static struct attribute *pwm_fan_attrs[] = {
 	&sensor_dev_attr_pwm1.dev_attr.attr,
 	&sensor_dev_attr_fan1_input.dev_attr.attr,
+	&dev_attr_manual_mode.attr,
 	NULL,
 };
 
@@ -161,7 +187,7 @@ static umode_t pwm_fan_attrs_visible(struct kobject *kobj, struct attribute *a,
 	struct device *dev = container_of(kobj, struct device, kobj);
 	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
 
-	/* Hide fan_input in case no interrupt is available  */
+	/* Hide fan1_input in case no interrupt is available */
 	if (n == 1 && ctx->irq <= 0)
 		return 0;
 
@@ -347,6 +373,8 @@ static int pwm_fan_thermal_notifier_call(struct notifier_block *nb,
 
 	if (event != SYSTEM_MONITOR_CHANGE_TEMP)
 		return NOTIFY_OK;
+	if (ctx->manual_mode)
+		return NOTIFY_OK;
 
 	state = pwm_fan_temp_to_state(ctx, event_data->temp);
 	if (state > ctx->pwm_fan_max_state)
@@ -419,7 +447,11 @@ static int pwm_fan_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	ctx->pwm_value = MAX_PWM;
+	/* Default PWM: from DT "default-pwm" (0-255), or 128 (medium speed) */
+	ctx->pwm_value = 128;
+	of_property_read_u32(dev->of_node, "default-pwm", &ctx->pwm_value);
+	if (ctx->pwm_value > MAX_PWM)
+		ctx->pwm_value = MAX_PWM;
 
 	pwm_init_state(ctx->pwm, &state);
 	/*
@@ -432,9 +464,9 @@ static int pwm_fan_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	/* Set duty cycle to maximum allowed and enable PWM output */
-	state.duty_cycle = ctx->pwm->args.period - 1;
-	state.enabled = true;
+	/* Set duty cycle from default-pwm and enable PWM output */
+	state.duty_cycle = DIV_ROUND_UP(ctx->pwm_value * (state.period - 1), MAX_PWM);
+	state.enabled = (ctx->pwm_value > 0);
 
 	ret = pwm_apply_state(ctx->pwm, &state);
 	if (ret) {
@@ -475,7 +507,7 @@ static int pwm_fan_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ctx->pwm_fan_state = ctx->pwm_fan_max_state;
+	pwm_fan_update_state(ctx, ctx->pwm_value);
 	if (IS_REACHABLE(CONFIG_ROCKCHIP_SYSTEM_MONITOR) &&
 	    of_find_property(dev->of_node, "rockchip,temp-trips", NULL)) {
 		ret = pwm_fan_register_thermal_notifier(dev, ctx);
