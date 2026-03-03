@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * trigger-dev: Generic GPIO input device that triggers a sysfs "echo 1 > ..."
+ * trigger-dev: Generic GPIO input device that triggers camera single-frame capture
  *
  * Features:
  * - GPIO input (edge interrupt)
  * - Press/release prints: "down"(red) / "up"
  * - One-shot trigger per press (must release before next trigger)
- * - Writes a configurable sysfs path to trigger e.g. camera single-frame capture
+ * - Two trigger modes (lower latency first):
+ *   1. trigger-output-gpios: directly pulse GPIO (e.g. camera FSIN) - minimal latency
+ *   2. trigger-path: write to sysfs "echo 1 > ..." - fallback for software trigger
  *
- * This driver is intended to be portable across Rockchip SoCs (RK3576/RK3588...)
- * and other platforms as long as a GPIO and a writable sysfs node are provided.
+ * When trigger-output-gpios is set, the camera node must NOT have fsin-gpios
+ * (same GPIO, single owner). Use /delete-property/ fsin-gpios in overlay if needed.
  */
 
 #include <linux/atomic.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/gpio/consumer.h>
@@ -23,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
 #define TRIGGER_DEV_MODNAME "trigger-dev"
@@ -40,18 +44,67 @@ struct trigger_dev {
 	u32			key_code;
 	bool			pressed;
 
-	/* Debounce (ms). If 0, handle state immediately. */
+	/* Debounce (ms). If 0, handle state immediately (no debounce). */
 	u32			debounce_ms;
 	struct delayed_work	debounce_work;
 
-	/* Trigger action: write payload to sysfs path */
+	/* Trigger action: direct GPIO pulse (Mode A), DT: trigger-output-gpios */
+	struct gpio_desc	*output_gpiod;
+	/* 单次脉冲宽度(us)，DT: trigger-output-pulse-us，默认 50 */
+	u32			output_pulse_us;
+	/* 每次外部触发产生的脉冲个数，DT: trigger-output-pulse-count，默认 1 */
+	u32			output_pulse_count;
+	/* 多脉冲时脉冲间隔(us)，DT: trigger-output-pulse-interval-us，0=无间隔 */
+	u32			output_pulse_interval_us;
+
+	/* Trigger action: write payload to sysfs path (Mode B), DT: trigger-path */
 	char			*trigger_path;
+	/* 写入 sysfs 的内容，DT: trigger-value，默认 "1\n" */
 	char			*trigger_payload;
 	size_t			trigger_payload_len;
+
+	/* 运行时模式：true=GPIO 直连(Mode A)，false=sysfs(Mode B)；两者都配置时优先 GPIO */
+	bool			mode_use_gpio;
+	struct mutex		mode_mutex;
 
 	atomic_t		trigger_pending;
 	struct work_struct	trigger_work;
 };
+
+#define TRIGGER_OUTPUT_PULSE_US_DEFAULT	50
+#define TRIGGER_OUTPUT_PULSE_COUNT_DEFAULT	1
+
+/* Direct GPIO pulse (FSIN): count and interval configurable per external trigger */
+static int trigger_dev_pulse_output(struct trigger_dev *tdev)
+{
+	u32 pulse_us, count, interval_us;
+	int i;
+
+	if (!tdev->output_gpiod)
+		return -ENODEV;
+
+	mutex_lock(&tdev->mode_mutex);
+	pulse_us = tdev->output_pulse_us ? : TRIGGER_OUTPUT_PULSE_US_DEFAULT;
+	count = tdev->output_pulse_count ? : TRIGGER_OUTPUT_PULSE_COUNT_DEFAULT;
+	interval_us = tdev->output_pulse_interval_us;
+	mutex_unlock(&tdev->mode_mutex);
+
+	/*
+	 * For ACTIVE_LOW (normally high, pull low on trigger):
+	 * gpiod 1 = physical low, 0 = physical high.
+	 * Pulse: 1 -> hold -> 0.
+	 */
+	for (i = 0; i < count; i++) {
+		if (i > 0 && interval_us)
+			usleep_range(interval_us, interval_us + 100);
+
+		gpiod_set_value_cansleep(tdev->output_gpiod, 1);
+		usleep_range(pulse_us, pulse_us + 20);
+		gpiod_set_value_cansleep(tdev->output_gpiod, 0);
+	}
+
+	return 0;
+}
 
 static int trigger_dev_write_once(struct trigger_dev *tdev)
 {
@@ -82,15 +135,25 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 {
 	struct trigger_dev *tdev =
 		container_of(work, struct trigger_dev, trigger_work);
+	bool use_gpio;
 	int ret;
 
 	/* Drain pending triggers (presses) */
 	while (atomic_dec_if_positive(&tdev->trigger_pending) >= 0) {
-		ret = trigger_dev_write_once(tdev);
+		mutex_lock(&tdev->mode_mutex);
+		use_gpio = tdev->mode_use_gpio && tdev->output_gpiod;
+		mutex_unlock(&tdev->mode_mutex);
+
+		if (use_gpio)
+			ret = trigger_dev_pulse_output(tdev);
+		else if (tdev->trigger_path)
+			ret = trigger_dev_write_once(tdev);
+		else
+			ret = -ENODEV;
+
 		if (ret) {
-			dev_err(tdev->dev, "trigger write failed: path=%s ret=%d\n",
-				tdev->trigger_path ? tdev->trigger_path : "<null>",
-				ret);
+			dev_err(tdev->dev, "trigger failed: %s ret=%d\n",
+				use_gpio ? "gpio" : "sysfs", ret);
 		} else {
 			dev_info(tdev->dev, "摄像头触发一次拍照\n");
 		}
@@ -158,12 +221,30 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 	tdev->key_code = KEY_CAMERA;
 	device_property_read_u32(dev, "linux,code", &tdev->key_code);
 
-	/* Debounce (ms). Default 20ms. */
-	tdev->debounce_ms = 20;
+	/* Debounce (ms). Default 0 = no debounce. */
+	tdev->debounce_ms = 0;
 	device_property_read_u32(dev, "debounce-ms", &tdev->debounce_ms);
 
 	/*
-	 * Trigger path:
+	 * trigger-output-gpios: 直连 GPIO 脉冲(Mode A)，如相机 FSIN。
+	 * 使用此模式时，相机节点不得配置 fsin-gpios（同一 GPIO 只能有一个所有者）。
+	 */
+	tdev->output_gpiod = devm_gpiod_get_optional(dev, "output", GPIOD_OUT_LOW);
+	if (IS_ERR(tdev->output_gpiod))
+		return PTR_ERR(tdev->output_gpiod);
+
+	/* trigger-output-pulse-us: 脉冲宽度(us)，默认 50 */
+	device_property_read_u32(dev, "trigger-output-pulse-us",
+				 &tdev->output_pulse_us);
+	/* trigger-output-pulse-count: 每次触发的脉冲个数，默认 1 */
+	device_property_read_u32(dev, "trigger-output-pulse-count",
+				&tdev->output_pulse_count);
+	/* trigger-output-pulse-interval-us: 多脉冲间隔(us)，0=无间隔 */
+	device_property_read_u32(dev, "trigger-output-pulse-interval-us",
+				&tdev->output_pulse_interval_us);
+
+	/*
+	 * trigger-path: sysfs write (Mode B). Parse when provided.
 	 * - preferred: trigger-path = "/sys/..."
 	 * - fallback: trigger-i2c-bus + trigger-i2c-addr (+ optional trigger-attr)
 	 */
@@ -172,7 +253,7 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 		tdev->trigger_path = devm_kstrdup(dev, path, GFP_KERNEL);
 		if (!tdev->trigger_path)
 			return -ENOMEM;
-	} else {
+	} else if (!tdev->output_gpiod) {
 		if (device_property_read_u32(dev, "trigger-i2c-bus", &bus) ||
 		    device_property_read_u32(dev, "trigger-i2c-addr", &addr))
 			return -EINVAL;
@@ -187,14 +268,21 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 			return -ENOMEM;
 	}
 
-	/* Trigger payload. Default "1\n" */
-	value = "1";
-	device_property_read_string(dev, "trigger-value", &value);
+	if (tdev->trigger_path) {
+		value = "1";
+		device_property_read_string(dev, "trigger-value", &value);
+		tdev->trigger_payload = devm_kasprintf(dev, GFP_KERNEL, "%s\n", value);
+		if (!tdev->trigger_payload)
+			return -ENOMEM;
+		tdev->trigger_payload_len = strlen(tdev->trigger_payload);
+	}
 
-	tdev->trigger_payload = devm_kasprintf(dev, GFP_KERNEL, "%s\n", value);
-	if (!tdev->trigger_payload)
-		return -ENOMEM;
-	tdev->trigger_payload_len = strlen(tdev->trigger_payload);
+	/* Need at least one trigger action */
+	if (!tdev->output_gpiod && !tdev->trigger_path)
+		return -EINVAL;
+
+	/* Default mode: prefer gpio when both configured */
+	tdev->mode_use_gpio = tdev->output_gpiod;
 
 	/* Try hardware debounce if available, else keep software debounce. */
 	if (tdev->debounce_ms) {
@@ -223,6 +311,7 @@ static int trigger_dev_probe(struct platform_device *pdev)
 
 	tdev->dev = dev;
 	platform_set_drvdata(pdev, tdev);
+	mutex_init(&tdev->mode_mutex);
 
 	/*
 	 * Primary DT property: input-gpios (con_id = "input")
@@ -280,25 +369,144 @@ static int trigger_dev_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, irq, "failed to get irq for input gpio\n");
 	tdev->irq = irq;
 
+	/*
+	 * IRQ flags: use IRQF_TRIGGER_FALLING for "active low, normally high"
+	 * (falling edge = trigger). If DT specifies interrupts property, the
+	 * flags may be overridden by irq_create_of_mapping; request_irq uses
+	 * the combined result. For gpiod_to_irq path, we pass the desired flags.
+	 */
 	ret = devm_request_any_context_irq(dev, tdev->irq, trigger_dev_irq,
-					   IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+					   IRQF_TRIGGER_FALLING,
 					   TRIGGER_DEV_MODNAME, tdev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to request irq\n");
 
 	gpio = desc_to_gpio(tdev->input_gpiod);
 	active_low = gpiod_is_active_low(tdev->input_gpiod);
-	dev_info(dev, "ready: gpio=%d irq=%d active_low=%d debounce_ms=%u key_code=%u trigger=%s payload=%s\n",
+	dev_info(dev, "ready: gpio=%d irq=%d active_low=%d debounce_ms=%u key_code=%u mode=%s\n",
 		 gpio,
 		 tdev->irq,
 		 active_low,
 		 tdev->debounce_ms,
 		 tdev->key_code,
-		 tdev->trigger_path,
-		 tdev->trigger_payload);
+		 tdev->output_gpiod ?
+		 "direct-gpio-pulse" : "sysfs-write");
+	if (tdev->output_gpiod)
+		dev_info(dev, "  output_gpio=%d pulse_us=%u\n",
+			 desc_to_gpio(tdev->output_gpiod),
+			 tdev->output_pulse_us ? : TRIGGER_OUTPUT_PULSE_US_DEFAULT);
+	else
+		dev_info(dev, "  trigger_path=%s payload=%s\n",
+			 tdev->trigger_path, tdev->trigger_payload);
 
 	return 0;
 }
+
+/* Sysfs: mode (gpio|sysfs) */
+static ssize_t mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", tdev->mode_use_gpio ? "gpio" : "sysfs");
+}
+
+static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	bool use_gpio;
+	bool can_switch = tdev->output_gpiod && tdev->trigger_path;
+
+	if (!can_switch)
+		return -EOPNOTSUPP;
+
+	if (sysfs_streq(buf, "gpio"))
+		use_gpio = true;
+	else if (sysfs_streq(buf, "sysfs"))
+		use_gpio = false;
+	else
+		return -EINVAL;
+
+	mutex_lock(&tdev->mode_mutex);
+	tdev->mode_use_gpio = use_gpio;
+	mutex_unlock(&tdev->mode_mutex);
+
+	return count;
+}
+static DEVICE_ATTR_RW(mode);
+
+/* Sysfs: pulse_count (Mode A only) */
+static ssize_t pulse_count_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	u32 v;
+
+	mutex_lock(&tdev->mode_mutex);
+	v = tdev->output_pulse_count ? : TRIGGER_OUTPUT_PULSE_COUNT_DEFAULT;
+	mutex_unlock(&tdev->mode_mutex);
+
+	return sysfs_emit(buf, "%u\n", v);
+}
+
+static ssize_t pulse_count_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	u32 v;
+	int ret;
+
+	if (!tdev->output_gpiod)
+		return -ENODEV;
+
+	ret = kstrtou32(buf, 0, &v);
+	if (ret || v == 0 || v > 255)
+		return -EINVAL;
+
+	mutex_lock(&tdev->mode_mutex);
+	tdev->output_pulse_count = v;
+	mutex_unlock(&tdev->mode_mutex);
+
+	return count;
+}
+static DEVICE_ATTR_RW(pulse_count);
+
+/* Sysfs: pulse_interval_us (Mode A only) */
+static ssize_t pulse_interval_us_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", tdev->output_pulse_interval_us);
+}
+
+static ssize_t pulse_interval_us_store(struct device *dev, struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	u32 v;
+	int ret;
+
+	if (!tdev->output_gpiod)
+		return -ENODEV;
+
+	ret = kstrtou32(buf, 0, &v);
+	if (ret)
+		return -EINVAL;
+
+	mutex_lock(&tdev->mode_mutex);
+	tdev->output_pulse_interval_us = v;
+	mutex_unlock(&tdev->mode_mutex);
+
+	return count;
+}
+static DEVICE_ATTR_RW(pulse_interval_us);
+
+static struct attribute *trigger_dev_attrs[] = {
+	&dev_attr_mode.attr,
+	&dev_attr_pulse_count.attr,
+	&dev_attr_pulse_interval_us.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(trigger_dev);
 
 static int trigger_dev_remove(struct platform_device *pdev)
 {
@@ -324,6 +532,7 @@ static struct platform_driver trigger_dev_driver = {
 	.driver = {
 		.name           = TRIGGER_DEV_MODNAME,
 		.of_match_table = of_match_ptr(trigger_dev_of_match),
+		.dev_groups     = trigger_dev_groups,
 	},
 };
 module_platform_driver(trigger_dev_driver);

@@ -111,23 +111,9 @@
  /* External FSIN trigger (single-frame) */
  #define OF_FSIN_PULSE_US		"rockchip,fsin-pulse-us"
  #define OS08A20_FSIN_PULSE_US_DEFAULT	50u
-#define OF_FSIN_SETTLE_US		"rockchip,fsin-settle-us"
-/*
- * Time to wait after enabling streaming and before asserting FSIN.
- *
- * Some receiver pipelines may miss the first frame if FSIN is asserted too
- * early after toggling 0x0100 (MIPI/PLL/DPHY needs time to become stable),
- * leading to "sometimes need multiple triggers for one frame".
- */
-#define OS08A20_FSIN_SETTLE_US_DEFAULT	5000u
-
-/* Optional timing knobs for single-frame trigger */
-#define OF_TRIGGER_FRAME_WAIT_US	"rockchip,trigger-frame-wait-us"
-#define OF_TRIGGER_FRAME_MARGIN_US	"rockchip,trigger-frame-margin-us"
- 
- /* Optional defaults (persistent across reboot via DT/overlay) */
- #define OF_DEFAULT_EXPOSURE		"rockchip,default-exposure"
- #define OF_DEFAULT_ANALOG_GAIN		"rockchip,default-analogue-gain"
+ /* 可选默认值，用于 V4L2 曝光/增益控件初始值，重启后通过 DT/overlay 持久化 */
+ #define OF_DEFAULT_EXPOSURE		"rockchip,default-exposure"   /* 曝光行数 */
+ #define OF_DEFAULT_ANALOG_GAIN		"rockchip,default-analogue-gain"  /* 1024=1.0x */
  
  /* V4L2 custom control for single-frame trigger */
  /*
@@ -206,7 +192,6 @@
 	 bool			power_on;
 	 bool			trigger_armed;
 	 u32			trigger_count;
-	 u64			last_trigger_ns;
 	 const struct os08a20_mode *cur_mode;
 	 unsigned int lane_num;
 	 unsigned int cfg_num;
@@ -220,11 +205,19 @@
 	 enum rkmodule_sync_mode	sync_mode;
 	 enum rkmodule_sync_mode	dt_sync_mode;
 	 u32			fsin_pulse_us;
-	u32			fsin_settle_us;
-	u32			trigger_frame_wait_us;
-	u32			trigger_frame_margin_us;
+	 /* DT: rockchip,default-exposure，V4L2 曝光控件初始值(行) */
 	 u32			default_exposure;
+	 /* DT: rockchip,default-analogue-gain，V4L2 增益控件初始值，1024=1.0x */
 	 u32			default_anal_gain;
+
+	 /* 快速触发：缓存上次应用的 3A 参数，未变化时跳过 I2C 写入 */
+	 u32			trigger_last_exposure;
+	 u32			trigger_last_anal_gain;
+	 bool			trigger_last_auto_wb;
+	 u32			trigger_last_red;
+	 u32			trigger_last_blue;
+	 /* 3A 脏标志：控件变更时置位，应用后清除，用于 fast_path 判断 */
+	 bool			trigger_3a_dirty;
  };
  
  #define to_os08a20(sd) container_of(sd, struct os08a20, subdev)
@@ -233,6 +226,10 @@
  static int os08a20_write_reg(struct i2c_client *client, u16 reg, u32 len, u32 val);
  static int os08a20_read_reg(struct i2c_client *client, u16 reg,
 				 unsigned int len, u32 *val);
+ /* 批量 I2C 写入用：reg/len/val 三元组，用于 os08a20_write_regs_batch */
+ struct os08a20_reg_val { u16 reg; u32 len; u32 val; };
+ static int os08a20_write_regs_batch(struct i2c_client *client,
+				     const struct os08a20_reg_val *regs, int num);
  
  static inline bool os08a20_use_fsin_trigger(const struct os08a20 *os08a20)
  {
@@ -241,36 +238,6 @@
 	  * configuration (board uses GPIO1_D6 as FSIN).
 	  */
 	 return os08a20->dt_sync_mode == SLAVE_MODE && os08a20->fsin_gpio;
- }
- 
- static inline u64 os08a20_frame_interval_ns(const struct os08a20 *os08a20)
- {
-	 const struct v4l2_fract *fi = &os08a20->cur_mode->max_fps;
-	u64 base_ns;
-	u64 vts_now;
-	u32 vts_def;
- 
-	 if (!fi->denominator)
-		 return 0;
- 
-	/*
-	 * Base frame interval comes from the mode's nominal max_fps (which matches
-	 * vts_def). In real pipelines, fps may be reduced by increasing VTS/VBlank
-	 * (e.g. low-light long exposure). Scale the interval by current VTS so we
-	 * don't return to standby too early and miss frames.
-	 */
-	base_ns = div_u64((u64)NSEC_PER_SEC * fi->numerator, fi->denominator);
-
-	vts_def = os08a20->cur_mode->vts_def;
-	if (!vts_def || !os08a20->vblank)
-		return base_ns;
-
-	/* VTS = height + vblank (both are in lines). */
-	vts_now = (u64)os08a20->cur_mode->height + (u64)os08a20->vblank->val;
-	if (!vts_now)
-		return base_ns;
-
-	return div_u64(base_ns * vts_now, vts_def);
  }
  
  static int os08a20_pulse_fsin_gpio(struct os08a20 *os08a20)
@@ -297,12 +264,12 @@
 	 u32 exposure = os08a20->cur_mode->exp_def;
 	 u32 anal_gain = ANALOG_GAIN_DEFAULT;
 	 int ret;
- 
+
 	 if (os08a20->exposure)
 		 exposure = os08a20->exposure->val;
 	 if (os08a20->anal_gain)
 		 anal_gain = os08a20->anal_gain->val;
- 
+
 	 ret = os08a20_write_reg(os08a20->client, OS08A20_REG_EXPOSURE,
 				 OS08A20_REG_VALUE_16BIT, exposure);
 	 ret |= os08a20_write_reg(os08a20->client, OS08A20_REG_GAIN_L,
@@ -312,8 +279,44 @@
 				  OS08A20_REG_VALUE_08BIT,
 				  (anal_gain >> OS08A20_GAIN_H_SHIFT) &
 				  OS08A20_GAIN_H_MASK);
- 
+
 	 return ret;
+ }
+
+ /* Batch write: STREAMING + exposure + gain in one I2C transaction */
+ static int os08a20_trigger_apply_streaming_exposure_gain(struct os08a20 *os08a20)
+ {
+	 u32 exposure = os08a20->cur_mode->exp_def;
+	 u32 anal_gain = ANALOG_GAIN_DEFAULT;
+	 struct os08a20_reg_val regs[4];
+	 int n = 0;
+
+	 if (os08a20->exposure)
+		 exposure = os08a20->exposure->val;
+	 if (os08a20->anal_gain)
+		 anal_gain = os08a20->anal_gain->val;
+
+	 regs[n].reg = OS08A20_REG_CTRL_MODE;
+	 regs[n].len = OS08A20_REG_VALUE_08BIT;
+	 regs[n].val = OS08A20_MODE_STREAMING;
+	 n++;
+
+	 regs[n].reg = OS08A20_REG_EXPOSURE;
+	 regs[n].len = OS08A20_REG_VALUE_16BIT;
+	 regs[n].val = exposure;
+	 n++;
+
+	 regs[n].reg = OS08A20_REG_GAIN_L;
+	 regs[n].len = OS08A20_REG_VALUE_08BIT;
+	 regs[n].val = anal_gain & OS08A20_GAIN_L_MASK;
+	 n++;
+
+	 regs[n].reg = OS08A20_REG_GAIN_H;
+	 regs[n].len = OS08A20_REG_VALUE_08BIT;
+	 regs[n].val = (anal_gain >> OS08A20_GAIN_H_SHIFT) & OS08A20_GAIN_H_MASK;
+	 n++;
+
+	 return os08a20_write_regs_batch(os08a20->client, regs, n);
  }
  
  static int os08a20_apply_white_balance(struct os08a20 *os08a20)
@@ -370,97 +373,70 @@
  
  static int os08a20_trigger_one_frame_locked(struct os08a20 *os08a20)
  {
-	 u64 frame_ns;
-	 u32 frame_us;
-	u32 frame_interval_us;
-	u32 settle_us;
-	u32 vblank_val = 0;
-	u32 vts_now = 0;
-	u32 base_wait_us = 0;
-	 u64 now_ns;
+	 u32 vblank_val = 0;
+	 u32 vts_now = 0;
 	 struct i2c_client *client = os08a20->client;
+	 u32 exposure, anal_gain;
+	 bool auto_wb;
+	 u32 red = OS08A20_WB_GAIN_DEFAULT, blue = OS08A20_WB_GAIN_DEFAULT;
+	 bool fast_path;
 	 int ret;
- 
+
 	 if (!os08a20_use_fsin_trigger(os08a20))
 		 return -EINVAL;
 	 if (!os08a20->streaming)
 		 return -EBUSY;
- 
+
 	 if (!pm_runtime_get_if_in_use(&client->dev))
 		 return -EIO;
- 
-	 /*
-	  * Enforce a minimum interval of one frame between triggers so we don't
-	  * accidentally output multiple frames when users trigger quickly.
-	  */
-	 frame_ns = os08a20_frame_interval_ns(os08a20);
-	 if (!frame_ns)
-		 frame_ns = 33333333ULL; /* fallback: 30fps */
- 
-	 now_ns = ktime_get_ns();
-	 if (os08a20->last_trigger_ns && now_ns > os08a20->last_trigger_ns &&
-		 now_ns - os08a20->last_trigger_ns < frame_ns) {
-		 u64 remain_ns = frame_ns - (now_ns - os08a20->last_trigger_ns);
-		 u32 remain_us = (u32)DIV_ROUND_UP_ULL(remain_ns, 1000);
- 
-		 if (remain_us)
-			 usleep_range(remain_us, remain_us + 200);
-	 }
- 
-	 /*
-	  * "armed" streaming: in trigger mode we keep the sensor in standby in
-	  * __os08a20_start_stream(). Each trigger temporarily enables streaming,
-	  * emits one FSIN pulse, then returns to standby after ~1 frame.
-	  */
-	 ret = os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
-				 OS08A20_REG_VALUE_08BIT, OS08A20_MODE_STREAMING);
-	 if (ret)
-		 goto out_pm_put;
- 
-	 /*
-	  * Re-apply exposure/gain right before the triggered frame. This avoids
-	  * cases where standby/quick-stream paths leave the sensor with default
-	  * (sometimes zero) exposure/gain at the moment of capture.
-	  */
-	 ret = os08a20_apply_exposure_gain(os08a20);
-	 if (ret)
-		 goto out_pm_put;
- 
-	 os08a20_apply_white_balance(os08a20);
- 
-	 /* Let the sensor settle a bit before the FSIN edge. */
-	settle_us = os08a20->fsin_settle_us;
-	if (!settle_us)
-		settle_us = OS08A20_FSIN_SETTLE_US_DEFAULT;
-	usleep_range(settle_us, settle_us + 200);
- 
-	 ret = os08a20_pulse_fsin_gpio(os08a20);
- 
-	if (os08a20->trigger_frame_wait_us)
-		base_wait_us = os08a20->trigger_frame_wait_us;
-	else {
-		/*
-		 * Wait long enough to cover worst-case phase between the FSIN edge
-		 * and the next frame start, plus one full frame. This improves the
-		 * reliability of "single echo -> single frame" when the sensor
-		 * needs up to 1 frame latency to lock to FSIN/start output.
-		 */
-		frame_interval_us = (u32)DIV_ROUND_UP_ULL(frame_ns, 1000);
-		base_wait_us = frame_interval_us * 2;
-	}
 
-	frame_us = base_wait_us + os08a20->trigger_frame_margin_us;
-	 if (frame_us < 1000)
-		 frame_us = 1000;
- 
-	 usleep_range(frame_us, frame_us + 2000);
- 
+	 exposure = os08a20->exposure ? os08a20->exposure->val : os08a20->cur_mode->exp_def;
+	 anal_gain = os08a20->anal_gain ? os08a20->anal_gain->val : ANALOG_GAIN_DEFAULT;
+	 auto_wb = os08a20->auto_wb ? os08a20->auto_wb->val : true;
+	 if (os08a20->red_balance)
+		 red = os08a20->red_balance->val;
+	 if (os08a20->blue_balance)
+		 blue = os08a20->blue_balance->val;
+
+	 /*
+	  * Fast path: skip 3A when unchanged since last trigger. Assumes sensor
+	  * retains exposure/gain in standby, or we've just applied them.
+	  */
+	 fast_path = !os08a20->trigger_3a_dirty &&
+		 exposure == os08a20->trigger_last_exposure &&
+		 anal_gain == os08a20->trigger_last_anal_gain &&
+		 auto_wb == os08a20->trigger_last_auto_wb &&
+		 (auto_wb || (red == os08a20->trigger_last_red &&
+			      blue == os08a20->trigger_last_blue));
+
+	 if (fast_path) {
+		 /* STREAMING only, then pulse, then STANDBY */
+		 ret = os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
+					 OS08A20_REG_VALUE_08BIT, OS08A20_MODE_STREAMING);
+	 } else {
+		 /* Batch: STREAMING + exposure + gain in one I2C transaction */
+		 ret = os08a20_trigger_apply_streaming_exposure_gain(os08a20);
+		 if (!ret) {
+			 os08a20->trigger_last_exposure = exposure;
+			 os08a20->trigger_last_anal_gain = anal_gain;
+			 os08a20->trigger_last_auto_wb = auto_wb;
+			 os08a20->trigger_last_red = red;
+			 os08a20->trigger_last_blue = blue;
+			 os08a20->trigger_3a_dirty = false;
+		 }
+		 if (!ret)
+			 os08a20_apply_white_balance(os08a20);
+	 }
+	 if (ret)
+		 goto out_pm_put;
+
+	 ret = os08a20_pulse_fsin_gpio(os08a20);
+
 	 ret |= os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
 				  OS08A20_REG_VALUE_08BIT, OS08A20_MODE_SW_STANDBY);
- 
+
 	 if (!ret) {
 		 os08a20->trigger_count++;
-		 os08a20->last_trigger_ns = ktime_get_ns();
 
 		if (os08a20->vblank) {
 			vblank_val = os08a20->vblank->val;
@@ -468,18 +444,14 @@
 		}
 
 		dev_info(&client->dev,
-			 "trigger capture: OK (count=%u wait_us=%u base_wait_us=%u margin_us=%u settle_us=%u vblank=%u vts=%u)\n",
+			 "trigger capture: OK (count=%u vblank=%u vts=%u)\n",
 			 os08a20->trigger_count,
-			 frame_us,
-			 base_wait_us,
-			 os08a20->trigger_frame_margin_us,
-			 settle_us,
 			 vblank_val,
 			 vts_now);
 	} else {
 		dev_warn(&client->dev, "trigger capture: FAIL (ret=%d)\n", ret);
 	 }
- 
+
  out_pm_put:
 	 pm_runtime_put(&client->dev);
 	 return ret;
@@ -812,7 +784,34 @@
 	 }
 	 return 0;
  }
- 
+
+ /* Batch I2C: multiple reg writes in one transaction to reduce latency */
+ static int os08a20_write_regs_batch(struct i2c_client *client,
+				     const struct os08a20_reg_val *regs, int num)
+ {
+	 u8 buf[64];
+	 int i, j, pos = 0;
+	 u8 *val_p;
+	 __be32 val_be;
+
+	 if (num <= 0 || num > 16)
+		 return -EINVAL;
+
+	 for (i = 0; i < num && pos < sizeof(buf) - 6; i++) {
+		 if (regs[i].len > 4)
+			 return -EINVAL;
+		 buf[pos++] = regs[i].reg >> 8;
+		 buf[pos++] = regs[i].reg & 0xff;
+		 val_be = cpu_to_be32(regs[i].val);
+		 val_p = (u8 *)&val_be;
+		 for (j = 4 - regs[i].len; j < 4; j++)
+			 buf[pos++] = val_p[j];
+	 }
+	 if (i2c_master_send(client, buf, pos) != pos)
+		 return -EIO;
+	 return 0;
+ }
+
  static int os08a20_write_array(struct i2c_client *client,
 				   const struct regval *regs)
  {
@@ -1092,6 +1091,7 @@
 		 if (os08a20_use_fsin_trigger(os08a20)) {
 			 if (stream) {
 				 os08a20->trigger_armed = true;
+				 os08a20->trigger_3a_dirty = true; /* first trigger does full apply */
 				 if (os08a20->fsin_gpio)
 					 gpiod_set_value_cansleep(os08a20->fsin_gpio, 0);
 			 } else {
@@ -1262,6 +1262,7 @@
  
 	 os08a20->trigger_armed = os08a20_use_fsin_trigger(os08a20);
 	 if (os08a20->trigger_armed) {
+		 os08a20->trigger_3a_dirty = true; /* first trigger does full apply */
 		 /* keep FSIN inactive while armed */
 		 gpiod_set_value_cansleep(os08a20->fsin_gpio, 0);
 		 ret = os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
@@ -1598,10 +1599,12 @@
  
 	 switch (ctrl->id) {
 	 case V4L2_CID_EXPOSURE:
+		 os08a20->trigger_3a_dirty = true;
 		 ret = os08a20_write_reg(os08a20->client, OS08A20_REG_EXPOSURE,
 					 OS08A20_REG_VALUE_16BIT, ctrl->val);
 		 break;
 	 case V4L2_CID_ANALOGUE_GAIN:
+		 os08a20->trigger_3a_dirty = true;
 		 ret = os08a20_write_reg(os08a20->client, OS08A20_REG_GAIN_L,
 					 OS08A20_REG_VALUE_08BIT,
 					 ctrl->val & OS08A20_GAIN_L_MASK);
@@ -1611,10 +1614,12 @@
 					  OS08A20_GAIN_H_MASK);
 		 break;
 	 case V4L2_CID_AUTO_WHITE_BALANCE:
+		 os08a20->trigger_3a_dirty = true;
 		 ret = os08a20_apply_white_balance(os08a20);
 		 break;
 	 case V4L2_CID_RED_BALANCE:
 	 case V4L2_CID_BLUE_BALANCE:
+		 os08a20->trigger_3a_dirty = true;
 		 if (os08a20->auto_wb && os08a20->auto_wb->val == 0)
 			 ret = os08a20_apply_white_balance(os08a20);
 		 break;
@@ -1900,17 +1905,6 @@
  
 	 os08a20->fsin_pulse_us = OS08A20_FSIN_PULSE_US_DEFAULT;
 	 of_property_read_u32(node, OF_FSIN_PULSE_US, &os08a20->fsin_pulse_us);
-
-	os08a20->fsin_settle_us = OS08A20_FSIN_SETTLE_US_DEFAULT;
-	of_property_read_u32(node, OF_FSIN_SETTLE_US, &os08a20->fsin_settle_us);
-
-	os08a20->trigger_frame_wait_us = 0;
-	of_property_read_u32(node, OF_TRIGGER_FRAME_WAIT_US,
-			     &os08a20->trigger_frame_wait_us);
-
-	os08a20->trigger_frame_margin_us = 0;
-	of_property_read_u32(node, OF_TRIGGER_FRAME_MARGIN_US,
-			     &os08a20->trigger_frame_margin_us);
  
 	 os08a20->xvclk = devm_clk_get(dev, "xvclk");
 	 if (IS_ERR(os08a20->xvclk)) {
@@ -1936,13 +1930,10 @@
 					  "Failed to get fsin-gpios\n");
  
 	dev_info(dev,
-		 "sync_mode(dt)=%u, fsin_gpio=%s, fsin_pulse_us=%u, fsin_settle_us=%u, trigger_wait_us=%u, trigger_margin_us=%u, fsin_trigger=%d\n",
+		 "sync_mode(dt)=%u, fsin_gpio=%s, fsin_pulse_us=%u, fsin_trigger=%d\n",
 		  os08a20->dt_sync_mode,
 		  os08a20->fsin_gpio ? "yes" : "no",
 		  os08a20->fsin_pulse_us,
-		 os08a20->fsin_settle_us,
-		 os08a20->trigger_frame_wait_us,
-		 os08a20->trigger_frame_margin_us,
 		  os08a20_use_fsin_trigger(os08a20));
  
 	 ret = os08a20_configure_regulators(os08a20);
@@ -1954,6 +1945,7 @@
 	 if (ret != 0)
 		 return -EINVAL;
  
+	 /* rockchip,default-exposure / rockchip,default-analogue-gain: 触发模式下 V4L2 控件初始值 */
 	 os08a20->default_exposure = 0;
 	 os08a20->default_anal_gain = 0;
 	 if (!of_property_read_u32(node, OF_DEFAULT_EXPOSURE, &os08a20->default_exposure))

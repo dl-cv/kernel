@@ -14,11 +14,8 @@
 			trigger_dev {
 				trigger_dev_pin: trigger-dev-pin {
 
-					/* 计划用GPIO1_A3 */
-					//rockchip,pins = <1 RK_PA3 RK_FUNC_GPIO &pcfg_pull_down>;
-
-					/* 调试用GPIO0_B7 */
-					rockchip,pins = <0 RK_PB7 RK_FUNC_GPIO &pcfg_pull_down>;
+					/* GPIO0_C6: 平时高电平，下降沿有效 */
+					rockchip,pins = <0 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up>;
 
 					/*
 					 * 注意：GPIO0_D3(RK_PD3) 在 LubanCat-5IO 默认 DTS 中
@@ -40,35 +37,27 @@
 				compatible = "embedfire,trigger-dev";
 				status = "okay";
 
-				/* Physical input (button): active high means pressed = 1 */
-
-                /* 计划用GPIO1_A3 */
-				//input-gpios = <&gpio1 RK_PA3 GPIO_ACTIVE_HIGH>;
-				//interrupt-parent = <&gpio1>;
-				//interrupts = <RK_PA3 IRQ_TYPE_EDGE_BOTH>;
-
-                /* 调试用GPIO0_B7 */
-				input-gpios = <&gpio0 RK_PB7 GPIO_ACTIVE_HIGH>;
+				/* GPIO0_C6: 下降沿有效（平时高电平，低电平=按下） */
+				input-gpios = <&gpio0 RK_PC6 GPIO_ACTIVE_LOW>;
 				interrupt-parent = <&gpio0>;
-				interrupts = <RK_PB7 IRQ_TYPE_EDGE_BOTH>;
-                
+				/* 下降沿触发，与 ACTIVE_LOW 配合：按下=低电平=下降沿 */
+				interrupts = <RK_PC6 IRQ_TYPE_EDGE_FALLING>;
 
 				pinctrl-names = "default";
 				pinctrl-0 = <&trigger_dev_pin>;
 
-				/* Debounce in ms (software fallback if HW debounce unsupported) */
-				debounce-ms = <20>;
+				/* 防抖时间(ms)，0=无防抖，适合快速触发 */
+				debounce-ms = <0>;
 
-				/* Optional input event code */
+				/* 输入事件码，KEY_CAMERA 用于相机快门 */
 				linux,code = <KEY_CAMERA>;
 
 				/*
-				 * Trigger action (same effect as):
-				 *   echo 1 > /sys/bus/i2c/devices/1-0036/trigger
-				 *
-				 * NOTE: adjust this path if your target i2c bus/address differs.
+				 * 通过 os08a20 的 sysfs 触发，与 fsin-gpios 共用。
+				 * os08a20 保留 fsin-gpios，同时支持硬触发和手动软触发。
 				 */
 				trigger-path = "/sys/bus/i2c/devices/1-0036/trigger";
+				/* 写入 sysfs 的值，默认 "1" 表示触发一次拍照 */
 				trigger-value = "1";
 			};
 		};
