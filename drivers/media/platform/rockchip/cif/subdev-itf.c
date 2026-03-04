@@ -24,6 +24,8 @@
 #include <linux/rk-camera-module.h>
 #include "common.h"
 
+#define SDITF_POWER_OFF_DELAY_MS 1000
+
 static inline struct sditf_priv *to_sditf_priv(struct v4l2_subdev *subdev)
 {
 	return container_of(subdev, struct sditf_priv, sd);
@@ -738,19 +740,58 @@ static int sditf_s_power(struct v4l2_subdev *sd, int on)
 		v4l2_dbg(1, rkcif_debug, &cif_dev->v4l2_dev,
 			"%s, toisp mode %d, hdr %d, set power %d\n",
 			__func__, priv->toisp_inf.link_mode, priv->hdr_cfg.hdr_mode, on);
-		mutex_lock(&cif_dev->stream_lock);
 		if (on) {
-			ret = pm_runtime_resume_and_get(cif_dev->dev);
-			ret |= v4l2_pipeline_pm_get(&node->vdev.entity);
+			cancel_delayed_work_sync(&priv->power_off_work);
+			mutex_lock(&cif_dev->stream_lock);
+			if (!priv->power_on) {
+				ret = pm_runtime_resume_and_get(cif_dev->dev);
+				if (ret < 0) {
+					mutex_unlock(&cif_dev->stream_lock);
+					atomic_dec(&priv->power_cnt);
+					return ret;
+				}
+				ret = v4l2_pipeline_pm_get(&node->vdev.entity);
+				if (ret < 0) {
+					pm_runtime_put_sync(cif_dev->dev);
+					mutex_unlock(&cif_dev->stream_lock);
+					atomic_dec(&priv->power_cnt);
+					return ret;
+				}
+				priv->power_on = true;
+			}
+			v4l2_dbg(1, rkcif_debug, &node->vdev,
+				 "s_power %d, entity use_count %d\n",
+				 on, node->vdev.entity.use_count);
+			mutex_unlock(&cif_dev->stream_lock);
 		} else {
-			v4l2_pipeline_pm_put(&node->vdev.entity);
-			pm_runtime_put_sync(cif_dev->dev);
+			schedule_delayed_work(&priv->power_off_work,
+					      msecs_to_jiffies(SDITF_POWER_OFF_DELAY_MS));
 		}
-		v4l2_info(&node->vdev, "s_power %d, entity use_count %d\n",
-			  on, node->vdev.entity.use_count);
-		mutex_unlock(&cif_dev->stream_lock);
 	}
 	return ret;
+}
+
+static void sditf_power_off_work(struct work_struct *work)
+{
+	struct sditf_priv *priv = container_of(to_delayed_work(work),
+					       struct sditf_priv,
+					       power_off_work);
+	struct rkcif_device *cif_dev = priv->cif_dev;
+	struct rkcif_vdev_node *node = &cif_dev->stream[0].vnode;
+
+	if (atomic_read(&priv->power_cnt) > 0)
+		return;
+
+	mutex_lock(&cif_dev->stream_lock);
+	if (atomic_read(&priv->power_cnt) == 0 && priv->power_on) {
+		v4l2_pipeline_pm_put(&node->vdev.entity);
+		pm_runtime_put_sync(cif_dev->dev);
+		priv->power_on = false;
+		v4l2_dbg(1, rkcif_debug, &node->vdev,
+			 "s_power %d, entity use_count %d\n",
+			 0, node->vdev.entity.use_count);
+	}
+	mutex_unlock(&cif_dev->stream_lock);
 }
 
 static int sditf_s_rx_buffer(struct v4l2_subdev *sd,
@@ -1166,6 +1207,8 @@ static int rkcif_subdev_media_init(struct sditf_priv *priv)
 		sditf_subdev_notifier(priv);
 	atomic_set(&priv->power_cnt, 0);
 	atomic_set(&priv->stream_cnt, 0);
+	priv->power_on = false;
+	INIT_DELAYED_WORK(&priv->power_off_work, sditf_power_off_work);
 	INIT_WORK(&priv->buffree_work.work, sditf_buffree_work);
 	INIT_LIST_HEAD(&priv->buf_free_list);
 	return 0;
@@ -1217,7 +1260,18 @@ static int rkcif_subdev_remove(struct platform_device *pdev)
 {
 	struct media_entity *me = platform_get_drvdata(pdev);
 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(me);
+	struct sditf_priv *priv = to_sditf_priv(sd);
 
+	cancel_delayed_work_sync(&priv->power_off_work);
+	mutex_lock(&priv->cif_dev->stream_lock);
+	if (priv->power_on) {
+		struct rkcif_vdev_node *node = &priv->cif_dev->stream[0].vnode;
+
+		v4l2_pipeline_pm_put(&node->vdev.entity);
+		pm_runtime_put_sync(priv->cif_dev->dev);
+		priv->power_on = false;
+	}
+	mutex_unlock(&priv->cif_dev->stream_lock);
 	media_entity_cleanup(&sd->entity);
 
 	pm_runtime_disable(&pdev->dev);

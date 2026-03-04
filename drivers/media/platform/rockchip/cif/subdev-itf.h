@@ -9,6 +9,7 @@
 #define _RKCIF_SDITF_H
 
 #include <linux/mutex.h>
+#include <linux/workqueue.h>
 #include <media/media-device.h>
 #include <media/media-entity.h>
 #include <media/v4l2-ctrls.h>
@@ -80,6 +81,8 @@ struct sditf_priv {
 	bool is_combine_mode;
 	atomic_t power_cnt;
 	atomic_t stream_cnt;
+	bool power_on;
+	struct delayed_work power_off_work;
 };
 
 extern struct platform_driver rkcif_subdev_driver;

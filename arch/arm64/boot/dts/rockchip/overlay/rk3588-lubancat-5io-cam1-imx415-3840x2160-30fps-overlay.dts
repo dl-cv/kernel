@@ -19,14 +19,22 @@
 		};
 	};
 
+	/* Disable os08a20 when using imx415 - only one sensor per cam slot */
 	fragment@1 {
+		target = <&dcphy1_os08a20>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@2 {
 		target = <&dcphy1_imx415>;
 		__overlay__ {
 			status = "okay";
 		};
 	};
 
-	fragment@2 {
+	fragment@3 {
 		target = <&csi2_dcphy1>;
 
 		__overlay__ {
@@ -34,7 +42,7 @@
 		};
 	};
 
-	fragment@3 {
+	fragment@4 {
 		target = <&mipi1_csi2>;
 
 		__overlay__ {
@@ -42,7 +50,7 @@
 		};
 	};
 
-	fragment@4 {
+	fragment@5 {
 		target = <&mipi_dcphy1>;
 
 		__overlay__ {
@@ -50,7 +58,7 @@
 		};
 	};
 
-	fragment@5 {
+	fragment@6 {
 		target = <&rkcif>;
 
 		__overlay__ {
@@ -58,7 +66,7 @@
 		};
 	};
 
-	fragment@6 {
+	fragment@7 {
 		target = <&rkcif_mipi_lvds1>;
 
 		__overlay__ {
@@ -66,7 +74,7 @@
 		};
 	};
 
-	fragment@7 {
+	fragment@8 {
 		target = <&rkcif_mipi_lvds1_sditf>;
 
 		__overlay__ {
@@ -74,7 +82,7 @@
 		};
 	};
 
-	fragment@8 {
+	fragment@9 {
 		target = <&rkcif_mmu>;
 
 		__overlay__ {
@@ -82,7 +90,7 @@
 		};
 	};
 
-	fragment@9 {
+	fragment@10 {
 		target = <&rkisp1>;
 
 		__overlay__ {
@@ -90,7 +98,7 @@
 		};
 	};
 
-	fragment@10 {
+	fragment@11 {
 		target = <&isp1_mmu>;
 
 		__overlay__ {
@@ -98,7 +106,7 @@
 		};
 	};
 
-	fragment@11 {
+	fragment@12 {
 		target = <&rkisp1_vir0>;
 
 		__overlay__ {

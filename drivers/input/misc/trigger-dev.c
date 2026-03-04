@@ -21,12 +21,14 @@
 #include <linux/gpio/consumer.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
+#include <linux/ktime.h>
 #include <linux/workqueue.h>
 
 #define TRIGGER_DEV_MODNAME "trigger-dev"
@@ -69,6 +71,13 @@ struct trigger_dev {
 
 	atomic_t		trigger_pending;
 	struct work_struct	trigger_work;
+
+	/* Debug stats */
+	atomic64_t		irq_count;
+	atomic64_t		trigger_ok_count;
+	atomic64_t		trigger_fail_count;
+	u32			max_pending;
+	u64			last_irq_ns;
 };
 
 #define TRIGGER_OUTPUT_PULSE_US_DEFAULT	50
@@ -136,10 +145,14 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 	struct trigger_dev *tdev =
 		container_of(work, struct trigger_dev, trigger_work);
 	bool use_gpio;
+	int pending_left;
+	u64 t0, dt_us;
+	s64 seq;
 	int ret;
 
 	/* Drain pending triggers (presses) */
 	while (atomic_dec_if_positive(&tdev->trigger_pending) >= 0) {
+		t0 = ktime_get_ns();
 		mutex_lock(&tdev->mode_mutex);
 		use_gpio = tdev->mode_use_gpio && tdev->output_gpiod;
 		mutex_unlock(&tdev->mode_mutex);
@@ -152,11 +165,27 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 			ret = -ENODEV;
 
 		if (ret) {
+			atomic64_inc(&tdev->trigger_fail_count);
 			dev_err(tdev->dev, "trigger failed: %s ret=%d\n",
 				use_gpio ? "gpio" : "sysfs", ret);
 		} else {
-			dev_info(tdev->dev, "摄像头触发一次拍照\n");
+			atomic64_inc(&tdev->trigger_ok_count);
 		}
+
+		seq = atomic64_read(&tdev->trigger_ok_count) +
+		      atomic64_read(&tdev->trigger_fail_count);
+		pending_left = atomic_read(&tdev->trigger_pending);
+		dt_us = div_u64(ktime_get_ns() - t0, 1000);
+		dev_info(tdev->dev,
+			 "触发处理 seq=%lld mode=%s ret=%d cost=%lluus pending=%d irq_total=%lld ok=%lld fail=%lld\n",
+			 seq,
+			 use_gpio ? "gpio" : "sysfs",
+			 ret,
+			 dt_us,
+			 pending_left,
+			 atomic64_read(&tdev->irq_count),
+			 atomic64_read(&tdev->trigger_ok_count),
+			 atomic64_read(&tdev->trigger_fail_count));
 	}
 }
 
@@ -177,6 +206,8 @@ static void trigger_dev_handle_state(struct trigger_dev *tdev, bool pressed_now)
 		 * lose fast repeated press cycles even if trigger_work is busy.
 		 */
 		atomic_inc(&tdev->trigger_pending);
+		if ((u32)atomic_read(&tdev->trigger_pending) > tdev->max_pending)
+			tdev->max_pending = atomic_read(&tdev->trigger_pending);
 		schedule_work(&tdev->trigger_work);
 	} else {
 		dev_info(tdev->dev, "up\n");
@@ -203,6 +234,26 @@ static void trigger_dev_debounce_work(struct work_struct *work)
 static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 {
 	struct trigger_dev *tdev = dev_id;
+	int pending;
+
+	tdev->last_irq_ns = ktime_get_ns();
+	atomic64_inc(&tdev->irq_count);
+
+	/*
+	 * Fast edge mode:
+	 * debounce=0 means external trigger may be a narrow pulse. Don't sample
+	 * GPIO level in deferred work (may already bounce back), queue one trigger
+	 * per IRQ edge directly.
+	 */
+	if (!tdev->debounce_ms) {
+		pending = atomic_inc_return(&tdev->trigger_pending);
+		if ((u32)pending > tdev->max_pending)
+			tdev->max_pending = pending;
+		schedule_work(&tdev->trigger_work);
+		if (pending > 1)
+			dev_warn(tdev->dev, "触发排队中 pending=%d\n", pending);
+		return IRQ_HANDLED;
+	}
 
 	mod_delayed_work(system_wq, &tdev->debounce_work,
 			 msecs_to_jiffies(tdev->debounce_ms));
@@ -347,6 +398,11 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&tdev->debounce_work, trigger_dev_debounce_work);
 	INIT_WORK(&tdev->trigger_work, trigger_dev_trigger_work);
 	atomic_set(&tdev->trigger_pending, 0);
+	atomic64_set(&tdev->irq_count, 0);
+	atomic64_set(&tdev->trigger_ok_count, 0);
+	atomic64_set(&tdev->trigger_fail_count, 0);
+	tdev->max_pending = 0;
+	tdev->last_irq_ns = 0;
 
 	/* Initialize pressed state without triggering. */
 	val = gpiod_get_value_cansleep(tdev->input_gpiod);
@@ -500,10 +556,28 @@ static ssize_t pulse_interval_us_store(struct device *dev, struct device_attribu
 }
 static DEVICE_ATTR_RW(pulse_interval_us);
 
+static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	u64 now = ktime_get_ns();
+	u64 ago_us = tdev->last_irq_ns ? div_u64(now - tdev->last_irq_ns, 1000) : 0;
+
+	return sysfs_emit(buf,
+			  "irq=%lld ok=%lld fail=%lld pending=%d max_pending=%u last_irq_ago_us=%llu\n",
+			  atomic64_read(&tdev->irq_count),
+			  atomic64_read(&tdev->trigger_ok_count),
+			  atomic64_read(&tdev->trigger_fail_count),
+			  atomic_read(&tdev->trigger_pending),
+			  tdev->max_pending,
+			  ago_us);
+}
+static DEVICE_ATTR_RO(stats);
+
 static struct attribute *trigger_dev_attrs[] = {
 	&dev_attr_mode.attr,
 	&dev_attr_pulse_count.attr,
 	&dev_attr_pulse_interval_us.attr,
+	&dev_attr_stats.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(trigger_dev);

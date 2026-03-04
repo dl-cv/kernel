@@ -24,13 +24,16 @@
 
 ## Sysfs 接口
 
-设备路径：`/sys/devices/platform/trigger-dev.*/`
+设备路径：`/sys/devices/platform/trigger-dev*/`
+
+> 注意：很多系统下设备名就是 `trigger-dev`（没有 `.0`），所以不要写成 `trigger-dev.*`。
 
 | 属性 | 读写 | 说明 |
 |------|------|------|
 | `mode` | RW | 模式切换：`gpio` / `sysfs`（仅当同时配置两种模式时可用） |
 | `pulse_count` | RW | 模式 A：每次外部触发产生的脉冲个数 (1–255) |
 | `pulse_interval_us` | RW | 模式 A：脉冲间隔（微秒） |
+| `stats` | RO | 调试统计：`irq/ok/fail/pending/max_pending/last_irq_ago_us` |
 
 ### 示例
 
@@ -39,15 +42,21 @@
 echo 1 > /sys/bus/i2c/devices/1-0036/trigger
 
 # 查看当前模式
-cat /sys/devices/platform/trigger-dev.*/mode
+
 
 # 切换模式（需同时配置 output-gpios 和 trigger-path）
-echo gpio > /sys/devices/platform/trigger-dev.*/mode
-echo sysfs > /sys/devices/platform/trigger-dev.*/mode
+echo gpio > /sys/devices/platform/trigger-dev*/mode
+echo sysfs > /sys/devices/platform/trigger-dev*/mode
+
+# 查看触发统计（用于排查“偶发没响应”）
+cat /sys/devices/platform/trigger-dev*/stats
 
 # 模式 A：每次触发发 3 个脉冲，间隔 100μs
-echo 3 > /sys/devices/platform/trigger-dev.*/pulse_count
-echo 100 > /sys/devices/platform/trigger-dev.*/pulse_interval_us
+echo 3 > /sys/devices/platform/trigger-dev*/pulse_count
+echo 100 > /sys/devices/platform/trigger-dev*/pulse_interval_us
+
+# 若没有该目录，先确认 trigger-dev 设备是否创建成功
+ls -d /sys/bus/platform/devices/trigger-dev*
 ```
 
 ## Device Tree 配置
@@ -93,11 +102,13 @@ sudo fdtoverlay -i /boot/dtbs/.../rk3588-lubancat-5io.dtb \
 | 模式 | 典型延迟 | 主要耗时 |
 |------|----------|----------|
 | **模式 A** | ~50–150 μs | workqueue 调度 + 50μs 脉冲 |
-| **模式 B** | ~1.5–2.5 ms | sysfs 路径 + I2C 曝光/增益/WB + 脉冲 |
+| **模式 B** | ~1.0–2.0 ms | sysfs 路径 + I2C 曝光/增益/WB + 脉冲 |
 
-**模式 A**：IRQ → debounce_work(0) → trigger_work → 直接 GPIO 脉冲，几乎无 I2C。
+**模式 A**：IRQ（debounce=0 时直接按边沿入队）→ trigger_work → 直接 GPIO 脉冲，几乎无 I2C。
 
-**模式 B**：IRQ → debounce_work → trigger_work → filp_open/kernel_write → os08a20 的 trigger_store → STREAMING + 曝光/增益/WB（约 8–10 次 I2C）+ 脉冲 + STANDBY。
+**模式 B**：IRQ（debounce=0 时直接按边沿入队）→ trigger_work → filp_open/kernel_write → os08a20 的 trigger_store → （已在 streaming 状态）写曝光/增益/WB（按需）+ 脉冲。
+
+> 当前驱动在 `debounce-ms=0` 时采用“按 IRQ 边沿直接入队触发”，避免窄脉冲在延后采样时回弹导致漏触发。
 
 ### 可优化点
 
@@ -105,6 +116,6 @@ sudo fdtoverlay -i /boot/dtbs/.../rk3588-lubancat-5io.dtb \
 |--------|------|------|
 | **高优先级 workqueue** | 模式 A/B | trigger-dev 使用 `alloc_workqueue(..., WQ_HIGHPRI)` 替代 `system_wq`，减少调度延迟 |
 | **合并 debounce + trigger** | 模式 A/B | debounce_ms=0 时，可省去 debounce_work，IRQ 直接 schedule_work(trigger_work) |
-| **跳过 3A 重写** | 模式 B | ✅ 已实现：若曝光/增益/WB 未变，仅 STREAMING + 脉冲 + STANDBY，可省 ~1 ms I2C |
+| **跳过 3A 重写** | 模式 B | ✅ 已实现：若曝光/增益/WB 未变，仅发送 FSIN 脉冲，可省 ~1 ms I2C |
 | **批量 I2C** | 模式 B | ✅ 已实现：STREAMING + 曝光 + 增益合并为一次 I2C 传输 |
 | **模式 A + fsin 共用** | 硬件 | 若需最低延迟且保留软触发，需硬件支持：FSIN 可由 SoC 或 os08a20 驱动，或使用多路复用 |

@@ -19,7 +19,15 @@
 		};
 	};
 
+	/* Disable imx415 when using os08a20 - only one sensor per cam slot */
 	fragment@1 {
+		target = <&dcphy1_imx415>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@2 {
 		target = <&dcphy1_os08a20>;
 		__overlay__ {
 			status = "okay";
@@ -31,7 +39,13 @@
 			//fsin-gpios = <&gpio0 RK_PC6 GPIO_ACTIVE_LOW>;
 
 			/* Pulse width in microseconds (logical active time) */
-			rockchip,fsin-pulse-us = <50>;
+			rockchip,fsin-pulse-us = <200>;
+			/* 低延迟触发时序参数（单位：us） */
+			rockchip,fsin-settle-us = <1000>;
+			/* 最短安全等待：约1帧@30fps */
+			rockchip,trigger-frame-wait-us = <33334>;
+			/* 额外安全边际：减小“偶发切半帧/丢帧”概率 */
+			rockchip,trigger-frame-margin-us = <8000>;
 			/* 触发间隔完全由外部输入控制 */
 			/* 默认曝光行数，用于 V4L2 曝光控件初始值（单位：行） */
 			rockchip,default-exposure = <30>;
@@ -40,7 +54,7 @@
 		};
 	};
 
-	fragment@2 {
+	fragment@3 {
 		target = <&csi2_dcphy1>;
 
 		__overlay__ {
@@ -48,7 +62,7 @@
 		};
 	};
 
-	fragment@3 {
+	fragment@4 {
 		target = <&mipi1_csi2>;
 
 		__overlay__ {
@@ -56,7 +70,7 @@
 		};
 	};
 
-	fragment@4 {
+	fragment@5 {
 		target = <&mipi_dcphy1>;
 
 		__overlay__ {
@@ -64,7 +78,7 @@
 		};
 	};
 
-	fragment@5 {
+	fragment@6 {
 		target = <&rkcif>;
 
 		__overlay__ {
@@ -72,7 +86,7 @@
 		};
 	};
 
-	fragment@6 {
+	fragment@7 {
 		target = <&rkcif_mipi_lvds1>;
 
 		__overlay__ {
@@ -80,7 +94,7 @@
 		};
 	};
 
-	fragment@7 {
+	fragment@8 {
 		target = <&rkcif_mipi_lvds1_sditf>;
 
 		__overlay__ {
@@ -88,7 +102,7 @@
 		};
 	};
 
-	fragment@8 {
+	fragment@9 {
 		target = <&rkcif_mmu>;
 
 		__overlay__ {
@@ -96,7 +110,7 @@
 		};
 	};
 
-	fragment@9 {
+	fragment@10 {
 		target = <&rkisp1>;
 
 		__overlay__ {
@@ -104,7 +118,7 @@
 		};
 	};
 
-	fragment@10 {
+	fragment@11 {
 		target = <&isp1_mmu>;
 
 		__overlay__ {
@@ -112,7 +126,7 @@
 		};
 	};
 
-	fragment@11 {
+	fragment@12 {
 		target = <&rkisp1_vir0>;
 
 		__overlay__ {
