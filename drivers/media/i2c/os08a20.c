@@ -288,9 +288,17 @@ static int os08a20_apply_fsin_slave_profile(struct os08a20 *os08a20)
 	struct os08a20_reg_val regs[] = {
 		{ OS08A20_REG_IO_PAD_OEN2, OS08A20_REG_VALUE_08BIT, 0x00 },
 		{ OS08A20_REG_IO_PAD_OUT,  OS08A20_REG_VALUE_08BIT, 0x00 },
-		{ OS08A20_REG_SYNC_CFG_0,  OS08A20_REG_VALUE_08BIT, 0x08 },
+		{ 0x3008, OS08A20_REG_VALUE_08BIT, 0x00 }, /* Disable GPIO control for VSYNC */
+		{ 0x3206, OS08A20_REG_VALUE_08BIT, 0x10 }, /* Enable FSIN (Bit[4] = 1) */
+		{ 0x3218, OS08A20_REG_VALUE_08BIT, 0xC0 }, /* Wait for external trigger signal */
+		{ OS08A20_REG_SYNC_CFG_0,  OS08A20_REG_VALUE_08BIT, 0x48 }, /* Enable external VSYNC trigger reset */
 		{ OS08A20_REG_SYNC_CFG_1,  OS08A20_REG_VALUE_08BIT, 0x02 },
 		{ OS08A20_REG_SYNC_CFG_2,  OS08A20_REG_VALUE_08BIT, 0x00 },
+		{ 0x4900, OS08A20_REG_VALUE_08BIT, 0x01 }, /* Reset frame control counter */
+		{ 0x4901, OS08A20_REG_VALUE_08BIT, 0x01 }, /* 1 frame on */
+		{ 0x4902, OS08A20_REG_VALUE_08BIT, 0x00 }, /* 0 frames off */
+		{ 0x4903, OS08A20_REG_VALUE_08BIT, 0x01 }, /* Disable all ISPFC masks to test if output is blocked */
+		{ 0x4800, OS08A20_REG_VALUE_08BIT, 0x24 }, /* Disable MIPI clock gating (was 0x64) */
 	};
 	u32 pad_oen2 = 0, sync0 = 0, sync1 = 0, sync2 = 0;
 	int ret;
@@ -559,16 +567,13 @@ static int os08a20_trigger_apply_streaming_exposure_gain(struct os08a20 *os08a20
 				     since_last_us, min_interval_us);
 
 	/*
-	 * Keep STREAMING only long enough for one frame to complete, then
-	 * return to standby to avoid free-running output in FSIN mode.
+	 * In FSIN mode with 0x3218=0xC0, the sensor automatically waits for the next pulse.
+	 * We don't need to put it to standby.
 	 */
 	post_wait_us = base_wait_us;
 	if (post_wait_us < 1000)
 		post_wait_us = 1000;
 	usleep_range(post_wait_us, post_wait_us + 2000);
-
-	ret |= os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
-				 OS08A20_REG_VALUE_08BIT, OS08A20_MODE_SW_STANDBY);
 
 	if (!ret) {
 		os08a20->trigger_count++;
@@ -1380,7 +1385,7 @@ static DEVICE_ATTR_RW(fsin_pulse_us);
 				 ret = os08a20_write_reg(os08a20->client,
 							 OS08A20_REG_CTRL_MODE,
 							 OS08A20_REG_VALUE_08BIT,
-							 OS08A20_MODE_SW_STANDBY);
+							 OS08A20_MODE_STREAMING);
 			 } else {
 				 os08a20->trigger_armed = false;
 				 os08a20->last_trigger_ns = 0;
@@ -1559,7 +1564,7 @@ static DEVICE_ATTR_RW(fsin_pulse_us);
 		/* keep FSIN inactive while armed */
 		gpiod_set_value_cansleep(os08a20->fsin_gpio, 0);
 		ret = os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
-					OS08A20_REG_VALUE_08BIT, OS08A20_MODE_SW_STANDBY);
+					OS08A20_REG_VALUE_08BIT, OS08A20_MODE_STREAMING);
 	} else {
 		ret = os08a20_write_reg(os08a20->client, OS08A20_REG_CTRL_MODE,
 					 OS08A20_REG_VALUE_08BIT, OS08A20_MODE_STREAMING);
