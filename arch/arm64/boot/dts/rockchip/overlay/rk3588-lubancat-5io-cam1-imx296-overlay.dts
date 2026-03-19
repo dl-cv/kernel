@@ -1,0 +1,141 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/usb/pd.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pwm/pwm.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/input/rk-input.h>
+#include <dt-bindings/display/drm_mipi_dsi.h>
+#include <dt-bindings/display/rockchip_vop.h>
+#include <dt-bindings/sensor-dev.h>
+
+/ {
+	/* Link path: sensor->csi2_dcphy1->mipi1_csi2->rkcif_mipi_lvds1->rkcif_mipi_lvds1_sditf->rkisp1_vir0 */
+	/* IMX296 sensor output is CSI-2 1-lane, so the endpoint must stay in 1-lane mode. */
+	fragment@0 {
+		target = <&i2c1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+			/delete-node/ dcphy1-imx415@1a;
+
+			imx296_cam1: imx296@1a {
+				compatible = "sony,imx296lq";
+				status = "okay";
+				reg = <0x1a>;
+				clocks = <&ext_cam_37m_clk>;
+				clock-names = "xvclk";
+				avdd-supply = <&cam_avdd>;
+				ovdd-supply = <&cam_dovdd>;
+				dvdd-supply = <&cam_dvdd>;
+				reset-gpios = <&gpio6 3 GPIO_ACTIVE_LOW>;
+
+				rockchip,camera-module-index = <1>;
+				rockchip,camera-module-facing = "back";
+				rockchip,camera-module-name = "IMX296LQR-C";
+				rockchip,camera-module-lens-name = "default";
+				/*
+				 * Single-camera XTRIG is wired as IMX296 fast
+				 * trigger, so the sensor must stay in master
+				 * mode (XMASTER strapped low on the board).
+				 */
+				rockchip,camera-module-sync-mode = "internal_master";
+
+				/* 0 = FREE_RUN, 1 = XTRIG_ONE_SHOT */
+				trigger-mode = <0>;
+
+				port {
+					imx296_cam1_out: endpoint {
+						remote-endpoint = <&dcphy1_in_imx296>;
+						clock-lanes = <0>;
+						data-lanes = <1>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&csi2_dcphy1>;
+		__overlay__ {
+			status = "okay";
+
+			port@0 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				/delete-node/ endpoint@4;
+
+				dcphy1_in_imx296: endpoint@4 {
+					reg = <4>;
+					remote-endpoint = <&imx296_cam1_out>;
+					data-lanes = <1>;
+				};
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&mipi1_csi2>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target = <&mipi_dcphy1>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@4 {
+		target = <&rkcif>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@5 {
+		target = <&rkcif_mipi_lvds1>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@6 {
+		target = <&rkcif_mipi_lvds1_sditf>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@7 {
+		target = <&rkcif_mmu>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@8 {
+		target = <&rkisp1>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@9 {
+		target = <&isp1_mmu>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@10 {
+		target = <&rkisp1_vir0>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};
