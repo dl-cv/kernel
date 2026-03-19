@@ -5,13 +5,6 @@ cmdline="earlyprintk console=ttyFIQ0 console=tty1 consoleblank=0 loglevel=7 root
 enable_uboot_overlays=1
 #overlay_start
 
-#dtoverlay=/dtb/overlay/rk3588-lubancat-uart4-m2-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-uart7-m2-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-rs485-1-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-rs485-2-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-can1-m1-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-can2-m0-overlay.dtbo
-
 # Display 显示输出配置
 # 每个vp对应一个显示接口，同一个vp同时只能开启一个屏幕
 # 规则1.默认在主设备树中开启hdmi0(vp0,4K)和dp0(vp1,4K)，可即插即用。
@@ -25,20 +18,6 @@ enable_uboot_overlays=1
 dtoverlay=/dtb/overlay/rk3588-lubancat-5io-hdmi0-vp0-overlay.dtbo
 ## vp1
 dtoverlay=/dtb/overlay/rk3588-lubancat-dp0-vp1-overlay.dtbo
-## vp2
-dtoverlay=/dtb/overlay/rk3588-lubancat-5io-hdmi1-vp2-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi0-vp2-1080x1920-5.5inch-ebf410125-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi0-vp2-1024x600-7inch-ebf410173-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi0-vp2-800x1280-10.1inch-ebf410177-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi0-vp2-800x1280-10.1inch-s8001280b1060b-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi0-vp2-generic-overlay.dtbo
-## vp3
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi1-vp3-1080x1920-5.5inch-ebf410125-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi1-vp3-1024x600-7inch-ebf410173-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi1-vp3-800x1280-10.1inch-ebf410177-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi1-vp3-800x1280-10.1inch-s8001280b1060b-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-dsi1-vp3-generic-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-dsi1-vp3-virtual-screen-overlay.dtbo
 
 # hdmi rx
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5io-hdmi-rx-overlay.dtbo
@@ -46,54 +25,10 @@ dtoverlay=/dtb/overlay/rk3588-lubancat-5io-hdmi1-vp2-overlay.dtbo
 # trigger-dev(按键触发拍照，GPIO1_A3，高电平=按下)
 #dtoverlay=/dtb/overlay/rk3588-lubancat-5io-trigger-dev-overlay.dtbo
 
-# cam0
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-imx415-3840x2160-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-imx415-1920x1080-60fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-ov8858-3264x2448-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-ov8858-1632x1224-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-gc08a8-3264x2448-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-gc2053-1920x1080-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam0-gc4653-2560x1440-30fps-overlay.dtbo
 # cam1
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-imx415-3840x2160-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-imx415-1920x1080-60fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-ov8858-3264x2448-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-ov8858-1632x1224-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-gc08a8-3264x2448-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-gc2053-1920x1080-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-gc4653-2560x1440-30fps-overlay.dtbo
-# cam2
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-imx415-3840x2160-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-imx415-1920x1080-60fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-ov8858-3264x2448-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-ov8858-1632x1224-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-gc08a8-3264x2448-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-gc2053-1920x1080-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam2-gc4653-2560x1440-30fps-overlay.dtbo
-# cam3
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-imx415-3840x2160-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-imx415-1920x1080-60fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-ov8858-3264x2448-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-ov8858-1632x1224-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-gc08a8-3264x2448-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-gc2053-1920x1080-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam3-gc4653-2560x1440-30fps-overlay.dtbo
-# cam4
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-imx415-3840x2160-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-imx415-1920x1080-60fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-ov8858-3264x2448-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-ov8858-1632x1224-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-gc08a8-3264x2448-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-gc2053-1920x1080-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam4-gc4653-2560x1440-30fps-overlay.dtbo
-# cam5
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-imx415-3840x2160-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-imx415-1920x1080-60fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-ov8858-3264x2448-15fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-ov8858-1632x1224-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-gc08a8-3264x2448-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-gc2053-1920x1080-30fps-overlay.dtbo
-#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam5-gc4653-2560x1440-30fps-overlay.dtbo
+#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-os08a20-3840x2160-30fps-overlay.dtbo
+#dtoverlay=/dtb/overlay/rk3588-lubancat-5io-cam1-imx415-overlay.dtbo
+
 
 #overlay_end
 
