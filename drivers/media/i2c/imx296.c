@@ -13,12 +13,16 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/videodev2.h>
 
 #include <linux/rk-camera-module.h>
@@ -38,6 +42,11 @@
 #define IMX296_PIXEL_ARRAY_WIDTH		1456
 #define IMX296_PIXEL_ARRAY_HEIGHT		1088
 #define IMX296_PIXEL_RATE			(1188000000ULL / 10)
+#define IMX296_NUM_DATA_LANES			1U
+#define IMX296_BITS_PER_SAMPLE			10U
+#define IMX296_LINK_FREQ			(IMX296_PIXEL_RATE * \
+						 IMX296_BITS_PER_SAMPLE / \
+						 (2 * IMX296_NUM_DATA_LANES))
 
 #define IMX296_REG_8BIT(n)			((1 << 16) | (n))
 #define IMX296_REG_16BIT(n)			((2 << 16) | (n))
@@ -138,7 +147,6 @@
 #define IMX296_MIN_MEMORY_WAIT_LINES		4U
 #define IMX296_OP_CLK_FREQ_HZ			74250000ULL
 #define IMX296_EXPOSURE_OFFSET_NS		14260ULL
-
 #define OF_CAMERA_PINCTRL_STATE_DEFAULT		"rockchip,camera_default"
 #define OF_CAMERA_PINCTRL_STATE_SLEEP		"rockchip,camera_sleep"
 #define OF_IMX296_TRIGGER_MODE			"trigger-mode"
@@ -207,6 +215,7 @@ struct imx296 {
 	struct v4l2_ctrl *anal_gain;
 	struct v4l2_ctrl *hblank;
 	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *test_pattern;
 	struct v4l2_ctrl *vflip;
@@ -237,6 +246,22 @@ static const char * const imx296_op_mode_menu[] = {
 	"XTRIG_ONE_SHOT",
 };
 
+static const s64 imx296_link_freq_menu[] = {
+	IMX296_LINK_FREQ,
+};
+
+static const char *imx296_op_mode_name(enum imx296_op_mode mode)
+{
+	switch (mode) {
+	case IMX296_FREE_RUN:
+		return "free_run";
+	case IMX296_XTRIG_ONE_SHOT:
+		return "master_fast_trigger";
+	default:
+		return "unknown";
+	}
+}
+
 static const char *imx296_sync_mode_name(enum rkmodule_sync_mode mode)
 {
 	switch (mode) {
@@ -252,9 +277,43 @@ static const char *imx296_sync_mode_name(enum rkmodule_sync_mode mode)
 	}
 }
 
+static int imx296_parse_run_mode(const char *buf, enum imx296_op_mode *mode)
+{
+	if (sysfs_streq(buf, "free_run") ||
+	    sysfs_streq(buf, "normal") ||
+	    sysfs_streq(buf, "continuous") ||
+	    sysfs_streq(buf, "0")) {
+		*mode = IMX296_FREE_RUN;
+		return 0;
+	}
+
+	if (sysfs_streq(buf, "master_fast_trigger") ||
+	    sysfs_streq(buf, "fast_trigger") ||
+	    sysfs_streq(buf, "xtrig_one_shot") ||
+	    sysfs_streq(buf, "trigger") ||
+	    sysfs_streq(buf, "1")) {
+		*mode = IMX296_XTRIG_ONE_SHOT;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static struct imx296 *imx296_from_dev(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+
+	if (!sd)
+		return NULL;
+
+	return to_imx296(sd);
+}
+
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);
 static int imx296_mode_switch(struct imx296 *sensor,
 			      enum imx296_op_mode new_mode);
+static u32 imx296_mbus_code(const struct imx296 *sensor);
 
 static const struct v4l2_ctrl_ops imx296_ctrl_ops = {
 	.s_ctrl = imx296_set_ctrl,
@@ -271,6 +330,51 @@ static const struct v4l2_ctrl_config imx296_op_mode_ctrl_cfg = {
 	.qmenu = imx296_op_mode_menu,
 };
 
+static ssize_t run_mode_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf,
+			 "pending=%s\nactive=%s\nstreaming=%u\navailable=free_run master_fast_trigger\n",
+			 imx296_op_mode_name(sensor->pending_mode),
+			 imx296_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+
+static ssize_t run_mode_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	enum imx296_op_mode mode;
+	int ret;
+
+	if (!sensor || !sensor->op_mode_ctrl)
+		return -ENODEV;
+
+	ret = imx296_parse_run_mode(buf, &mode);
+	if (ret)
+		return ret;
+
+	ret = v4l2_ctrl_s_ctrl(sensor->op_mode_ctrl, mode);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "run mode switched to %s\n", imx296_op_mode_name(mode));
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(run_mode);
+
 static int imx296_read(struct imx296 *sensor, u32 addr)
 {
 	u8 data[3] = { 0, 0, 0 };
@@ -282,6 +386,55 @@ static int imx296_read(struct imx296 *sensor, u32 addr)
 		return ret;
 
 	return (data[2] << 16) | (data[1] << 8) | data[0];
+}
+
+static void imx296_log_stream_state_locked(struct imx296 *sensor, const char *tag)
+{
+	u32 ctrl00, ctrl08, ctrl0a, ctrl0b, syncsel, lowlagtrg, pgctrl;
+	u32 reg = 0;
+	const char *name = NULL;
+	int ret;
+
+#define IMX296_READBACK(_reg, _dst, _name) \
+	do { \
+		reg = (_reg); \
+		name = (_name); \
+		ret = imx296_read(sensor, reg); \
+		if (ret < 0) \
+			goto read_fail; \
+		(_dst) = ret; \
+	} while (0)
+
+	IMX296_READBACK(IMX296_CTRL00, ctrl00, "CTRL00");
+	IMX296_READBACK(IMX296_CTRL08, ctrl08, "CTRL08");
+	IMX296_READBACK(IMX296_CTRL0A, ctrl0a, "CTRL0A");
+	IMX296_READBACK(IMX296_CTRL0B, ctrl0b, "CTRL0B");
+	IMX296_READBACK(IMX296_SYNCSEL, syncsel, "SYNCSEL");
+	IMX296_READBACK(IMX296_LOWLAGTRG, lowlagtrg, "LOWLAGTRG");
+	IMX296_READBACK(IMX296_PGCTRL, pgctrl, "PGCTRL");
+
+#undef IMX296_READBACK
+
+	dev_info(sensor->dev,
+		 "stream-state[%s]: pending=%s active=%s test_pattern=%u ctrl00=0x%02x standby=%u ctrl08=0x%02x reghold=%u ctrl0a=0x%02x xmsta=%u ctrl0b=0x%02x trigen=%u syncsel=0x%02x lowlag=0x%02x pgctrl=0x%02x regen=%u clken=%u pg_mode=%u\n",
+		 tag,
+		 imx296_op_mode_name(sensor->pending_mode),
+		 imx296_op_mode_name(sensor->active_mode),
+		 sensor->test_pattern ? sensor->test_pattern->val : 0,
+		 ctrl00, !!(ctrl00 & IMX296_CTRL00_STANDBY),
+		 ctrl08, !!(ctrl08 & IMX296_CTRL08_REGHOLD),
+		 ctrl0a, !!(ctrl0a & IMX296_CTRL0A_XMSTA),
+		 ctrl0b, !!(ctrl0b & IMX296_CTRL0B_TRIGEN),
+		 syncsel, lowlagtrg, pgctrl,
+		 !!(pgctrl & IMX296_PGCTRL_REGEN),
+		 !!(pgctrl & IMX296_PGCTRL_CLKEN),
+		 (pgctrl >> 3) & 0x1f);
+	return;
+
+read_fail:
+	dev_warn(sensor->dev,
+		 "stream-state[%s]: failed to read %s (0x%04x): %d\n",
+		 tag, name, reg & IMX296_REG_ADDR_MASK, ret);
 }
 
 static int imx296_write(struct imx296 *sensor, u32 addr, u32 value, int *err)
@@ -594,7 +747,7 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 	if (ret < 0)
 		return ret;
 
-	ret = v4l2_ctrl_handler_init(handler, 10);
+	ret = v4l2_ctrl_handler_init(handler, 11);
 	if (ret)
 		return ret;
 
@@ -628,6 +781,13 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 					   IMX296_VBLANK_DEFAULT,
 					   IMX296_VBLANK_MAX, 1,
 					   IMX296_VBLANK_DEFAULT);
+
+	sensor->link_freq = v4l2_ctrl_new_int_menu(handler, NULL,
+						   V4L2_CID_LINK_FREQ,
+						   ARRAY_SIZE(imx296_link_freq_menu) - 1,
+						   0, imx296_link_freq_menu);
+	if (sensor->link_freq)
+		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	sensor->pixel_rate = v4l2_ctrl_new_std(handler, NULL,
 					       V4L2_CID_PIXEL_RATE,
@@ -834,9 +994,13 @@ static int imx296_stream_on(struct imx296 *sensor)
 {
 	int ret = 0;
 
+	imx296_log_stream_state_locked(sensor, "before-on");
+
 	imx296_write(sensor, IMX296_CTRL00, 0, &ret);
 	usleep_range(2000, 5000);
 	imx296_write(sensor, IMX296_CTRL0A, 0, &ret);
+
+	imx296_log_stream_state_locked(sensor, ret ? "after-on-error" : "after-on");
 
 	__v4l2_ctrl_grab(sensor->vflip, 1);
 	__v4l2_ctrl_grab(sensor->hflip, 1);
@@ -1710,6 +1874,10 @@ static int imx296_probe(struct i2c_client *client,
 	if (ret)
 		goto err_pm;
 
+	ret = device_create_file(dev, &dev_attr_run_mode);
+	if (ret)
+		goto err_subdev;
+
 	pm_runtime_set_autosuspend_delay(dev, 1000);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_put_autosuspend(dev);
@@ -1718,14 +1886,15 @@ static int imx296_probe(struct i2c_client *client,
 		 DRIVER_VERSION >> 16,
 		 (DRIVER_VERSION & 0xff00) >> 8,
 		 DRIVER_VERSION & 0x00ff,
-		 sensor->pending_mode == IMX296_FREE_RUN ?
-		 "FREE_RUN" : "XTRIG_ONE_SHOT");
+		 imx296_op_mode_name(sensor->pending_mode));
 	dev_info(dev,
 		 "sync mode: %s (single-camera XTRIG uses fast trigger in sensor master mode)\n",
 		 imx296_sync_mode_name(sensor->sync_mode));
 
 	return 0;
 
+err_subdev:
+	v4l2_async_unregister_subdev(sd);
 err_pm:
 	pm_runtime_disable(dev);
 	pm_runtime_put_noidle(dev);
@@ -1742,6 +1911,7 @@ static int imx296_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx296 *sensor = to_imx296(sd);
 
+	device_remove_file(sensor->dev, &dev_attr_run_mode);
 	v4l2_async_unregister_subdev(sd);
 	imx296_subdev_cleanup(sensor);
 	mutex_destroy(&sensor->mutex);

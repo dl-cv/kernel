@@ -388,6 +388,39 @@
 		};
 	};
 
+	dcphy1_imx296: dcphy1-imx296@1a {
+		compatible = "sony,imx296lq";
+		status = "disabled";
+		reg = <0x1a>;
+		clocks = <&ext_cam_37m_clk>;
+		clock-names = "xvclk";
+		avdd-supply = <&cam_avdd>;
+		ovdd-supply = <&cam_dovdd>;
+		dvdd-supply = <&cam_dvdd>;
+		reset-gpios = <&gpio6 3 GPIO_ACTIVE_LOW>;
+
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "IMX296LQR-C";
+		rockchip,camera-module-lens-name = "default";
+		rockchip,camera-module-sync-mode = "internal_master";
+		trigger-mode = <0>;
+
+		port {
+			imx296_dcphy1_out: endpoint {
+				remote-endpoint = <&dcphy1_in_imx296>;
+				clock-lanes = <0>;
+				data-lanes = <1>;
+			};
+		};
+	};
+
+	gd32_mcu: gd32-mcu@2a {
+		compatible = "gd,gd32-mcu";
+		status = "disabled";
+		reg = <0x2a>;
+	};
+
 	dcphy1_gc08a8: dcphy1-gc08a8@31 {
 		compatible = "galaxycore,gc08a8";
 		status = "disabled";
@@ -1596,7 +1629,13 @@
 				reg = <8>;
 				remote-endpoint = <&os08a20_dcphy1_out>;
 				data-lanes = <1 2 3 4>;
-			};			
+			};
+
+			dcphy1_in_imx296: endpoint@9 {
+				reg = <9>;
+				remote-endpoint = <&imx296_dcphy1_out>;
+				data-lanes = <1>;
+			};
 		};
 
 		port@1 {
