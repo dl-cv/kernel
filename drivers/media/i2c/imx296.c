@@ -16,6 +16,7 @@
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/pwm.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -150,6 +151,12 @@
 #define OF_CAMERA_PINCTRL_STATE_DEFAULT		"rockchip,camera_default"
 #define OF_CAMERA_PINCTRL_STATE_SLEEP		"rockchip,camera_sleep"
 #define OF_IMX296_TRIGGER_MODE			"trigger-mode"
+#define OF_IMX296_TRIGGER_PULSE_US		"rockchip,trigger-pulse-us"
+#define IMX296_TRIGGER_PULSE_US_DEFAULT		5U
+#define IMX296_TRIGGER_PULSE_US_MIN		1U
+#define IMX296_TRIGGER_PULSE_US_MAX		1000000U
+#define IMX296_TRIGGER_PERIOD_NS_DEFAULT	10000000ULL
+#define IMX296_TRIGGER_PERIOD_MARGIN_NS		10000000ULL
 
 #ifndef V4L2_CID_USER_IMX296_BASE
 #define V4L2_CID_USER_IMX296_BASE		(V4L2_CID_USER_BASE + 0x10d0)
@@ -185,6 +192,7 @@ struct imx296 {
 	struct clk *clk;
 	struct regulator_bulk_data supplies[ARRAY_SIZE(imx296_supply_names)];
 	struct gpio_desc *reset_gpio;
+	struct pwm_device *trigger_pwm;
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pins_default;
 	struct pinctrl_state *pins_sleep;
@@ -199,6 +207,7 @@ struct imx296 {
 	enum rkmodule_sync_mode sync_mode;
 	enum imx296_op_mode active_mode;
 	enum imx296_op_mode pending_mode;
+	u32 trigger_pulse_us;
 
 	u32 module_index;
 	const char *module_facing;
@@ -310,6 +319,125 @@ static struct imx296 *imx296_from_dev(struct device *dev)
 	return to_imx296(sd);
 }
 
+static struct pwm_device *imx296_devm_pwm_get_optional(struct device *dev,
+						       const char *con_id)
+{
+	struct pwm_device *pwm;
+	int ret;
+
+	pwm = devm_pwm_get(dev, con_id);
+	if (IS_ERR(pwm)) {
+		ret = PTR_ERR(pwm);
+		if (ret == -ENOENT || ret == -ENODEV)
+			return NULL;
+		return pwm;
+	}
+
+	return pwm;
+}
+
+static u64 imx296_pwm_period_ns(struct pwm_device *pwm)
+{
+	struct pwm_state state;
+	struct pwm_args args;
+
+	if (!pwm)
+		return 0;
+
+	pwm_get_state(pwm, &state);
+	if (state.period)
+		return state.period;
+
+	pwm_get_args(pwm, &args);
+	return args.period;
+}
+
+static u64 imx296_trigger_period_ns(u64 pulse_ns, u64 base_period_ns)
+{
+	u64 min_period_ns = pulse_ns + IMX296_TRIGGER_PERIOD_MARGIN_NS;
+
+	if (base_period_ns < IMX296_TRIGGER_PERIOD_NS_DEFAULT)
+		base_period_ns = IMX296_TRIGGER_PERIOD_NS_DEFAULT;
+
+	return max(base_period_ns, min_period_ns);
+}
+
+static int imx296_init_trigger_pwm(struct imx296 *sensor)
+{
+	struct pwm_state state = { 0 };
+	u64 pulse_ns;
+
+	if (!sensor->trigger_pwm)
+		return 0;
+
+	pulse_ns = (u64)sensor->trigger_pulse_us * 1000ULL;
+	state.period = imx296_trigger_period_ns(
+		pulse_ns, imx296_pwm_period_ns(sensor->trigger_pwm));
+	state.duty_cycle = 0;
+	state.polarity = PWM_POLARITY_INVERSED;
+	state.enabled = false;
+
+	return pwm_apply_state(sensor->trigger_pwm, &state);
+}
+
+static int imx296_trigger_once_locked(struct imx296 *sensor)
+{
+	struct pwm_state state;
+	u64 duty_ns;
+	u32 pulse_us;
+	int ret;
+
+	if (!sensor->trigger_pwm)
+		return -ENODEV;
+
+	pulse_us = clamp_t(u32, sensor->trigger_pulse_us,
+			   IMX296_TRIGGER_PULSE_US_MIN,
+			   IMX296_TRIGGER_PULSE_US_MAX);
+	duty_ns = (u64)pulse_us * 1000ULL;
+
+	pwm_get_state(sensor->trigger_pwm, &state);
+	state.period = imx296_trigger_period_ns(
+		duty_ns, imx296_pwm_period_ns(sensor->trigger_pwm));
+	state.duty_cycle = duty_ns;
+	state.polarity = PWM_POLARITY_INVERSED;
+	state.enabled = true;
+
+	ret = pwm_apply_state(sensor->trigger_pwm, &state);
+	if (ret)
+		return ret;
+
+	/*
+	 * Keep the PWM enabled long enough for the low-active portion to finish,
+	 * then disable before the next period starts so userspace gets exactly
+	 * one low pulse per write.
+	 */
+	if (pulse_us <= 1000)
+		udelay(pulse_us);
+	else
+		usleep_range(pulse_us, pulse_us + max_t(u32, 20U, pulse_us / 10U));
+
+	state.duty_cycle = 0;
+	state.enabled = false;
+	ret = pwm_apply_state(sensor->trigger_pwm, &state);
+	if (ret)
+		return ret;
+
+	dev_info(sensor->dev,
+		 "trigger pulse emitted: width=%u us idle=high active=low mode=%s streaming=%u\n",
+		 pulse_us,
+		 imx296_op_mode_name(sensor->streaming ?
+				     sensor->active_mode :
+				     sensor->pending_mode),
+		 sensor->streaming);
+
+	if (sensor->streaming && sensor->active_mode != IMX296_XTRIG_ONE_SHOT)
+		dev_warn(sensor->dev,
+			 "trigger pulse was emitted while active mode is %s; switch run_mode to master_fast_trigger for one-shot capture\n",
+			 imx296_op_mode_name(sensor->active_mode));
+
+	return 0;
+}
+
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);
 static int imx296_mode_switch(struct imx296 *sensor,
 			      enum imx296_op_mode new_mode);
@@ -374,6 +502,108 @@ static ssize_t run_mode_store(struct device *dev, struct device_attribute *attr,
 }
 
 static DEVICE_ATTR_RW(run_mode);
+
+static ssize_t trigger_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf,
+			 "available=echo 1 > trigger\npulse_us=%u\nidle=high\nactive=low\npwm_present=%u\npending=%s\nactive_mode=%s\nstreaming=%u\n",
+			 sensor->trigger_pulse_us,
+			 !!sensor->trigger_pwm,
+			 imx296_op_mode_name(sensor->pending_mode),
+			 imx296_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+
+static ssize_t trigger_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	unsigned int val;
+	int ret;
+
+	if (!sensor)
+		return -ENODEV;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	if (!val)
+		return count;
+	if (val != 1)
+		return -EINVAL;
+
+	mutex_lock(&sensor->mutex);
+	ret = imx296_trigger_once_locked(sensor);
+	mutex_unlock(&sensor->mutex);
+
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(trigger);
+
+static ssize_t trigger_pulse_us_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf, "%u\n", sensor->trigger_pulse_us);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+
+static ssize_t trigger_pulse_us_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	unsigned int pulse_us;
+
+	if (!sensor)
+		return -ENODEV;
+
+	if (kstrtouint(buf, 0, &pulse_us))
+		return -EINVAL;
+	if (pulse_us < IMX296_TRIGGER_PULSE_US_MIN ||
+	    pulse_us > IMX296_TRIGGER_PULSE_US_MAX)
+		return -ERANGE;
+
+	mutex_lock(&sensor->mutex);
+	sensor->trigger_pulse_us = pulse_us;
+	mutex_unlock(&sensor->mutex);
+
+	dev_info(dev, "trigger pulse width set to %u us\n", pulse_us);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(trigger_pulse_us);
+
+static struct attribute *imx296_attrs[] = {
+	&dev_attr_run_mode.attr,
+	&dev_attr_trigger.attr,
+	&dev_attr_trigger_pulse_us.attr,
+	NULL
+};
+
+static const struct attribute_group imx296_attr_group = {
+	.attrs = imx296_attrs,
+};
 
 static int imx296_read(struct imx296 *sensor, u32 addr)
 {
@@ -1799,6 +2029,28 @@ static int imx296_probe(struct i2c_client *client,
 		return dev_err_probe(dev, PTR_ERR(sensor->clk),
 				     "failed to get input clock\n");
 
+	sensor->trigger_pulse_us = IMX296_TRIGGER_PULSE_US_DEFAULT;
+	ret = of_property_read_u32(node, OF_IMX296_TRIGGER_PULSE_US,
+				   &trigger_mode);
+	if (!ret) {
+		if (trigger_mode < IMX296_TRIGGER_PULSE_US_MIN ||
+		    trigger_mode > IMX296_TRIGGER_PULSE_US_MAX) {
+			dev_warn(dev,
+				 "trigger pulse width %u us is out of range, defaulting to %u us\n",
+				 trigger_mode, IMX296_TRIGGER_PULSE_US_DEFAULT);
+		} else {
+			sensor->trigger_pulse_us = trigger_mode;
+		}
+	} else if (ret != -EINVAL) {
+		return dev_err_probe(dev, ret,
+				     "failed to read trigger pulse width\n");
+	}
+
+	sensor->trigger_pwm = imx296_devm_pwm_get_optional(dev, "trigger");
+	if (IS_ERR(sensor->trigger_pwm))
+		return dev_err_probe(dev, PTR_ERR(sensor->trigger_pwm),
+				     "failed to get trigger pwm\n");
+
 	sensor->pinctrl = devm_pinctrl_get(dev);
 	if (!IS_ERR(sensor->pinctrl)) {
 		sensor->pins_default =
@@ -1834,6 +2086,10 @@ static int imx296_probe(struct i2c_client *client,
 		return PTR_ERR(sensor->regmap);
 
 	mutex_init(&sensor->mutex);
+
+	ret = imx296_init_trigger_pwm(sensor);
+	if (ret)
+		goto err_destroy_mutex;
 
 	ret = imx296_power_on(sensor);
 	if (ret)
@@ -1874,7 +2130,7 @@ static int imx296_probe(struct i2c_client *client,
 	if (ret)
 		goto err_pm;
 
-	ret = device_create_file(dev, &dev_attr_run_mode);
+	ret = devm_device_add_group(dev, &imx296_attr_group);
 	if (ret)
 		goto err_subdev;
 
@@ -1890,6 +2146,10 @@ static int imx296_probe(struct i2c_client *client,
 	dev_info(dev,
 		 "sync mode: %s (single-camera XTRIG uses fast trigger in sensor master mode)\n",
 		 imx296_sync_mode_name(sensor->sync_mode));
+	if (sensor->trigger_pwm)
+		dev_info(dev,
+			 "trigger pwm ready: default low pulse=%u us\n",
+			 sensor->trigger_pulse_us);
 
 	return 0;
 
@@ -1911,7 +2171,6 @@ static int imx296_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx296 *sensor = to_imx296(sd);
 
-	device_remove_file(sensor->dev, &dev_attr_run_mode);
 	v4l2_async_unregister_subdev(sd);
 	imx296_subdev_cleanup(sensor);
 	mutex_destroy(&sensor->mutex);

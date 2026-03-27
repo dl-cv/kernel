@@ -6,6 +6,7 @@
 
 
 #include "rk3588-lubancat-cam.dtsi"
+#include <dt-bindings/pwm/pwm.h>
 
 //CAM 0
 /* Link path: sensor->csi2_dcphy0->mipi0_csi2->rkcif_mipi_lvds--->rkcif_mipi_lvds_sditf->rkisp0_vir0 */
@@ -394,10 +395,13 @@
 		reg = <0x1a>;
 		clocks = <&ext_cam_37m_clk>;
 		clock-names = "xvclk";
+		pwm-names = "trigger";
+		pwms = <&pwm14 0 10000000 PWM_POLARITY_INVERTED>;
 		avdd-supply = <&cam_avdd>;
 		ovdd-supply = <&cam_dovdd>;
 		dvdd-supply = <&cam_dvdd>;
 		reset-gpios = <&gpio6 3 GPIO_ACTIVE_LOW>;
+		rockchip,trigger-pulse-us = <5>;
 
 		rockchip,camera-module-index = <1>;
 		rockchip,camera-module-facing = "back";

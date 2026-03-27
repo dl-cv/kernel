@@ -105,6 +105,15 @@
 	};
 
 	fragment@13 {
+		target = <&pwm14>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "active";
+			pinctrl-0 = <&pwm14m2_pins>;
+		};
+	};
+
+	fragment@14 {
 		target = <&dcphy1_imx415>;
 		__overlay__ {
 			/*
