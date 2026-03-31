@@ -5,13 +5,15 @@
  * Features:
  * - GPIO input (edge interrupt)
  * - Press/release prints: "down"(red) / "up"
- * - One-shot trigger per press (must release before next trigger)
+ * - Two input modes:
+ *   1. button: debounce + press/release state machine, safe for keys
+ *   2. edge: fast active-edge trigger, suitable for clean external pulses
  * - Two trigger modes (lower latency first):
  *   1. trigger-output-gpios: directly pulse GPIO (e.g. camera FSIN) - minimal latency
  *   2. trigger-path: write to sysfs "echo 1 > ..." - fallback for software trigger
  *
- * When trigger-output-gpios is set, the camera node must NOT have fsin-gpios
- * (same GPIO, single owner). Use /delete-property/ fsin-gpios in overlay if needed.
+ * When trigger-output-gpios is set, keep a single owner for that output GPIO.
+ * If another node already claims the same pin, remove one side in DT.
  */
 
 #include <linux/atomic.h>
@@ -21,6 +23,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -36,10 +39,16 @@
 #define ANSI_RED   "\033[1;31m"
 #define ANSI_RESET "\033[0m"
 
+enum trigger_dev_input_mode {
+	TRIGGER_DEV_INPUT_MODE_EDGE = 0,
+	TRIGGER_DEV_INPUT_MODE_BUTTON,
+};
+
 struct trigger_dev {
 	struct device		*dev;
 	struct gpio_desc	*input_gpiod;
 	int			irq;
+	enum trigger_dev_input_mode input_mode;
 
 	/* Input device */
 	struct input_dev	*input;
@@ -82,6 +91,77 @@ struct trigger_dev {
 
 #define TRIGGER_OUTPUT_PULSE_US_DEFAULT	50
 #define TRIGGER_OUTPUT_PULSE_COUNT_DEFAULT	1
+
+static const char *trigger_dev_input_mode_name(enum trigger_dev_input_mode mode)
+{
+	switch (mode) {
+	case TRIGGER_DEV_INPUT_MODE_BUTTON:
+		return "button";
+	case TRIGGER_DEV_INPUT_MODE_EDGE:
+	default:
+		return "edge";
+	}
+}
+
+static int trigger_dev_parse_input_mode(const char *buf,
+					enum trigger_dev_input_mode *mode)
+{
+	if (sysfs_streq(buf, "edge") || sysfs_streq(buf, "pulse")) {
+		*mode = TRIGGER_DEV_INPUT_MODE_EDGE;
+		return 0;
+	}
+
+	if (sysfs_streq(buf, "button")) {
+		*mode = TRIGGER_DEV_INPUT_MODE_BUTTON;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static unsigned int
+trigger_dev_irq_type_for_mode(struct trigger_dev *tdev,
+			      enum trigger_dev_input_mode mode)
+{
+	bool active_low = gpiod_is_active_low(tdev->input_gpiod);
+
+	if (mode == TRIGGER_DEV_INPUT_MODE_BUTTON)
+		return IRQ_TYPE_EDGE_BOTH;
+
+	return active_low ? IRQ_TYPE_EDGE_FALLING : IRQ_TYPE_EDGE_RISING;
+}
+
+static int trigger_dev_refresh_pressed_state(struct trigger_dev *tdev)
+{
+	int val;
+
+	val = gpiod_get_value_cansleep(tdev->input_gpiod);
+	if (val < 0)
+		return val;
+
+	tdev->pressed = !!val;
+	return 0;
+}
+
+static int trigger_dev_set_input_mode(struct trigger_dev *tdev,
+				      enum trigger_dev_input_mode mode)
+{
+	unsigned int irq_type = trigger_dev_irq_type_for_mode(tdev, mode);
+	int ret;
+
+	disable_irq(tdev->irq);
+	cancel_delayed_work_sync(&tdev->debounce_work);
+
+	ret = irq_set_irq_type(tdev->irq, irq_type);
+	if (!ret) {
+		ret = trigger_dev_refresh_pressed_state(tdev);
+		if (!ret)
+			WRITE_ONCE(tdev->input_mode, mode);
+	}
+
+	enable_irq(tdev->irq);
+	return ret;
+}
 
 /* Direct GPIO pulse (FSIN): count and interval configurable per external trigger */
 static int trigger_dev_pulse_output(struct trigger_dev *tdev)
@@ -234,6 +314,7 @@ static void trigger_dev_debounce_work(struct work_struct *work)
 static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 {
 	struct trigger_dev *tdev = dev_id;
+	enum trigger_dev_input_mode input_mode = READ_ONCE(tdev->input_mode);
 	int pending;
 
 	tdev->last_irq_ns = ktime_get_ns();
@@ -241,11 +322,11 @@ static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 
 	/*
 	 * Fast edge mode:
-	 * debounce=0 means external trigger may be a narrow pulse. Don't sample
-	 * GPIO level in deferred work (may already bounce back), queue one trigger
-	 * per IRQ edge directly.
+	 * Queue one trigger for each active edge. This is intended for clean
+	 * external pulses where the rising edge should be ignored and the input
+	 * may already bounce back before deferred work runs.
 	 */
-	if (!tdev->debounce_ms) {
+	if (input_mode == TRIGGER_DEV_INPUT_MODE_EDGE) {
 		pending = atomic_inc_return(&tdev->trigger_pending);
 		if ((u32)pending > tdev->max_pending)
 			tdev->max_pending = pending;
@@ -265,6 +346,7 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 	const char *path;
 	const char *value;
 	const char *attr;
+	const char *input_mode;
 	u32 bus, addr;
 	int ret;
 
@@ -276,9 +358,18 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 	tdev->debounce_ms = 0;
 	device_property_read_u32(dev, "debounce-ms", &tdev->debounce_ms);
 
+	tdev->input_mode = TRIGGER_DEV_INPUT_MODE_EDGE;
+	input_mode = "edge";
+	ret = device_property_read_string(dev, "trigger-input-mode", &input_mode);
+	if (!ret) {
+		ret = trigger_dev_parse_input_mode(input_mode, &tdev->input_mode);
+		if (ret)
+			return ret;
+	}
+
 	/*
-	 * trigger-output-gpios: 直连 GPIO 脉冲(Mode A)，如相机 FSIN。
-	 * 使用此模式时，相机节点不得配置 fsin-gpios（同一 GPIO 只能有一个所有者）。
+	 * trigger-output-gpios: 直连 GPIO 脉冲(Mode A)，如相机触发脚。
+	 * 使用此模式时，确保该输出 GPIO 没有被其它节点占用。
 	 */
 	tdev->output_gpiod = devm_gpiod_get_optional(dev, "output", GPIOD_OUT_LOW);
 	if (IS_ERR(tdev->output_gpiod))
@@ -351,7 +442,6 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	struct trigger_dev *tdev;
 	int irq;
 	int ret;
-	int val;
 	int gpio;
 	bool active_low;
 	int gpiod_err;
@@ -404,11 +494,9 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	tdev->max_pending = 0;
 	tdev->last_irq_ns = 0;
 
-	/* Initialize pressed state without triggering. */
-	val = gpiod_get_value_cansleep(tdev->input_gpiod);
-	if (val < 0)
-		return dev_err_probe(dev, val, "failed to read initial gpio state\n");
-	tdev->pressed = !!val;
+	ret = trigger_dev_refresh_pressed_state(tdev);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to read initial gpio state\n");
 
 	ret = input_register_device(tdev->input);
 	if (ret)
@@ -425,28 +513,31 @@ static int trigger_dev_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, irq, "failed to get irq for input gpio\n");
 	tdev->irq = irq;
 
-	/*
-	 * IRQ flags: use IRQF_TRIGGER_FALLING for "active low, normally high"
-	 * (falling edge = trigger). If DT specifies interrupts property, the
-	 * flags may be overridden by irq_create_of_mapping; request_irq uses
-	 * the combined result. For gpiod_to_irq path, we pass the desired flags.
-	 */
+	ret = irq_set_irq_type(tdev->irq,
+			       trigger_dev_irq_type_for_mode(tdev,
+							      tdev->input_mode));
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to configure irq type\n");
+
 	ret = devm_request_any_context_irq(dev, tdev->irq, trigger_dev_irq,
-					   IRQF_TRIGGER_FALLING,
-					   TRIGGER_DEV_MODNAME, tdev);
+					   0, TRIGGER_DEV_MODNAME, tdev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to request irq\n");
 
 	gpio = desc_to_gpio(tdev->input_gpiod);
 	active_low = gpiod_is_active_low(tdev->input_gpiod);
-	dev_info(dev, "ready: gpio=%d irq=%d active_low=%d debounce_ms=%u key_code=%u mode=%s\n",
+	dev_info(dev, "ready: gpio=%d irq=%d active_low=%d input_mode=%s debounce_ms=%u key_code=%u mode=%s\n",
 		 gpio,
 		 tdev->irq,
 		 active_low,
+		 trigger_dev_input_mode_name(tdev->input_mode),
 		 tdev->debounce_ms,
 		 tdev->key_code,
 		 tdev->output_gpiod ?
 		 "direct-gpio-pulse" : "sysfs-write");
+	if (tdev->input_mode == TRIGGER_DEV_INPUT_MODE_BUTTON &&
+	    !tdev->debounce_ms)
+		dev_warn(dev, "button input mode is selected with debounce-ms=0; mechanical keys may still bounce\n");
 	if (tdev->output_gpiod)
 		dev_info(dev, "  output_gpio=%d pulse_us=%u\n",
 			 desc_to_gpio(tdev->output_gpiod),
@@ -457,6 +548,44 @@ static int trigger_dev_probe(struct platform_device *pdev)
 
 	return 0;
 }
+
+/* Sysfs: input_mode (button|edge) */
+static ssize_t input_mode_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n",
+			  trigger_dev_input_mode_name(READ_ONCE(tdev->input_mode)));
+}
+
+static ssize_t input_mode_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	enum trigger_dev_input_mode mode;
+	int ret;
+
+	ret = trigger_dev_parse_input_mode(buf, &mode);
+	if (ret)
+		return ret;
+
+	if (mode == READ_ONCE(tdev->input_mode))
+		return count;
+
+	ret = trigger_dev_set_input_mode(tdev, mode);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "input mode switched to %s\n",
+		 trigger_dev_input_mode_name(mode));
+	if (mode == TRIGGER_DEV_INPUT_MODE_BUTTON && !tdev->debounce_ms)
+		dev_warn(dev, "button input mode is selected with debounce-ms=0; mechanical keys may still bounce\n");
+
+	return count;
+}
+static DEVICE_ATTR_RW(input_mode);
 
 /* Sysfs: mode (gpio|sysfs) */
 static ssize_t mode_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -563,17 +692,20 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 	u64 ago_us = tdev->last_irq_ns ? div_u64(now - tdev->last_irq_ns, 1000) : 0;
 
 	return sysfs_emit(buf,
-			  "irq=%lld ok=%lld fail=%lld pending=%d max_pending=%u last_irq_ago_us=%llu\n",
+			  "irq=%lld ok=%lld fail=%lld pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u\n",
 			  atomic64_read(&tdev->irq_count),
 			  atomic64_read(&tdev->trigger_ok_count),
 			  atomic64_read(&tdev->trigger_fail_count),
 			  atomic_read(&tdev->trigger_pending),
 			  tdev->max_pending,
-			  ago_us);
+			  ago_us,
+			  trigger_dev_input_mode_name(READ_ONCE(tdev->input_mode)),
+			  tdev->debounce_ms);
 }
 static DEVICE_ATTR_RO(stats);
 
 static struct attribute *trigger_dev_attrs[] = {
+	&dev_attr_input_mode.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_pulse_count.attr,
 	&dev_attr_pulse_interval_us.attr,

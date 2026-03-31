@@ -1,121 +1,109 @@
 # trigger-dev 使用说明
 
-通用 GPIO 输入设备，用于外部触发相机单帧采集。支持两种触发模式，可运行时切换。
+通用 GPIO 输入触发设备，用于把外部输入信号转换成一次相机触发动作。当前驱动同时支持：
 
-## 模式说明
+- **输入模式**：`input_mode = button/edge`
+- **输出模式**：`mode = gpio/sysfs`
 
-| 模式 | 说明 | 配置 |
+这两个模式互相独立，不要混淆。
+
+## 当前项目默认链路（LubanCat-5IO + IMX296）
+
+- **输入 GPIO**：`GPIO0_C6`
+- **默认输入模式**：`button`
+- **输出动作**：写 `echo 1 > /sys/bus/i2c/devices/1-001a/trigger`
+- **最终输出引脚**：`GPIO1_D6(PWM14_M2)` 产生一次低电平脉冲
+
+即：
+
+`GPIO0_C6 -> trigger-dev -> /sys/bus/i2c/devices/1-001a/trigger -> IMX296 -> GPIO1_D6(PWM14_M2)`
+
+## 输入模式说明
+
+| 输入模式 | 说明 | 适用场景 |
 |------|------|------|
-| **模式 A** | 直接驱动 FSIN GPIO 脉冲，延迟最低 | `trigger-output-gpios` |
-| **模式 B** | 通过 sysfs 写入触发，与 os08a20 共用 `fsin-gpios` | `trigger-path` |
+| `button` | 双沿感知 + 防抖 + 按下/松开状态机，只在按下时触发一次 | 机械按键、继电器、易抖动输入 |
+| `edge` | 活动沿快速触发，每个有效边沿直接排队一次触发 | 干净的外部窄脉冲输入 |
 
-- **模式 A**：trigger-dev 独占 FSIN GPIO，相机节点**不得**声明 `fsin-gpios`
-- **模式 B**：os08a20 保留 `fsin-gpios`，trigger-dev 写入其 sysfs 触发，**同时支持硬触发和手动软触发**
-- 若同时配置两者，可通过 sysfs `mode` 属性运行时切换
+- `button` 模式下，`debounce-ms` 生效。
+- `edge` 模式下，驱动走快速路径，忽略 `debounce-ms`。
+- 当前 5IO overlay 默认使用 `button` 模式，避免按键松开回弹再次拍照。
 
-## 硬触发与软触发（模式 B）
+## 输出模式说明
 
-当使用 `trigger-path` 且 os08a20 保留 `fsin-gpios` 时：
+| 输出模式 | 说明 | 配置 |
+|------|------|------|
+| `gpio` | 直接输出 GPIO 脉冲 | `trigger-output-gpios` |
+| `sysfs` | 写指定 sysfs 节点，语义等价 `echo` | `trigger-path` |
 
-- **硬触发**：外部 GPIO 下降沿 → trigger-dev → 写入 os08a20 sysfs → os08a20 驱动 FSIN 脉冲
-- **软触发**：用户手动执行 `echo 1 > /sys/bus/i2c/devices/1-0036/trigger` → os08a20 驱动 FSIN 脉冲
-
-两种方式共用同一 FSIN 引脚，无需切换配置。
+- 当前工程默认是 `sysfs` 输出模式，目标为 `IMX296` 的 `trigger` 节点。
+- 如果同时配置了 `trigger-output-gpios` 和 `trigger-path`，可通过 `mode` 在两者间切换。
 
 ## Sysfs 接口
 
 设备路径：`/sys/devices/platform/trigger-dev*/`
 
-> 注意：很多系统下设备名就是 `trigger-dev`（没有 `.0`），所以不要写成 `trigger-dev.*`。
-
 | 属性 | 读写 | 说明 |
 |------|------|------|
-| `mode` | RW | 模式切换：`gpio` / `sysfs`（仅当同时配置两种模式时可用） |
-| `pulse_count` | RW | 模式 A：每次外部触发产生的脉冲个数 (1–255) |
-| `pulse_interval_us` | RW | 模式 A：脉冲间隔（微秒） |
-| `stats` | RO | 调试统计：`irq/ok/fail/pending/max_pending/last_irq_ago_us` |
+| `input_mode` | RW | 输入模式切换：`button` / `edge` |
+| `mode` | RW | 输出模式切换：`gpio` / `sysfs` |
+| `pulse_count` | RW | 输出模式为 `gpio` 时的脉冲个数 |
+| `pulse_interval_us` | RW | 输出模式为 `gpio` 时的脉冲间隔 |
+| `stats` | RO | 调试统计，含 `input_mode` 和 `debounce_ms` |
 
-### 示例
+## 常用命令
 
 ```bash
-# 手动软触发（os08a20 的 trigger sysfs）
-echo 1 > /sys/bus/i2c/devices/1-0036/trigger
+# 查看 trigger-dev 节点
+ls -d /sys/bus/platform/devices/trigger-dev*
 
-# 查看当前模式
+# 查看当前输入/输出模式
+cat /sys/devices/platform/trigger-dev*/input_mode
+cat /sys/devices/platform/trigger-dev*/mode
 
+# 输入模式切换
+echo button > /sys/devices/platform/trigger-dev*/input_mode
+echo edge > /sys/devices/platform/trigger-dev*/input_mode
 
-# 切换模式（需同时配置 output-gpios 和 trigger-path）
+# 输出模式切换（需同时配置 output-gpios + trigger-path）
 echo gpio > /sys/devices/platform/trigger-dev*/mode
 echo sysfs > /sys/devices/platform/trigger-dev*/mode
 
-# 查看触发统计（用于排查“偶发没响应”）
+# 查看统计
 cat /sys/devices/platform/trigger-dev*/stats
 
-# 模式 A：每次触发发 3 个脉冲，间隔 100μs
-echo 3 > /sys/devices/platform/trigger-dev*/pulse_count
-echo 100 > /sys/devices/platform/trigger-dev*/pulse_interval_us
-
-# 若没有该目录，先确认 trigger-dev 设备是否创建成功
-ls -d /sys/bus/platform/devices/trigger-dev*
+# IMX296 软触发验证
+echo master_fast_trigger > /sys/bus/i2c/devices/1-001a/run_mode
+echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 ```
 
-## Device Tree 配置
-
-### 常用属性
+## Device Tree 常用属性
 
 | 属性 | 说明 | 默认 |
 |------|------|------|
-| `input-gpios` | 外部触发输入 GPIO | 必填 |
-| `interrupts` | 边沿类型（如 `IRQ_TYPE_EDGE_FALLING`） | 必填 |
-| `debounce-ms` | 防抖时间(ms)，0=无防抖 | 0 |
-| `trigger-output-gpios` | 模式 A：输出 GPIO（如 FSIN） | - |
-| `trigger-output-pulse-us` | 单脉冲宽度(μs) | 50 |
-| `trigger-output-pulse-count` | 每次触发的脉冲个数 | 1 |
-| `trigger-output-pulse-interval-us` | 脉冲间隔(μs) | 0 |
-| `trigger-path` | 模式 B：sysfs 路径 | - |
-| `trigger-value` | 模式 B：写入内容 | "1" |
+| `input-gpios` | 外部输入 GPIO | 必填 |
+| `interrupts` | 输入 IRQ 边沿配置 | 必填 |
+| `trigger-input-mode` | 默认输入模式：`button` / `edge` | `edge` |
+| `debounce-ms` | `button` 模式防抖时间 | 0 |
+| `trigger-output-gpios` | 输出模式 `gpio` 的目标 GPIO | - |
+| `trigger-output-pulse-us` | GPIO 模式单脉冲宽度(us) | 50 |
+| `trigger-output-pulse-count` | GPIO 模式脉冲个数 | 1 |
+| `trigger-output-pulse-interval-us` | GPIO 模式脉冲间隔(us) | 0 |
+| `trigger-path` | 输出模式 `sysfs` 的路径 | - |
+| `trigger-value` | `sysfs` 模式写入内容 | `"1"` |
 
-### Overlay 加载
+## 当前 5IO 默认配置
 
-```bash
-# 加载 os08a20 相机 overlay 后再加载 trigger-dev
-sudo fdtoverlay -i /boot/dtbs/.../rk3588-lubancat-5io.dtb \
-  -o /tmp/merged.dtb \
-  rk3588-lubancat-5io-cam1-os08a20-3840x2160-30fps.dtbo \
-  rk3588-lubancat-5io-trigger-dev.dtbo
-```
+`rk3588-lubancat-5io-trigger-dev-overlay.dts` 当前默认设置为：
 
-参考：`arch/arm64/boot/dts/rockchip/overlay/rk3588-lubancat-5io-trigger-dev-overlay.dts`
+- `trigger-input-mode = "button"`
+- `interrupts = <... IRQ_TYPE_EDGE_BOTH>`
+- `debounce-ms = <10>`
 
-## 硬件说明（LubanCat-5IO）
+这样按键按下时触发一次，松开仅用于状态释放，不再额外触发拍照。
 
-- **输入**：GPIO0_C6，下降沿有效（平时高电平）
-- **FSIN**：GPIO1_D6，由 os08a20 的 `fsin-gpios` 驱动，trigger-dev 通过 sysfs 写入触发
-- 默认 overlay 使用 `trigger-path`，保留 os08a20 的 `fsin-gpios`，同时支持硬触发和软触发
+## 风险与边界
 
----
-
-## 模式 A/B 延迟与优化
-
-### 典型延迟（外部触发 → FSIN 脉冲）
-
-| 模式 | 典型延迟 | 主要耗时 |
-|------|----------|----------|
-| **模式 A** | ~50–150 μs | workqueue 调度 + 50μs 脉冲 |
-| **模式 B** | ~1.0–2.0 ms | sysfs 路径 + I2C 曝光/增益/WB + 脉冲 |
-
-**模式 A**：IRQ（debounce=0 时直接按边沿入队）→ trigger_work → 直接 GPIO 脉冲，几乎无 I2C。
-
-**模式 B**：IRQ（debounce=0 时直接按边沿入队）→ trigger_work → filp_open/kernel_write → os08a20 的 trigger_store → （已在 streaming 状态）写曝光/增益/WB（按需）+ 脉冲。
-
-> 当前驱动在 `debounce-ms=0` 时采用“按 IRQ 边沿直接入队触发”，避免窄脉冲在延后采样时回弹导致漏触发。
-
-### 可优化点
-
-| 优化项 | 适用 | 说明 |
-|--------|------|------|
-| **高优先级 workqueue** | 模式 A/B | trigger-dev 使用 `alloc_workqueue(..., WQ_HIGHPRI)` 替代 `system_wq`，减少调度延迟 |
-| **合并 debounce + trigger** | 模式 A/B | debounce_ms=0 时，可省去 debounce_work，IRQ 直接 schedule_work(trigger_work) |
-| **跳过 3A 重写** | 模式 B | ✅ 已实现：若曝光/增益/WB 未变，仅发送 FSIN 脉冲，可省 ~1 ms I2C |
-| **批量 I2C** | 模式 B | ✅ 已实现：STREAMING + 曝光 + 增益合并为一次 I2C 传输 |
-| **模式 A + fsin 共用** | 硬件 | 若需最低延迟且保留软触发，需硬件支持：FSIN 可由 SoC 或 os08a20 驱动，或使用多路复用 |
+- `button` 模式会引入防抖延迟，不适合极窄脉冲输入。
+- `edge` 模式对机械按键回弹敏感，可能出现松开时再次触发。
+- `GPIO1_D6(PWM14_M2)` 与 `cam1 IMX415`、`cam1 OS08A20` 的触发相关配置存在复用冲突，不能同时加载相关 overlay。
