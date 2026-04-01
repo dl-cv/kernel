@@ -35,6 +35,9 @@ GPIO0_C6 -> trigger-dev -> echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 - 走快速 IRQ 路径
 - 每个有效活动沿直接排队一次触发
 - 忽略 `debounce-ms`
+- 有效沿跟随 `input-gpios` 极性：
+  - `GPIO_ACTIVE_HIGH` = 上升沿
+  - `GPIO_ACTIVE_LOW` = 下降沿
 
 适合：
 
@@ -122,8 +125,11 @@ echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 
 这样当前板子接按键时，按下只触发一次，松开不会因回弹再次触发。
 
+若当前 5IO 在运行时从 `button` 切到 `edge`，则 `GPIO0_C6(GPIO_ACTIVE_LOW)` 只应响应下降沿。若上升沿也触发，优先检查当前内核是否包含 `drivers/gpio/gpio-rockchip.c` 中对 GPIO V2 `int_bothedge` 清零的修复。
+
 ## 常见问题
 
+- `GPIO0_C6` 在 `edge` 模式下上升沿也触发：当前 5IO 默认 `input-gpios = <... GPIO_ACTIVE_LOW>`，理论上只应对下降沿触发；若运行时从 `button` 切到 `edge` 后仍出现双沿触发，优先检查是否缺少 `gpio-rockchip` 对 GPIO V2 `int_bothedge` 的清零修复。
 - 按下和松开都触发：通常是机械按键回弹，但驱动处于 `edge` 模式或 `button` 模式下防抖过小。
 - `trigger-path` 不存在：目标传感器节点或 overlay 未生效。
 - 脉冲已发出但业务不出单帧：优先检查 `IMX296` 是否已切到 `master_fast_trigger`。

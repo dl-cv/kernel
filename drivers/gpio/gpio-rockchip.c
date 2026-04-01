@@ -464,6 +464,15 @@ static int rockchip_irq_set_type(struct irq_data *d, unsigned int type)
 		goto out;
 	}
 
+	/*
+	 * GPIO V2 has a dedicated both-edge enable bit. Clear it explicitly
+	 * when switching back to single-edge/level mode, otherwise the
+	 * controller may keep reporting both edges after a runtime mode change.
+	 */
+	if (bank->gpio_type == GPIO_TYPE_V2)
+		rockchip_gpio_writel_bit(bank, d->hwirq, 0,
+					 bank->gpio_regs->int_bothedge);
+
 	rockchip_gpio_writel(bank, level, bank->gpio_regs->int_type);
 	rockchip_gpio_writel(bank, polarity, bank->gpio_regs->int_polarity);
 out:

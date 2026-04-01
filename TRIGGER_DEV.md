@@ -27,6 +27,7 @@
 
 - `button` 模式下，`debounce-ms` 生效。
 - `edge` 模式下，驱动走快速路径，忽略 `debounce-ms`。
+- `edge` 模式下的有效沿跟随 `input-gpios` 极性：`GPIO_ACTIVE_HIGH` 对应上升沿，`GPIO_ACTIVE_LOW` 对应下降沿。
 - 当前 5IO overlay 默认使用 `button` 模式，避免按键松开回弹再次拍照。
 
 ## 输出模式说明
@@ -102,8 +103,11 @@ echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 
 这样按键按下时触发一次，松开仅用于状态释放，不再额外触发拍照。
 
+若运行时切到 `input_mode=edge`，当前 5IO 的 `GPIO0_C6(GPIO_ACTIVE_LOW)` 只应在下降沿触发。若上升沿也触发，优先检查当前内核是否已经包含 `drivers/gpio/gpio-rockchip.c` 对 GPIO V2 `int_bothedge` 清零的修复。
+
 ## 风险与边界
 
 - `button` 模式会引入防抖延迟，不适合极窄脉冲输入。
 - `edge` 模式对机械按键回弹敏感，可能出现松开时再次触发。
+- 若内核缺少 Rockchip GPIO V2 的 `int_bothedge` 清零修复，运行时从 `button` 切到 `edge` 后可能错误表现为双沿都触发。
 - `GPIO1_D6(PWM14_M2)` 与 `cam1 IMX415`、`cam1 OS08A20` 的触发相关配置存在复用冲突，不能同时加载相关 overlay。
