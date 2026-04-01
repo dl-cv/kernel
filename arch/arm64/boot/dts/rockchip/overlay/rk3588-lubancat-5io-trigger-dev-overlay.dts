@@ -37,21 +37,21 @@
 				compatible = "embedfire,trigger-dev";
 				status = "okay";
 
-				/* GPIO0_C6: 默认按键安全模式，平时高电平，低电平=按下 */
+				/* GPIO0_C6: 默认外部脉冲模式，平时高电平，下降沿有效 */
 				input-gpios = <&gpio0 RK_PC6 GPIO_ACTIVE_LOW>;
 				interrupt-parent = <&gpio0>;
 				/*
-				 * 默认 button 模式使用双沿感知，用于区分按下/松开。
-				 * 若切到 edge 模式，驱动会在运行时改回单活动沿触发。
+				 * DTS 先保持双沿描述，驱动会在 probe 时按 input_mode
+				 * 重新切到实际所需的单活动沿/双沿。
 				 */
 				interrupts = <RK_PC6 IRQ_TYPE_EDGE_BOTH>;
 
 				pinctrl-names = "default";
 				pinctrl-0 = <&trigger_dev_pin>;
 
-				/* 输入模式：button=按键安全模式，edge=外部脉冲快速模式 */
-				trigger-input-mode = "button";
-				/* 按键安全模式默认防抖 10ms；edge 模式下该值被忽略 */
+				/* 输入模式：默认 edge，适合干净外部脉冲 */
+				trigger-input-mode = "edge";
+				/* 当前默认 edge 模式下该值被忽略；切到 button 时仍可复用 */
 				debounce-ms = <10>;
 
 				/* 输入事件码，KEY_CAMERA 用于相机快门 */

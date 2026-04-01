@@ -401,14 +401,14 @@
 		ovdd-supply = <&cam_dovdd>;
 		dvdd-supply = <&cam_dvdd>;
 		reset-gpios = <&gpio6 3 GPIO_ACTIVE_LOW>;
-		rockchip,trigger-pulse-us = <5>;
+		rockchip,trigger-pulse-us = <800>;
 
 		rockchip,camera-module-index = <1>;
 		rockchip,camera-module-facing = "back";
 		rockchip,camera-module-name = "IMX296LQR-C";
 		rockchip,camera-module-lens-name = "default";
 		rockchip,camera-module-sync-mode = "internal_master";
-		trigger-mode = <0>;
+		trigger-mode = <1>;
 
 		port {
 			imx296_dcphy1_out: endpoint {

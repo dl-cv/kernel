@@ -13,7 +13,7 @@
 GPIO0_C6 -> trigger-dev -> echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 ```
 
-最终由 `IMX296` 在 `GPIO1_D6(PWM14_M2)` 输出一次低电平脉冲。
+当前板级默认会让 `IMX296` 以 `master_fast_trigger` 模式工作，并在 `GPIO1_D6(PWM14_M2)` 输出一次 `800us` 低电平脉冲。
 
 ## 输入模式
 
@@ -119,13 +119,13 @@ echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 
 `rk3588-lubancat-5io-trigger-dev-overlay.dts` 当前默认：
 
-- `trigger-input-mode = "button"`
+- `trigger-input-mode = "edge"`
 - `interrupts = <... IRQ_TYPE_EDGE_BOTH>`
 - `debounce-ms = <10>`
 
-这样当前板子接按键时，按下只触发一次，松开不会因回弹再次触发。
+这样当前板级上电后，驱动会把 `GPIO0_C6(GPIO_ACTIVE_LOW)` 切到单下降沿触发，默认适合干净外部脉冲输入；若后续改接机械按键，再运行时切回 `button`。
 
-若当前 5IO 在运行时从 `button` 切到 `edge`，则 `GPIO0_C6(GPIO_ACTIVE_LOW)` 只应响应下降沿。若上升沿也触发，优先检查当前内核是否包含 `drivers/gpio/gpio-rockchip.c` 中对 GPIO V2 `int_bothedge` 清零的修复。
+当前默认 `input_mode=edge` 时，`GPIO0_C6(GPIO_ACTIVE_LOW)` 只应响应下降沿。若上升沿也触发，优先检查当前内核是否包含 `drivers/gpio/gpio-rockchip.c` 中对 GPIO V2 `int_bothedge` 清零的修复。
 
 ## 常见问题
 

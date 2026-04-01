@@ -13,7 +13,7 @@
 
 ### 目标
 
-- 保持 `IMX296` 默认工作在 `FREE_RUN / Normal Mode`。
+- 支持按当前板级需求调整 `IMX296` 默认模式；当前 5IO 默认切到 `master_fast_trigger`，同时保留 `free_run` / `master_fast_trigger` 的 `echo` 切换能力。
 - 新增一个板端可通过 `echo` 写入的 `sysfs` 节点，用于在 `FREE_RUN` 与主模式快速触发之间切换。
 - 复用驱动现有模式切换逻辑，避免重复维护寄存器序列。
 - 完成宿主机最小编译验证。
@@ -29,7 +29,7 @@
 
 | 项目 | 当前状态 | 结论 |
 | --- | --- | --- |
-| `trigger-mode` DT 属性 | 已支持，当前默认 `<0>` | 默认就是 `FREE_RUN` |
+| `trigger-mode` DT 属性 | 已支持，当前 5IO 默认 `<1>` | 当前板级默认切到 `master_fast_trigger` |
 | 驱动内部模式枚举 | 已有 `IMX296_FREE_RUN` / `IMX296_XTRIG_ONE_SHOT` | 底层切换逻辑已具备 |
 | V4L2 模式控件 | 已有 `V4L2_CID_IMX296_OP_MODE` | 但不满足 `echo` 操作需求 |
 | 终端切换入口 | 暂无 | 需补 `sysfs` 节点 |
@@ -71,7 +71,7 @@
 | 依赖项 | 类型 | 用途 | 所在位置 | 使用入口 | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | `V4L2_CID_IMX296_OP_MODE` | V4L2 自定义控件 | 驱动内部模式切换统一入口 | `imx296.c` | `run_mode_store()` | 已有 |
-| `trigger-mode = <0>` | DTS 属性 | 保持默认 `FREE_RUN` | `rk3588-lubancat-5io-csi.dtsi` | `imx296_probe()` | 当前无需修改 |
+| `trigger-mode = <1>` | DTS 属性 | 让当前 5IO 板级默认进入 `master_fast_trigger` | `rk3588-lubancat-5io-csi.dtsi` | `imx296_probe()` | 仍可运行时切回 `free_run` |
 | `sysfs` | 内核接口 | 板端 `echo` 切换模式 | `/sys/bus/i2c/devices/...` | shell | 本次新增 |
 
 ## 风险点
@@ -101,7 +101,7 @@
 - 已支持以下典型写法：
   - `echo free_run > .../run_mode`
   - `echo master_fast_trigger > .../run_mode`
-- 已保持默认 DTS `trigger-mode = <0>`，即默认 `FREE_RUN`。
+- 当前 5IO 已将默认 DTS `trigger-mode` 调整为 `<1>`，即默认 `master_fast_trigger`。
 - 已完成宿主机最小验证：`drivers/media/i2c/imx296.o` 编译通过。
 - 已完成 `ReadLints` 检查，当前无新增 linter 错误。
 
@@ -115,6 +115,6 @@
 
 - [x] 新增 `run_mode` sysfs 节点
 - [x] 复用现有模式切换逻辑，支持字符串写入
-- [x] 保持默认 `FREE_RUN`
+- [x] 支持按板级需求调整默认模式
 - [x] 完成最小编译验证
 - [x] 更新现有 IMX296 文档与总目录

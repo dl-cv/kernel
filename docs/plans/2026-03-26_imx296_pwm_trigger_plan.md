@@ -8,7 +8,7 @@
 
 - 空闲电平为高；
 - 触发脉冲为低电平有效；
-- 默认低脉宽为 `5us`；
+- 默认低脉宽为 `800us`；
 - 脉宽可以查看和修改；
 - 通过 `echo` 能直接打出一次触发脉冲。
 
@@ -18,7 +18,7 @@
 
 - 在 `IMX296` 方案下使用 `GPIO1_D6 -> PWM14_M2` 作为触发脉冲输出。
 - 在 `imx296.c` 中增加 PWM 单脉冲触发能力和 sysfs 调试入口。
-- 默认脉冲宽度设为 `5us`，支持运行时查看和修改。
+- 默认脉冲宽度设为 `800us`，支持运行时查看和修改。
 - 通过 `echo 1 > .../trigger` 直接输出一次低电平脉冲。
 - 更新现有 `IMX296` 文档和文档总目录。
 
@@ -48,7 +48,7 @@
 2. 在 `rk3588-lubancat-5io-cam1-imx296-overlay.dts` 中新增 `&pwm14` 片段，将其启用并切到 `&pwm14m2_pins`。
 3. 在 `drivers/media/i2c/imx296.c` 中：
    - 申请可选 PWM 资源；
-   - 从 DT 读取默认脉宽，缺省为 `5us`；
+   - 从 DT 读取默认脉宽，当前 5IO 缺省为 `800us`；
    - 增加 `trigger_pulse_us` sysfs 节点用于查看/修改脉宽；
    - 增加 `trigger` sysfs 节点用于 `echo 1` 触发一次单脉冲；
    - 在当前内核配置下使用 `pwm_apply_state(enabled=true)` 立即起波形，再通过 `udelay/usleep_range` 等待脉宽结束后 `disable`，避免第二个周期。
@@ -89,7 +89,7 @@
 
 - `GPIO1_D6/PWM14_M2` 与 `IMX415 cam1` overlay 的 `pwm14` 输出、`OS08A20 cam1` overlay 的 `fsin-gpios` 明确冲突，因此这些方案不能同时使用。
 - 当前不启用 `CONFIG_PWM_ROCKCHIP_ONESHOT`，单脉冲将走 `enable -> 等待 -> disable` 路径，功能上可行，但“命令到脉冲开始”的确定性不应直接等同于 MCU 定时器 one-pulse 模式。
-- `5us` 脉宽很短，虽然低电平宽度由 PWM 硬件生成，但软件 disable 时机仍需保守处理，避免跨到第二个周期。
+- `800us` 脉宽相比早期 `5us` 更宽，兼容性更好，但仍需结合板端实际触发输入规格和示波器结果确认最终边界。
 - 若板级实际触发输入链路上还有额外上拉/二极管/隔离器件，低电平有效宽度可能与软件设置略有偏差，仍需示波器复核。
 
 ## 验证方案
@@ -101,7 +101,7 @@
    - 新增 sysfs 节点名和文档描述保持一致。
 2. 板端功能验证：
    - `cat /sys/bus/i2c/devices/1-001a/trigger_pulse_us`
-   - `echo 5 > /sys/bus/i2c/devices/1-001a/trigger_pulse_us`
+   - `echo 800 > /sys/bus/i2c/devices/1-001a/trigger_pulse_us`
    - `echo 1 > /sys/bus/i2c/devices/1-001a/trigger`
    - `dmesg | grep -i "imx296.*trigger"`
    - 示波器观察 `GPIO1_D6`：空闲高、触发时出现单个低脉冲，宽度约为配置值
@@ -112,7 +112,7 @@
 ## 实施结果
 
 - 已在 `drivers/media/i2c/imx296.c` 中新增可选 `trigger` PWM 资源解析、`imx296_trigger_once_locked()` helper，以及 `trigger` / `trigger_pulse_us` sysfs 节点。
-- 已在 `arch/arm64/boot/dts/rockchip/rk3588-lubancat-5io-csi.dtsi` 的 `dcphy1_imx296` 节点中新增 `pwm-names = "trigger"`、`pwms = <&pwm14 0 10000000 PWM_POLARITY_INVERTED>` 和 `rockchip,trigger-pulse-us = <5>`。
+- 已在 `arch/arm64/boot/dts/rockchip/rk3588-lubancat-5io-csi.dtsi` 的 `dcphy1_imx296` 节点中新增 `pwm-names = "trigger"`、`pwms = <&pwm14 0 10000000 PWM_POLARITY_INVERTED>` 和 `rockchip,trigger-pulse-us = <800>`。
 - 已在 `arch/arm64/boot/dts/rockchip/overlay/rk3588-lubancat-5io-cam1-imx296-overlay.dts` 中新增 `&pwm14` 使能片段，并切到 `&pwm14m2_pins`，让 `GPIO1_D6` 输出 PWM。
 - 当前单脉冲实现采用 `enable -> 等待脉宽 -> disable` 路径，未依赖 `CONFIG_PWM_ROCKCHIP_ONESHOT`。
 
@@ -127,7 +127,7 @@
 ### 未验证项
 
 - 未在板端读取到新增 sysfs 节点并实际执行 `echo 1 > .../trigger`。
-- 未在示波器上确认 `GPIO1_D6` 的空闲高、触发低和 `5us` 低脉宽。
+- 未在示波器上确认 `GPIO1_D6` 的空闲高、触发低和 `800us` 低脉宽。
 - 未在 `master_fast_trigger` 模式下获取到“脉冲触发单帧采图成功”的板端证据。
 
 ## TODO 清单
