@@ -31,8 +31,8 @@
 | --- | --- | --- |
 | `trigger-mode` DT 属性 | 已支持，当前 5IO 默认 `<1>` | 当前板级默认切到 `master_fast_trigger` |
 | 驱动内部模式枚举 | 已有 `IMX296_FREE_RUN` / `IMX296_XTRIG_ONE_SHOT` | 底层切换逻辑已具备 |
-| V4L2 模式控件 | 已有 `V4L2_CID_IMX296_OP_MODE` | 但不满足 `echo` 操作需求 |
-| 终端切换入口 | 暂无 | 需补 `sysfs` 节点 |
+| V4L2 模式控件 | 已有 `V4L2_CID_IMX296_OP_MODE` | 已复用为 `sysfs` 入口，但其缓存默认值必须与 DTS 默认模式保持一致 |
+| 终端切换入口 | 已有 `run_mode` sysfs | 板端实测已暴露“首次写 `free_run` 被控件缓存当成 no-op”问题，需要补默认值同步 |
 
 ## 方案设计
 
@@ -42,12 +42,13 @@
 3. `run_mode` 的写入逻辑复用 `v4l2_ctrl_s_ctrl(sensor->op_mode_ctrl, ...)`：
    - `echo free_run > .../run_mode`
    - `echo master_fast_trigger > .../run_mode`
-4. 读取 `run_mode` 时返回：
+4. 在控件初始化完成后，将 `op_mode_ctrl` 的缓存默认值同步到 `sensor->pending_mode`，避免 DTS 默认 `master_fast_trigger` 时首次写 `free_run` 被误判为“值未变化”。
+5. 读取 `run_mode` 时返回：
    - 当前待生效模式
    - 当前活动模式
    - 当前 `streaming` 状态
    - 可接受的模式名
-5. 在 `probe` 中创建设备属性，在 `remove` 中清理。
+6. 在 `probe` 中创建设备属性，在 `remove` 中清理。
 
 ## 影响文件
 
@@ -102,12 +103,14 @@
   - `echo free_run > .../run_mode`
   - `echo master_fast_trigger > .../run_mode`
 - 当前 5IO 已将默认 DTS `trigger-mode` 调整为 `<1>`，即默认 `master_fast_trigger`。
+- 已定位并修复 `op_mode_ctrl` 缓存默认值与 DTS `trigger-mode` 脱节的问题；修复前首次写 `free_run` 会被 `V4L2 ctrl` 框架当作 no-op，日志显示成功但 `pending/active` 实际不变。
+- 已将 `run_mode_store()` 日志改为打印实际 `pending/active/streaming` 状态，避免继续出现“日志成功但内部状态未切换”的误导。
 - 已完成宿主机最小验证：`drivers/media/i2c/imx296.o` 编译通过。
 - 已完成 `ReadLints` 检查，当前无新增 linter 错误。
 
 ### 待板端验证
 
-- `/sys/bus/i2c/devices/1-001a/run_mode` 是否按预期出现。
+- 修复后的新内核在板端首次执行 `echo free_run > /sys/bus/i2c/devices/1-001a/run_mode` 时，是否无需先写一次 `master_fast_trigger` 即可生效。
 - 正在 stream 时切换模式是否稳定。
 - 主模式快速触发下，外部触发脉冲与板级 `XMASTER` 拉法是否匹配。
 

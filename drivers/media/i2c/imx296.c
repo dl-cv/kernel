@@ -496,7 +496,22 @@ static ssize_t run_mode_store(struct device *dev, struct device_attribute *attr,
 	if (ret)
 		return ret;
 
-	dev_info(dev, "run mode switched to %s\n", imx296_op_mode_name(mode));
+	mutex_lock(&sensor->mutex);
+	if (sensor->pending_mode != mode)
+		dev_warn(dev,
+			 "run mode request=%s but state is pending=%s active=%s streaming=%u\n",
+			 imx296_op_mode_name(mode),
+			 imx296_op_mode_name(sensor->pending_mode),
+			 imx296_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	else
+		dev_info(dev,
+			 "run mode request=%s pending=%s active=%s streaming=%u\n",
+			 imx296_op_mode_name(mode),
+			 imx296_op_mode_name(sensor->pending_mode),
+			 imx296_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	mutex_unlock(&sensor->mutex);
 
 	return count;
 }
@@ -1042,6 +1057,21 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 		dev_err(sensor->dev, "failed to add controls (%d)\n", ret);
 		v4l2_ctrl_handler_free(handler);
 		return ret;
+	}
+
+	if (sensor->op_mode_ctrl) {
+		/*
+		 * Keep the control cache aligned with the DTS-selected default
+		 * mode so the first sysfs/V4L2 write is not swallowed as a
+		 * no-op when the board boots in master_fast_trigger.
+		 */
+		ret = __v4l2_ctrl_s_ctrl(sensor->op_mode_ctrl, sensor->pending_mode);
+		if (ret < 0) {
+			dev_err(sensor->dev,
+				"failed to sync default run mode control (%d)\n", ret);
+			v4l2_ctrl_handler_free(handler);
+			return ret;
+		}
 	}
 
 	sensor->subdev.ctrl_handler = handler;
