@@ -22,6 +22,16 @@ Optional properties:
 			  pwm cooling state. This depends on CONFIG_ROCKCHIP_SYSTEM_MONITOR.
 			  If add the property the fan cooling state will be changed
 			  by system monitor. Otherwise, use the default thermal governor.
+- rockchip,cooling-levels-silent/normal/turbo :
+			  Optional per-mode cooling levels. Each property uses
+			  the same value format as cooling-levels.
+- rockchip,temp-trips-silent/normal/turbo :
+			  Optional per-mode temperature to cooling-state mapping.
+			  Each property uses the same format as rockchip,temp-trips.
+			  If all per-mode properties are present, userspace can
+			  switch runtime fan profile among silent/normal/turbo.
+			  If they are absent or incomplete, the driver falls back
+			  to cooling-levels + rockchip,temp-trips.
 
 Example:
 	fan0: pwm-fan {
@@ -59,4 +69,42 @@ Example 2:
 		interrupt-parent = <&gpio5>;
 		interrupts = <1 IRQ_TYPE_EDGE_FALLING>;
 		pulses-per-revolution = <2>;
+	};
+
+Example 3 (Rockchip mode profiles):
+	fan0: pwm-fan {
+		compatible = "pwm-fan";
+		#cooling-cells = <2>;
+		pwms = <&pwm 0 50000 0>;
+
+		rockchip,cooling-levels-silent = <0 40 80 140 200>;
+		rockchip,temp-trips-silent = <
+			50000 1
+			55000 2
+			60000 3
+			65000 4
+		>;
+		rockchip,cooling-levels-normal = <0 50 100 200 255>;
+		rockchip,temp-trips-normal = <
+			40000 1
+			45000 2
+			50000 3
+			55000 4
+		>;
+		rockchip,cooling-levels-turbo = <0 90 150 220 255>;
+		rockchip,temp-trips-turbo = <
+			35000 1
+			40000 2
+			45000 3
+			50000 4
+		>;
+
+		/* Backward compatibility */
+		cooling-levels = <0 50 100 200 255>;
+		rockchip,temp-trips = <
+			40000 1
+			45000 2
+			50000 3
+			55000 4
+		>;
 	};
