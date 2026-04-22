@@ -25,6 +25,12 @@
 					 */
 
 				};
+
+				/* GPIO1_D2/D3：结果灯输出；极性以原理图为准 */
+				trigger_dev_result_led_pin: trigger-dev-result-led-pin {
+					rockchip,pins = <1 RK_PD2 RK_FUNC_GPIO &pcfg_pull_none>,
+							<1 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
+				};
 			};
 		};
 	};
@@ -47,7 +53,7 @@
 				interrupts = <RK_PC6 IRQ_TYPE_EDGE_BOTH>;
 
 				pinctrl-names = "default";
-				pinctrl-0 = <&trigger_dev_pin>;
+				pinctrl-0 = <&trigger_dev_pin &trigger_dev_result_led_pin>;
 
 				/* 输入模式：默认 edge，适合干净外部脉冲 */
 				trigger-input-mode = "edge";
@@ -56,6 +62,10 @@
 
 				/* 输入事件码，KEY_CAMERA 用于相机快门 */
 				linux,code = <KEY_CAMERA>;
+
+				/* 结果指示灯：OK 绿 GPIO1_D2，NG 红 GPIO1_D3（与 schematic 不一致时改 ACTIVE） */
+				ok-led-gpios = <&gpio1 RK_PD2 GPIO_ACTIVE_HIGH>;
+				ng-led-gpios = <&gpio1 RK_PD3 GPIO_ACTIVE_HIGH>;
 
 				/*
 				 * 通过 IMX296 的 sysfs 触发：

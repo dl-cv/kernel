@@ -179,17 +179,6 @@ config ICS932S401
 	  This driver can also be built as a module. If so, the module
 	  will be called ics932s401.
 
-config GD32_MCU
-	tristate "GD32 MCU placeholder driver"
-	depends on I2C
-	help
-	  Say Y here to bind a board-level GD32 MCU described in the
-	  Device Tree as a managed Linux I2C device.
-
-	  This driver only provides the minimal kernel-side binding and
-	  identification path. It does not implement any GD32-specific
-	  register protocol.
-
 config ATMEL_SSC
 	tristate "Device driver for Atmel SSC peripheral"
 	depends on HAS_IOMEM && (ARCH_AT91 || COMPILE_TEST)

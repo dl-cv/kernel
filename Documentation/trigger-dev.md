@@ -70,6 +70,8 @@ echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 - `mode`：输出模式，`gpio` / `sysfs`
 - `pulse_count`：GPIO 输出模式下的脉冲个数
 - `pulse_interval_us`：GPIO 输出模式下的脉冲间隔
+- `result`：结果指示灯（需 DT 配置 `ok-led-gpios` / `ng-led-gpios`）。写 `ok` / `ng` / `off`；读为 `ok` / `ng` / `none`。外部触发在驱动内处理每条 pending 前会先灭两灯（仅当 `result_led_enable` 为 1）。OK/NG 互斥，不会双灯同亮。
+- `result_led_enable`：`1` 正常驱动结果灯；`0` 关闭驱动对 GPIO 的操作并灭灯，此后触发与 `result` 写不再改变引脚。
 - `stats`：调试统计，包含 `input_mode`、`debounce_ms`、`irq/ok/fail`
 
 ## 推荐命令
@@ -85,6 +87,11 @@ echo edge > /sys/devices/platform/trigger-dev*/input_mode
 
 # 查看统计
 cat /sys/devices/platform/trigger-dev*/stats
+
+# 结果灯（已配置 ok/ng LED 时）
+echo ok > /sys/devices/platform/trigger-dev*/result
+echo off > /sys/devices/platform/trigger-dev*/result
+echo 0 > /sys/devices/platform/trigger-dev*/result_led_enable
 
 # IMX296 触发验证
 echo master_fast_trigger > /sys/bus/i2c/devices/1-001a/run_mode
@@ -103,6 +110,8 @@ echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 - `trigger-output-pulse-interval-us`
 - `trigger-path`
 - `trigger-value`
+- `ok-led-gpios`：OK 结果灯输出（可选）
+- `ng-led-gpios`：NG 结果灯输出（可选）
 
 ## 关键实现点
 
@@ -111,7 +120,7 @@ echo 1 > /sys/bus/i2c/devices/1-001a/trigger
 - `trigger_dev_irq()`：根据 `input_mode` 选择快速边沿路径或按键安全路径
 - `trigger_dev_debounce_work()`：button 模式下做延迟采样
 - `trigger_dev_handle_state()`：只在按下沿累计一次触发
-- `trigger_dev_trigger_work()`：执行最终 `gpio/sysfs` 动作
+- `trigger_dev_trigger_work()`：每条 pending 在最终 `gpio/sysfs` 相机触发前先条件灭结果灯，再执行触发
 - `input_mode_show()` / `input_mode_store()`：运行时切换输入模式
 - `mode_show()` / `mode_store()`：运行时切换输出模式
 

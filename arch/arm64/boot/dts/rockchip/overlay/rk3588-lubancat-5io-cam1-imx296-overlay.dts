@@ -27,13 +27,6 @@
 		};
 	};
 
-	fragment@2 {
-		target = <&gd32_mcu>;
-		__overlay__ {
-			status = "okay";
-		};
-	};
-
 	fragment@3 {
 		target = <&csi2_dcphy1>;
 		__overlay__ {

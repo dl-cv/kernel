@@ -419,12 +419,6 @@
 		};
 	};
 
-	gd32_mcu: gd32-mcu@2a {
-		compatible = "gd,gd32-mcu";
-		status = "disabled";
-		reg = <0x2a>;
-	};
-
 	dcphy1_gc08a8: dcphy1-gc08a8@31 {
 		compatible = "galaxycore,gc08a8";
 		status = "disabled";

@@ -11,6 +11,8 @@
  * - Two trigger modes (lower latency first):
  *   1. trigger-output-gpios: directly pulse GPIO (e.g. camera FSIN) - minimal latency
  *   2. trigger-path: write to sysfs "echo 1 > ..." - fallback for software trigger
+ * - Optional result LEDs: ok-led-gpios / ng-led-gpios; sysfs "result" (ok/ng/off),
+ *   "result_led_enable"; each external trigger clears LEDs before camera action.
  *
  * When trigger-output-gpios is set, keep a single owner for that output GPIO.
  * If another node already claims the same pin, remove one side in DT.
@@ -26,6 +28,7 @@
 #include <linux/irq.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
@@ -42,6 +45,12 @@
 enum trigger_dev_input_mode {
 	TRIGGER_DEV_INPUT_MODE_EDGE = 0,
 	TRIGGER_DEV_INPUT_MODE_BUTTON,
+};
+
+enum trigger_dev_result_led {
+	TRIGGER_DEV_RESULT_NONE = 0,
+	TRIGGER_DEV_RESULT_OK,
+	TRIGGER_DEV_RESULT_NG,
 };
 
 struct trigger_dev {
@@ -77,6 +86,13 @@ struct trigger_dev {
 	/* 运行时模式：true=GPIO 直连(Mode A)，false=sysfs(Mode B)；两者都配置时优先 GPIO */
 	bool			mode_use_gpio;
 	struct mutex		mode_mutex;
+
+	/* 结果指示灯：DT ok-led-gpios / ng-led-gpios；逻辑 0=inactive(灭) 1=active(亮) */
+	struct gpio_desc	*ok_led_gpiod;
+	struct gpio_desc	*ng_led_gpiod;
+	bool			result_led_enable;
+	enum trigger_dev_result_led result_led;
+	struct mutex		led_mutex;
 
 	atomic_t		trigger_pending;
 	struct work_struct	trigger_work;
@@ -220,6 +236,41 @@ static int trigger_dev_write_once(struct trigger_dev *tdev)
 	return 0;
 }
 
+static bool trigger_dev_has_result_leds(struct trigger_dev *tdev)
+{
+	return tdev->ok_led_gpiod || tdev->ng_led_gpiod;
+}
+
+/* led_mutex held */
+static void trigger_dev_leds_off_locked(struct trigger_dev *tdev)
+{
+	if (tdev->ok_led_gpiod)
+		gpiod_set_value_cansleep(tdev->ok_led_gpiod, 0);
+	if (tdev->ng_led_gpiod)
+		gpiod_set_value_cansleep(tdev->ng_led_gpiod, 0);
+	tdev->result_led = TRIGGER_DEV_RESULT_NONE;
+}
+
+/* led_mutex held */
+static void trigger_dev_leds_set_ok_locked(struct trigger_dev *tdev)
+{
+	if (tdev->ng_led_gpiod)
+		gpiod_set_value_cansleep(tdev->ng_led_gpiod, 0);
+	if (tdev->ok_led_gpiod)
+		gpiod_set_value_cansleep(tdev->ok_led_gpiod, 1);
+	tdev->result_led = TRIGGER_DEV_RESULT_OK;
+}
+
+/* led_mutex held */
+static void trigger_dev_leds_set_ng_locked(struct trigger_dev *tdev)
+{
+	if (tdev->ok_led_gpiod)
+		gpiod_set_value_cansleep(tdev->ok_led_gpiod, 0);
+	if (tdev->ng_led_gpiod)
+		gpiod_set_value_cansleep(tdev->ng_led_gpiod, 1);
+	tdev->result_led = TRIGGER_DEV_RESULT_NG;
+}
+
 static void trigger_dev_trigger_work(struct work_struct *work)
 {
 	struct trigger_dev *tdev =
@@ -232,6 +283,11 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 
 	/* Drain pending triggers (presses) */
 	while (atomic_dec_if_positive(&tdev->trigger_pending) >= 0) {
+		mutex_lock(&tdev->led_mutex);
+		if (tdev->result_led_enable)
+			trigger_dev_leds_off_locked(tdev);
+		mutex_unlock(&tdev->led_mutex);
+
 		t0 = ktime_get_ns();
 		mutex_lock(&tdev->mode_mutex);
 		use_gpio = tdev->mode_use_gpio && tdev->output_gpiod;
@@ -375,6 +431,13 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 	if (IS_ERR(tdev->output_gpiod))
 		return PTR_ERR(tdev->output_gpiod);
 
+	tdev->ok_led_gpiod = devm_gpiod_get_optional(dev, "ok-led", GPIOD_OUT_LOW);
+	if (IS_ERR(tdev->ok_led_gpiod))
+		return PTR_ERR(tdev->ok_led_gpiod);
+	tdev->ng_led_gpiod = devm_gpiod_get_optional(dev, "ng-led", GPIOD_OUT_LOW);
+	if (IS_ERR(tdev->ng_led_gpiod))
+		return PTR_ERR(tdev->ng_led_gpiod);
+
 	/* trigger-output-pulse-us: 脉冲宽度(us)，默认 50 */
 	device_property_read_u32(dev, "trigger-output-pulse-us",
 				 &tdev->output_pulse_us);
@@ -453,6 +516,7 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	tdev->dev = dev;
 	platform_set_drvdata(pdev, tdev);
 	mutex_init(&tdev->mode_mutex);
+	mutex_init(&tdev->led_mutex);
 
 	/*
 	 * Primary DT property: input-gpios (con_id = "input")
@@ -545,6 +609,21 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	else
 		dev_info(dev, "  trigger_path=%s payload=%s\n",
 			 tdev->trigger_path, tdev->trigger_payload);
+
+	mutex_lock(&tdev->led_mutex);
+	tdev->result_led_enable = true;
+	tdev->result_led = TRIGGER_DEV_RESULT_NONE;
+	trigger_dev_leds_off_locked(tdev);
+	mutex_unlock(&tdev->led_mutex);
+
+	if (trigger_dev_has_result_leds(tdev)) {
+		if (tdev->ok_led_gpiod)
+			dev_info(dev, "  ok_led_gpio=%d\n",
+				 desc_to_gpio(tdev->ok_led_gpiod));
+		if (tdev->ng_led_gpiod)
+			dev_info(dev, "  ng_led_gpio=%d\n",
+				 desc_to_gpio(tdev->ng_led_gpiod));
+	}
 
 	return 0;
 }
@@ -685,6 +764,109 @@ static ssize_t pulse_interval_us_store(struct device *dev, struct device_attribu
 }
 static DEVICE_ATTR_RW(pulse_interval_us);
 
+static const char *trigger_dev_result_name(enum trigger_dev_result_led r)
+{
+	switch (r) {
+	case TRIGGER_DEV_RESULT_OK:
+		return "ok";
+	case TRIGGER_DEV_RESULT_NG:
+		return "ng";
+	default:
+		return "none";
+	}
+}
+
+/* Sysfs: result (ok|ng|off), read: ok|ng|none */
+static ssize_t result_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	const char *name;
+
+	if (!trigger_dev_has_result_leds(tdev))
+		return -ENODEV;
+
+	mutex_lock(&tdev->led_mutex);
+	name = trigger_dev_result_name(tdev->result_led);
+	mutex_unlock(&tdev->led_mutex);
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+
+static ssize_t result_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+
+	if (!trigger_dev_has_result_leds(tdev))
+		return -ENODEV;
+
+	mutex_lock(&tdev->led_mutex);
+	if (!tdev->result_led_enable) {
+		mutex_unlock(&tdev->led_mutex);
+		return count;
+	}
+
+	if (sysfs_streq(buf, "ok")) {
+		trigger_dev_leds_set_ok_locked(tdev);
+	} else if (sysfs_streq(buf, "ng")) {
+		trigger_dev_leds_set_ng_locked(tdev);
+	} else if (sysfs_streq(buf, "off")) {
+		trigger_dev_leds_off_locked(tdev);
+	} else {
+		mutex_unlock(&tdev->led_mutex);
+		return -EINVAL;
+	}
+	mutex_unlock(&tdev->led_mutex);
+
+	return count;
+}
+static DEVICE_ATTR_RW(result);
+
+/* Sysfs: result_led_enable (0=驱动不操作结果灯并灭灯, 1=正常) */
+static ssize_t result_led_enable_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	int en;
+
+	if (!trigger_dev_has_result_leds(tdev))
+		return -ENODEV;
+
+	mutex_lock(&tdev->led_mutex);
+	en = tdev->result_led_enable;
+	mutex_unlock(&tdev->led_mutex);
+
+	return sysfs_emit(buf, "%d\n", en);
+}
+
+static ssize_t result_led_enable_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	bool v;
+	int ret;
+
+	if (!trigger_dev_has_result_leds(tdev))
+		return -ENODEV;
+
+	ret = kstrtobool(buf, &v);
+	if (ret)
+		return ret;
+
+	mutex_lock(&tdev->led_mutex);
+	if (!v) {
+		tdev->result_led_enable = false;
+		trigger_dev_leds_off_locked(tdev);
+	} else {
+		tdev->result_led_enable = true;
+	}
+	mutex_unlock(&tdev->led_mutex);
+
+	return count;
+}
+static DEVICE_ATTR_RW(result_led_enable);
+
 static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct trigger_dev *tdev = dev_get_drvdata(dev);
@@ -709,6 +891,8 @@ static struct attribute *trigger_dev_attrs[] = {
 	&dev_attr_mode.attr,
 	&dev_attr_pulse_count.attr,
 	&dev_attr_pulse_interval_us.attr,
+	&dev_attr_result.attr,
+	&dev_attr_result_led_enable.attr,
 	&dev_attr_stats.attr,
 	NULL,
 };
@@ -743,7 +927,7 @@ static struct platform_driver trigger_dev_driver = {
 };
 module_platform_driver(trigger_dev_driver);
 
-MODULE_DESCRIPTION("Generic GPIO input trigger device (sysfs write on press)");
+MODULE_DESCRIPTION("Generic GPIO input trigger device (camera trigger + optional result LEDs)");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 
