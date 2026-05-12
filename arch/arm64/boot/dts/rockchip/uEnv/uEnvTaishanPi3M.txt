@@ -1,0 +1,11 @@
+uname_r=
+size=0x1000000
+cmdline="earlyprintk console=ttyFIQ0 console=tty1 consoleblank=0 loglevel=7 rootwait rw rootfstype=ext4"
+
+enable_uboot_overlays=0
+#overlay_start
+
+#dtoverlay=/dtb/overlay/tspi-3m-dsi-c41409463.dtbo
+#dtoverlay=/dtb/overlay/tspi-3m-dsi-c42388916.dtbo
+
+#overlay_end
