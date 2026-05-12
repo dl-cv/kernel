@@ -53,7 +53,7 @@
 ```python
 from pathlib import Path
 
-base = Path("/sys/devices/platform/trigger-dev.0")  # 或 glob trigger-dev.*
+base = Path("/sys/devices/platform/trigger-dev")  # 或 glob trigger-dev.*
 (base / "result").write_text("ok\n")
 (base / "result").write_text("off\n")
 (base / "result_led_enable").write_text("0\n")
