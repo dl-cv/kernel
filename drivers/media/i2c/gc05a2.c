@@ -903,6 +903,7 @@ static long gc05a2_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	long ret = 0;
 	u32 stream = 0;
 	struct rkmodule_channel_info *ch_info;
+	struct rkmodule_hdr_cfg *hdr;
 
 	switch (cmd) {
 	case RKMODULE_GET_MODULE_INFO:
@@ -929,6 +930,16 @@ static long gc05a2_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		ch_info = (struct rkmodule_channel_info *)arg;
 		ret = gc05a2_get_channel_info(gc05a2, ch_info);
 		break;
+	case RKMODULE_GET_HDR_CFG:
+		hdr = (struct rkmodule_hdr_cfg *)arg;
+		hdr->esp.mode = HDR_NORMAL_VC;
+		hdr->hdr_mode = NO_HDR;
+		break;
+	case RKMODULE_SET_HDR_CFG:
+		hdr = (struct rkmodule_hdr_cfg *)arg;
+		if (hdr->hdr_mode != NO_HDR)
+			ret = -EINVAL;
+		break;
 	default:
 		ret = -ENOTTY;
 		break;
@@ -947,6 +958,7 @@ static long gc05a2_compat_ioctl32(struct v4l2_subdev *sd,
 	long ret = 0;
 	u32 stream = 0;
 	struct rkmodule_channel_info *ch_info;
+	struct rkmodule_hdr_cfg *hdr;
 
 	switch (cmd) {
 	case RKMODULE_GET_MODULE_INFO:
@@ -1000,6 +1012,35 @@ static long gc05a2_compat_ioctl32(struct v4l2_subdev *sd,
 		}
 		kfree(ch_info);
 		break;
+	case RKMODULE_GET_HDR_CFG:
+		hdr = kzalloc(sizeof(*hdr), GFP_KERNEL);
+		if (!hdr) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = gc05a2_ioctl(sd, cmd, hdr);
+		if (!ret) {
+			ret = copy_to_user(up, hdr, sizeof(*hdr));
+			if (ret)
+				ret = -EFAULT;
+		}
+		kfree(hdr);
+		break;
+	case RKMODULE_SET_HDR_CFG:
+		hdr = kzalloc(sizeof(*hdr), GFP_KERNEL);
+		if (!hdr) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = copy_from_user(hdr, up, sizeof(*hdr));
+		if (!ret)
+			ret = gc05a2_ioctl(sd, cmd, hdr);
+		else
+			ret = -EFAULT;
+		kfree(hdr);
+		break;
 	default:
 		ret = -ENOTTY;
 		break;
@@ -1012,6 +1053,11 @@ static long gc05a2_compat_ioctl32(struct v4l2_subdev *sd,
 static int __gc05a2_start_stream(struct gc05a2 *gc05a2)
 {
 	int ret;
+
+	/* Re-write global registers after power cycle */
+	ret = gc05a2_write_array(gc05a2->client, gc05a2->cur_mode->global_reg_list);
+	if (ret)
+		return ret;
 
 	ret = gc05a2_write_array(gc05a2->client, gc05a2->cur_mode->reg_list);
 	if (ret)
@@ -1261,6 +1307,7 @@ static int gc05a2_enum_frame_interval(struct v4l2_subdev *sd,
 	fie->width = gc05a2->support_modes[fie->index].width;
 	fie->height = gc05a2->support_modes[fie->index].height;
 	fie->interval = gc05a2->support_modes[fie->index].max_fps;
+	fie->reserved[0] = NO_HDR;
 	return 0;
 }
 
@@ -1306,12 +1353,29 @@ static const struct v4l2_subdev_video_ops gc05a2_video_ops = {
 	.g_frame_interval = gc05a2_g_frame_interval,
 };
 
+static int gc05a2_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct gc05a2 *gc05a2 = to_gc05a2(sd);
+
+	if (sel->target == V4L2_SEL_TGT_CROP_BOUNDS) {
+		sel->r.left = 0;
+		sel->r.width = gc05a2->cur_mode->width;
+		sel->r.top = 0;
+		sel->r.height = gc05a2->cur_mode->height;
+		return 0;
+	}
+	return -EINVAL;
+}
+
 static const struct v4l2_subdev_pad_ops gc05a2_pad_ops = {
 	.enum_mbus_code = gc05a2_enum_mbus_code,
 	.enum_frame_size = gc05a2_enum_frame_sizes,
 	.enum_frame_interval = gc05a2_enum_frame_interval,
 	.get_fmt = gc05a2_get_fmt,
 	.set_fmt = gc05a2_set_fmt,
+	.get_selection = gc05a2_get_selection,
 	.get_mbus_config = gc05a2_g_mbus_config,
 };
 
