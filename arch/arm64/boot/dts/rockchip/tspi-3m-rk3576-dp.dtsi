@@ -77,11 +77,11 @@
  * Can choose which path to enable according to actual needs to save resources
  *-----------------------------------------------------------*/
 &dp0_in_vp0 {
- 	status = "disabled";   // Disable main display path (can be enabled if multi-screen needed)
+	status = "okay";       // Enable main display path (4K@120Hz)
 };
 
 &dp0_in_vp1 {
-	status = "okay";       // Enable secondary display path
+	status = "disabled";   // Disable secondary display path
 };
 
 &dp0_in_vp2 {
@@ -98,18 +98,26 @@
 /*-----------------------------------------------------------
  * DP0 Routing Node
  * status: Enable DP0 routing
- * connect: Connect VP1 display path output to DP0
+ * connect: Connect VP0 display path output to DP0
  *-----------------------------------------------------------*/
 &route_dp0 {
 	status = "okay";
-	connect = <&vp1_out_dp0>;
+	connect = <&vp0_out_dp0>;
+};
+
+/*-----------------------------------------------------------
+ * VP0 Video Path Node
+ * status: Enable VP0, as video source for DP0
+ *-----------------------------------------------------------*/
+&vp0 {
+	status = "okay";
 };
 
 /*-----------------------------------------------------------
  * VP1 Video Path Node
- * status: Enable VP1, as video source for DP0
+ * status: Disable VP1
  *-----------------------------------------------------------*/
 &vp1 {
-	status = "okay";
+	status = "disabled";
 };
 
