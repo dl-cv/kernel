@@ -33,14 +33,15 @@
 
 	imx296_mipi0: imx296@1a {
 		status = "okay";
-		compatible = "sony,imx296";
+		compatible = "sony,imx296lq";
 		reg = <0x1a>;
-		clocks = <&cru CLK_MIPI_CAMERAOUT_M0>;
-		assigned-clocks = <&cru CLK_MIPI_CAMERAOUT_M0>;
-		assigned-clock-rates = <74250000>;
-		clock-names = "inck";
-		pinctrl-names = "default";
-		pinctrl-0 = <&cam_clk0m0_clk0>;
+		/* Module has on-board 37.125MHz oscillator, disable board MCLK */
+		/* clocks = <&cru CLK_MIPI_CAMERAOUT_M0>; */
+		/* assigned-clocks = <&cru CLK_MIPI_CAMERAOUT_M0>; */
+		/* assigned-clock-rates = <74250000>; */
+		/* clock-names = "inck"; */
+		/* pinctrl-names = "default"; */
+		/* pinctrl-0 = <&cam_clk0m0_clk0>; */
 		power-domains = <&power RK3576_PD_VI>;
 
 		avdd-supply = <&vcc_mipicsi0_avdd>;
@@ -57,6 +58,7 @@
 		port {
 			imx296_dcphy0_out: endpoint {
 				remote-endpoint = <&dcphy0_in_imx296>;
+				clock-lanes = <0>;
 				data-lanes = <1>;
 			};
 		};
