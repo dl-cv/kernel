@@ -1,0 +1,232 @@
+/********************************************************************
+ * SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+ * 
+ * Copyright (c) 2023 Rockchip Electronics Co., Ltd.
+ * Copyright (c) 2026 LCKFB <lckfb@sz-jlc.com>
+ *********************************************************************
+ * Wiki-(Chinese)：https://wiki.lckfb.com/
+ * Wiki-(English)：https://wiki.lckfb.com/en/
+ *********************************************************************/
+/dts-v1/;
+
+#include <dt-bindings/usb/pd.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pwm/pwm.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/input/linux-event-codes.h>
+#include <dt-bindings/display/drm_mipi_dsi.h>
+#include <dt-bindings/display/rockchip_vop.h>
+#include <dt-bindings/sensor-dev.h>
+#include "rk3576.dtsi"
+#include "rk3576-rk806.dtsi"
+
+/*-----------------------------------------------------------
+ * Uncomment the required dtsi based on the compiled system type
+ *----------------------------------------------------------*/
+// #include "rk3576-android.dtsi"
+#include "rk3576-linux.dtsi"
+
+/*-----------------------------------------------------------
+ * Core layer configuration, almost no need to modify here, contains basic configurations
+ *----------------------------------------------------------*/
+#include "dlcvcam-rk3576-core.dtsi"
+
+/* TF card slot and related power/detect circuits are removed. */
+&vcc_3v3_sdcard {
+	status = "disabled";
+};
+
+&sdmmc {
+	status = "disabled";
+};
+
+/*-----------------------------------------------------------
+ * Type-C-OTG Configuration
+ *----------------------------------------------------------*/
+#include "dlcvcam-rk3576-typec.dtsi"
+
+/*-----------------------------------------------------------
+ * USB-HOST Configuration
+ * Hardware cut: FE2.1 USB hub and three standalone USB2.0 ports are removed.
+ * Keep USB3_OTG1 host; USB2_HOST1 is wired directly to the USB3.0 connector.
+ *----------------------------------------------------------*/
+#include "dlcvcam-rk3576-usb-host.dtsi"
+
+/*-----------------------------------------------------------
+ * Ethernet Port Configuration
+ *----------------------------------------------------------*/
+#include "dlcvcam-rk3576-eth.dtsi"
+
+/*-----------------------------------------------------------
+ * WIFI-BT Module Configuration, default is AP6256 module
+ * Special Note: Module requires RTC 32KHz clock support, please ensure RTC is started
+ * Hardware cut: AP6256 and TXB0104RUTR are removed, keep WiFi/BT disabled.
+ *----------------------------------------------------------*/
+// #include "dlcvcam-rk3576-sdio-wifibt.dtsi"
+
+/*-----------------------------------------------------------
+ * HYM8563 RTC Configuration
+ *----------------------------------------------------------*/
+#include "dlcvcam-rk3576-rtc.dtsi"
+
+/*-----------------------------------------------------------
+ * CSI-MIPI Camera Configuration
+ *
+ * TaishanPi 3M RK3576 CSI-MIPI 4Lanes x 3 Camera Link Description:
+ *
+ * [sensor0] -> [csi2_dcphy0]->[mipi0_csi2]->[rkcif_mipi_lvds]->[rkcif_mipi_lvds_sditf]->[rkisp_vir0]
+ * [sensor1] -> [csi2_dphy0]->[mipi1_csi2]->[rkcif_mipi_lvds1]->[rkcif_mipi_lvds1_sditf]->[rkisp_vir1]
+ * [sensor2] -> [csi2_dphy3]->[mipi3_csi2]->[rkcif_mipi_lvds3]->[rkcif_mipi_lvds3_sditf]->[rkisp_vir2]
+ *
+ * Uncomment or comment the corresponding dtsi file according to the required interface
+ *----------------------------------------------------------*/
+#include "dlcvcam-rk3576-csi0.dtsi"
+// #include "dlcvcam-rk3576-csi1.dtsi"
+// #include "dlcvcam-rk3576-csi3.dtsi"
+
+/*-----------------------------------------------------------
+ * MINI-PCIe Configuration
+ *
+ * The MINI-PCIe slot supports three mutually exclusive modes.
+ *
+ * Uncomment exactly one #include below, then recompile the kernel.
+ * This is the recommended approach for production images.
+ *
+ * WARNING: Do NOT use both methods for the same mode simultaneously.
+ *   If a #include is active AND its corresponding overlay is loaded,
+ *   regulator/device nodes will be duplicated and the kernel will
+ *   fail to boot correctly.
+ * Hardware cut: MINI-PCIe slot and related SATA/PCIe/4G mode circuits are removed.
+ *----------------------------------------------------------*/
+// #include "dlcvcam-rk3576-pcie.dtsi"
+// #include "dlcvcam-rk3576-sata.dtsi"
+// #include "dlcvcam-rk3576-ec20-4g.dtsi"
+
+/* MINI-PCIe/SATA shared Combo PHY0 is disabled after slot removal. */
+&combphy0_ps {
+	status = "disabled";
+};
+
+/*-----------------------------------------------------------
+ * Headphone Interface and Onboard Microphone Configuration
+ * Hardware cut: ES8388, onboard MIC, headphone jack, headset detect/button circuits are removed.
+ *----------------------------------------------------------*/
+// #include "dlcvcam-rk3576-headset-onboard-mic.dtsi"
+
+/*-----------------------------------------------------------
+ * Display Interface Configuration (HDMI & DP & MIPI)
+ * HDMI  : dlcvcam-rk3576-hdmi.dtsi
+ * DP    : dlcvcam-rk3576-dp.dtsi
+ * MIPI  : Choose different dtsi files according to different screens
+ *
+ * general file configuration exists for compatibility with device tree overlay mechanism
+ * [Special Note]: RK3576 has limited vp path resources
+ * Default configuration: HDMI is set to vp0, DP is set to vp1, MIPI-DSI is set to vp2
+ * Hardware cut: HDMI_TX connector and related circuits are removed, keep HDMI disabled.
+ * Hardware cut: MIPI DSI connector and SY7201ABC related circuits are removed, keep DSI disabled.
+ *----------------------------------------------------------*/
+// #include "dlcvcam-rk3576-hdmi.dtsi"
+#include "dlcvcam-rk3576-dp.dtsi"
+// #include "dlcvcam-rk3576-dsi-general.dtsi"
+
+/*
+ * Product Model: LCKFB-TSPI-10.1inch-MIPI-TP
+ * Screen Name: LCSC-boards LCKFB-TSPI-10.1inch-MIPI-TP
+ * Screen Resolution: 800x1280
+ * LCSC Part Number: C41409463
+ */
+// #include "dlcvcam-rk3576-dsi-c41409463.dtsi"
+
+/*
+ * Product Model: LCKFB-mipi-3.1inch-screen
+ * Screen Name: LCSC-boards LCKFB-mipi-3.1inch-screen
+ * Screen Resolution: 480x800
+ * LCSC Part Number: C42388916
+ */
+// #include "dlcvcam-rk3576-dsi-c42388916.dtsi"
+
+&dp0_sound {
+	status = "disabled";
+};
+
+&spdif_tx3 {
+	status = "disabled";
+};
+
+/*-----------------------------------------------------------
+ * Board Basic Information Configuration
+ *----------------------------------------------------------*/
+/ {
+	model = "DLCV DLCVCAM RK3576 Board";
+	compatible = "dlcv,dlcvcam-rk3576", "rockchip,rk3576";
+
+	/*
+	 * User LED
+	 * Used to indicate system status
+	 */
+	leds: leds {
+		status = "okay";
+		compatible = "gpio-leds";
+
+		work_led: work {
+			linux,default-trigger = "heartbeat";
+			gpios = <&gpio0 RK_PA0 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Board Cooling Fan Configuration
+	 */
+	fan: pwm-fan {
+		status = "okay";
+		compatible = "pwm-fan";
+
+		#cooling-cells = <2>;
+
+		pwms = <&pwm2_8ch_3 0 500000 0>;
+		cooling-levels = <50 120 180 230 255>;
+		rockchip,temp-trips = <
+			0        1
+			30000    2
+			40000    3
+			50000    4
+			55000    4
+		>;
+	};
+};
+
+/*-----------------------------------------------------------
+ * pwm fan channel setting
+ *-----------------------------------------------------------*/
+&pwm2_8ch_3 {
+	status = "okay";
+	pinctrl-0 = <&pwm2m3_ch3>;
+};
+
+/*-----------------------------------------------------------
+ * Board sleep settings
+ *-----------------------------------------------------------*/
+&rockchip_suspend {
+	status = "okay";
+
+	/*
+	 *	Sleep log debug enable
+	 *	0: Disable
+	 *	1: Enable
+	 */
+	rockchip,sleep-debug-en = <1>;
+
+	/*
+	 *	IO retention configuration
+	 *
+	 *	In sleep scenarios where vdd_logic is powered off
+	 *	Maintain the level of RKPM_VCCIO3_RET_EN IO.
+	 */
+	rockchip,sleep-io-ret-config = <
+		(0
+		| RKPM_VCCIO3_RET_EN
+		)
+	>;
+
+	rockchip,regulator-on-before-mem = <&vdd_npu_s0>;
+};
