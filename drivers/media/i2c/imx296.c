@@ -328,7 +328,7 @@ static struct pwm_device *imx296_devm_pwm_get_optional(struct device *dev,
 	pwm = devm_pwm_get(dev, con_id);
 	if (IS_ERR(pwm)) {
 		ret = PTR_ERR(pwm);
-		if (ret == -ENOENT || ret == -ENODEV)
+		if (ret == -ENOENT || ret == -ENODEV || ret == -EINVAL)
 			return NULL;
 		return pwm;
 	}
@@ -823,9 +823,11 @@ static int imx296_power_on(struct imx296 *sensor)
 
 	udelay(1);
 
-	ret = clk_prepare_enable(sensor->clk);
-	if (ret < 0)
-		goto err_reset;
+	if (sensor->clk) {
+		ret = clk_prepare_enable(sensor->clk);
+		if (ret < 0)
+			goto err_reset;
+	}
 
 	usleep_range(1000, 2000);
 
@@ -841,7 +843,8 @@ err_supply:
 
 static void imx296_power_off(struct imx296 *sensor)
 {
-	clk_disable_unprepare(sensor->clk);
+	if (sensor->clk)
+		clk_disable_unprepare(sensor->clk);
 	if (sensor->reset_gpio)
 		gpiod_direction_output(sensor->reset_gpio, 1);
 
@@ -1257,7 +1260,7 @@ static int imx296_stream_on(struct imx296 *sensor)
 	imx296_log_stream_state_locked(sensor, "before-on");
 
 	imx296_write(sensor, IMX296_CTRL00, 0, &ret);
-	usleep_range(2000, 5000);
+	usleep_range(30000, 35000);
 	imx296_write(sensor, IMX296_CTRL0A, 0, &ret);
 
 	imx296_log_stream_state_locked(sensor, ret ? "after-on-error" : "after-on");
@@ -1921,7 +1924,7 @@ static int imx296_identify_model(struct imx296 *sensor)
 		return ret;
 	}
 
-	usleep_range(2000, 5000);
+	usleep_range(30000, 35000);
 
 	ret = imx296_read(sensor, IMX296_SENSOR_INFO);
 	if (ret < 0) {
@@ -2053,9 +2056,10 @@ static int imx296_probe(struct i2c_client *client,
 	sensor->clk = devm_clk_get(dev, "inck");
 	if (IS_ERR(sensor->clk))
 		sensor->clk = devm_clk_get(dev, "xvclk");
-	if (IS_ERR(sensor->clk))
-		return dev_err_probe(dev, PTR_ERR(sensor->clk),
-				     "failed to get input clock\n");
+	if (IS_ERR(sensor->clk)) {
+		dev_info(dev, "no external input clock, assuming on-board oscillator\n");
+		sensor->clk = NULL;
+	}
 
 	sensor->trigger_pulse_us = IMX296_TRIGGER_PULSE_US_DEFAULT;
 	ret = of_property_read_u32(node, OF_IMX296_TRIGGER_PULSE_US,
@@ -2096,17 +2100,24 @@ static int imx296_probe(struct i2c_client *client,
 		sensor->pinctrl = NULL;
 	}
 
-	clk_rate = clk_get_rate(sensor->clk);
-	for (i = 0; i < ARRAY_SIZE(imx296_clk_params); ++i) {
-		if (clk_rate == imx296_clk_params[i].freq) {
-			sensor->clk_params = &imx296_clk_params[i];
-			break;
+	if (sensor->clk) {
+		clk_rate = clk_get_rate(sensor->clk);
+		for (i = 0; i < ARRAY_SIZE(imx296_clk_params); ++i) {
+			if (clk_rate == imx296_clk_params[i].freq) {
+				sensor->clk_params = &imx296_clk_params[i];
+				break;
+			}
 		}
-	}
 
-	if (!sensor->clk_params) {
-		dev_err(dev, "unsupported clock rate %lu\n", clk_rate);
-		return -EINVAL;
+		if (!sensor->clk_params) {
+			dev_err(dev, "unsupported clock rate %lu\n", clk_rate);
+			return -EINVAL;
+		}
+	} else {
+		/* Default to 37.125 MHz on-board oscillator parameters */
+		sensor->clk_params = &imx296_clk_params[0];
+		dev_info(dev, "using on-board oscillator clk params (%u Hz)\n",
+			 imx296_clk_params[0].freq);
 	}
 
 	sensor->regmap = devm_regmap_init_i2c(client, &imx296_regmap_config);
