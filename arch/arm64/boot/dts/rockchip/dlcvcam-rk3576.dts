@@ -176,6 +176,9 @@
 
 	/*
 	 * Board Cooling Fan Configuration
+	 *
+	 * Three profiles: silent / normal / turbo
+	 * Managed by Rockchip pwm-fan driver with profile switching via sysfs.
 	 */
 	fan: pwm-fan {
 		status = "okay";
@@ -184,13 +187,48 @@
 		#cooling-cells = <2>;
 
 		pwms = <&pwm2_8ch_3 0 500000 0>;
-		cooling-levels = <50 120 180 230 255>;
+
+		/* Fallback cooling levels for thermal framework */
+		cooling-levels = <26 77 128 179 255>;
 		rockchip,temp-trips = <
 			0        1
-			30000    2
-			40000    3
-			50000    4
+			50000    2
+			60000    3
+			70000    4
+			75000    4
+		>;
+
+		/* Silent: 50°C 10% -> 75°C 100% */
+		rockchip,cooling-levels-silent = <26 26 51 77 102 128 179 255>;
+		rockchip,temp-trips-silent = <
+			50000    1
+			55000    2
+			60000    3
+			65000    4
+			70000    5
+			72000    6
+			75000    7
+		>;
+
+		/* Normal: 45°C 10% -> 70°C 100% */
+		rockchip,cooling-levels-normal = <26 26 77 128 179 217 255>;
+		rockchip,temp-trips-normal = <
+			45000    1
+			50000    2
+			55000    3
+			60000    4
+			65000    5
+			70000    6
+		>;
+
+		/* Turbo: 40°C 10% -> 60°C 100% */
+		rockchip,cooling-levels-turbo = <26 26 77 128 191 255>;
+		rockchip,temp-trips-turbo = <
+			40000    1
+			45000    2
+			50000    3
 			55000    4
+			60000    5
 		>;
 	};
 
