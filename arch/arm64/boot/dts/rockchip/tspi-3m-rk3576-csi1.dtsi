@@ -32,7 +32,7 @@
 	pinctrl-0 = <&i2c5m3_xfer>;
 
 	imx415_mipi1: imx415@37 {
-        status = "okay";
+        status = "disabled";
 		compatible = "sony,imx415";
 		reg = <0x37>;
 		clocks = <&cru CLK_MIPI_CAMERAOUT_M1>;
@@ -62,7 +62,7 @@
 	};
 
 	gc05a2_mipi1: gc05a2@37 {
-		status = "okay";
+		status = "disabled";
 		compatible = "galaxycore,gc05a2";
 		reg = <0x37>;
 		clocks = <&cru CLK_MIPI_CAMERAOUT_M1>;
