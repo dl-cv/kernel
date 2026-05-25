@@ -1,6 +1,6 @@
-# 泰山派 RK3576 内核编译与更新操作手册
+# DLCVCAM RK3576 内核编译与更新操作手册
 
-> 适用对象：LCKFB TaishanPi 3M (RK3576)  
+> 适用对象：DLCVCAM (RK3576)  
 > 内核版本：6.1.99-rk3576  
 > 编译主机：x86_64 Linux (交叉编译)  
 > 目标板子：`ssh root@192.168.1.204`
@@ -28,9 +28,9 @@ cd /home/ypw/kernel
 # 加载基础配置
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lubancat_linux_rk3576_defconfig
 
-# 合并泰山派3M裁剪配置
+# 合并 DLCVCAM 裁剪配置
 ./scripts/kconfig/merge_config.sh -m .config \
-    arch/arm64/configs/tspi_3m_rk3576_kernel_cut.config
+    arch/arm64/configs/dlcvcam_rk3576_kernel_cut.config
 
 # 应用合并后的配置
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
@@ -44,11 +44,15 @@ cd /home/ypw/kernel
 # 增量编译内核、设备树、模块
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules -j8
 
+# 安装模块到目标根文件系统（如需模块支持，如 WiFi/BT 等）
+# 替换 /path/to/rootfs 为板子实际根文件系统挂载路径
+# sudo make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_install INSTALL_MOD_PATH=/path/to/rootfs
+
 # 生成 lz4 压缩内核
 lz4 -f arch/arm64/boot/Image arch/arm64/boot/Image.lz4
 
 # 打包 boot.img（FIT 格式，含 kernel + dtb + resource）
-BOOT_ITS=boot.its ./scripts/mkimg --dtb tspi-3m-rk3576.dtb
+BOOT_ITS=boot.its ./scripts/mkimg --dtb dlcvcam-rk3576.dtb
 ```
 
 > 建议用 `-j8`。如果内存较小（如 8GB 以下）出现 `cc1` 被杀死的情况，请改用 `-j4` 或 `-j2`。
@@ -69,8 +73,8 @@ mkimage -l boot.img
 
 ### 方式一：RKDevTool（Windows，官方推荐）
 
-1. 下载 [RKDevTool_v3.32](https://wiki.lckfb.com/zh-hans/tspi-3-rk3576/img-download/distributed-image.html) 并解压
-2. 下载泰山派3M分区表 `TaishanPi-3M-RK3576_Linux.cfg`，导入 RKDevTool
+1. 下载 RKDevTool_v3.32 并解压（可从 [LCKFB wiki](https://wiki.lckfb.com/zh-hans/tspi-3-rk3576/img-download/distributed-image.html) 获取）
+2. 下载分区表 `TaishanPi-3M-RK3576_Linux.cfg`，导入 RKDevTool
 3. 勾选 **boot** 分区，选择生成的 `boot.img`
 4. 板子进入 **Loader 模式**：
    - 按住 **REC** 按钮不放
@@ -119,14 +123,17 @@ set -e
 
 cd /home/ypw/kernel
 
-echo "[1/3] 增量编译内核..."
+echo "[1/4] 增量编译内核..."
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules -j8
 
-echo "[2/3] 生成 Image.lz4..."
+echo "[2/4] 生成 Image.lz4..."
 lz4 -f arch/arm64/boot/Image arch/arm64/boot/Image.lz4
 
-echo "[3/3] 打包 boot.img..."
-BOOT_ITS=boot.its ./scripts/mkimg --dtb tspi-3m-rk3576.dtb
+echo "[3/4] 打包 boot.img..."
+BOOT_ITS=boot.its ./scripts/mkimg --dtb dlcvcam-rk3576.dtb
+
+echo "[4/4] 提示：如需更新内核模块（如 WiFi/BT 驱动等），请执行："
+echo "  sudo make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_install INSTALL_MOD_PATH=/path/to/rootfs"
 
 echo ""
 echo "完成！"
