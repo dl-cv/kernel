@@ -50,10 +50,18 @@
 
 		reset-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_LOW>;
 
+		/* External trigger: PWM output on GPIO0_B5 (pwm1_ch1_m0) */
+		pwm-names = "trigger";
+		pwms = <&pwm1_6ch_1 0 10000000 PWM_POLARITY_INVERTED>;
+		rockchip,trigger-pulse-us = <800>;
+
 		rockchip,camera-module-index = <0>;
 		rockchip,camera-module-facing = "back";
 		rockchip,camera-module-name = "IMX296-MIPI";
 		rockchip,camera-module-lens-name = "default";
+
+		/* 0 = FREE_RUN, 1 = XTRIG_ONE_SHOT */
+		trigger-mode = <1>;
 
 		port {
 			imx296_dcphy0_out: endpoint {
@@ -199,5 +207,12 @@
 };
 
 &rkvpss_mmu {
+	status = "okay";
+};
+
+/*-----------------------------------------------------------
+ * PWM1 CH1 for IMX296 external trigger output on GPIO0_B5
+ *----------------------------------------------------------*/
+&pwm1_6ch_1 {
 	status = "okay";
 };

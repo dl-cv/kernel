@@ -193,6 +193,37 @@
 			55000    4
 		>;
 	};
+
+	/*
+	 * External Trigger Device
+	 * GPIO0_D2 input -> trigger-dev -> imx296 sysfs trigger
+	 * -> PWM output on GPIO0_B5
+	 */
+	trigger_dev: trigger-dev {
+		compatible = "embedfire,trigger-dev";
+		status = "okay";
+
+		/* GPIO0_D2: external pulse input, active-low (high idle, falling edge) */
+		input-gpios = <&gpio0 RK_PD2 GPIO_ACTIVE_LOW>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PD2 IRQ_TYPE_EDGE_BOTH>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&trigger_dev_pin &trigger_dev_result_led_pin>;
+
+		/* Input mode: edge for clean external pulses */
+		trigger-input-mode = "edge";
+		debounce-ms = <10>;
+		linux,code = <KEY_CAMERA>;
+
+		/* Result LEDs */
+		ok-led-gpios = <&gpio2 RK_PB0 GPIO_ACTIVE_HIGH>;
+		ng-led-gpios = <&gpio2 RK_PA7 GPIO_ACTIVE_HIGH>;
+
+		/* Trigger imx296 via sysfs */
+		trigger-path = "/sys/bus/i2c/devices/4-001a/trigger";
+		trigger-value = "1";
+	};
 };
 
 /*-----------------------------------------------------------
@@ -229,4 +260,22 @@
 	>;
 
 	rockchip,regulator-on-before-mem = <&vdd_npu_s0>;
+};
+
+/*-----------------------------------------------------------
+ * Trigger device pin configuration
+ *-----------------------------------------------------------*/
+&pinctrl {
+	trigger_dev {
+		trigger_dev_pin: trigger-dev-pin {
+			/* GPIO0_D2: high idle, pull-up, falling edge active */
+			rockchip,pins = <0 RK_PD2 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		trigger_dev_result_led_pin: trigger-dev-result-led-pin {
+			/* GPIO2_B0: OK LED, GPIO2_A7: NG LED */
+			rockchip,pins = <2 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>,
+					<2 RK_PA7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
 };
