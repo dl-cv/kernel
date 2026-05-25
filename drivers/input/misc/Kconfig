@@ -929,4 +929,19 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config TRIGGER_DEV
+	tristate "Generic GPIO input trigger device (camera trigger + result LEDs)"
+	depends on GPIOLIB && SYSFS
+	help
+	  Say Y/M here to enable a generic GPIO input device named "trigger-dev".
+	  It converts GPIO edge/button events into camera trigger actions via
+	  direct GPIO pulse or sysfs write. Optional OK/NG result LEDs are
+	  supported.
+
+	  Example: trigger an IMX296 sensor via sysfs on each external pulse:
+	    echo 1 > /sys/bus/i2c/devices/4-001a/trigger
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called trigger-dev.
+
 endif
