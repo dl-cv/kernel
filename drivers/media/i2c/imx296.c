@@ -134,9 +134,9 @@
 #define IMX296_FID0_ROIPH1			IMX296_REG_16BIT(0x3310)
 #define IMX296_FID0_ROIPV1			IMX296_REG_16BIT(0x3312)
 #define IMX296_FID0_ROIWH1			IMX296_REG_16BIT(0x3314)
-#define IMX296_FID0_ROIWH1_MIN			96
+#define IMX296_FID0_ROIWH1_MIN			80
 #define IMX296_FID0_ROIWV1			IMX296_REG_16BIT(0x3316)
-#define IMX296_FID0_ROIWV1_MIN			88
+#define IMX296_FID0_ROIWV1_MIN			4
 
 #define IMX296_HMAX_DEFAULT			1100U
 #define IMX296_VBLANK_DEFAULT			30U
@@ -439,6 +439,8 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 }
 
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);
+static int imx296_mode_switch_locked(struct imx296 *sensor,
+			      enum imx296_op_mode new_mode);
 static int imx296_mode_switch(struct imx296 *sensor,
 			      enum imx296_op_mode new_mode);
 static u32 imx296_mbus_code(const struct imx296 *sensor);
@@ -609,10 +611,103 @@ static ssize_t trigger_pulse_us_store(struct device *dev,
 
 static DEVICE_ATTR_RW(trigger_pulse_us);
 
+static ssize_t roi_left_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf, "%u\n", sensor->crop.left);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+static DEVICE_ATTR_RO(roi_left);
+
+static ssize_t roi_top_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf, "%u\n", sensor->crop.top);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+static DEVICE_ATTR_RO(roi_top);
+
+static ssize_t roi_width_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf, "%u\n", sensor->crop.width);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+static DEVICE_ATTR_RO(roi_width);
+
+static ssize_t roi_height_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf, "%u\n", sensor->crop.height);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+static DEVICE_ATTR_RO(roi_height);
+
+static ssize_t roi_enable_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct imx296 *sensor = imx296_from_dev(dev);
+	ssize_t len;
+	u32 enabled;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	enabled = (sensor->crop.width != IMX296_PIXEL_ARRAY_WIDTH ||
+		   sensor->crop.height != IMX296_PIXEL_ARRAY_HEIGHT);
+	mutex_unlock(&sensor->mutex);
+
+	len = sysfs_emit(buf, "%u\n", enabled);
+	return len;
+}
+static DEVICE_ATTR_RO(roi_enable);
+
 static struct attribute *imx296_attrs[] = {
 	&dev_attr_run_mode.attr,
 	&dev_attr_trigger.attr,
 	&dev_attr_trigger_pulse_us.attr,
+	&dev_attr_roi_left.attr,
+	&dev_attr_roi_top.attr,
+	&dev_attr_roi_width.attr,
+	&dev_attr_roi_height.attr,
+	&dev_attr_roi_enable.attr,
 	NULL
 };
 
@@ -636,6 +731,7 @@ static int imx296_read(struct imx296 *sensor, u32 addr)
 static void imx296_log_stream_state_locked(struct imx296 *sensor, const char *tag)
 {
 	u32 ctrl00, ctrl08, ctrl0a, ctrl0b, syncsel, lowlagtrg, pgctrl;
+	u32 fid0_roi, roiph1, roipv1, roiwh1, roiwv1;
 	u32 reg = 0;
 	const char *name = NULL;
 	int ret;
@@ -657,11 +753,16 @@ static void imx296_log_stream_state_locked(struct imx296 *sensor, const char *ta
 	IMX296_READBACK(IMX296_SYNCSEL, syncsel, "SYNCSEL");
 	IMX296_READBACK(IMX296_LOWLAGTRG, lowlagtrg, "LOWLAGTRG");
 	IMX296_READBACK(IMX296_PGCTRL, pgctrl, "PGCTRL");
+	IMX296_READBACK(IMX296_FID0_ROI, fid0_roi, "FID0_ROI");
+	IMX296_READBACK(IMX296_FID0_ROIPH1, roiph1, "ROIPH1");
+	IMX296_READBACK(IMX296_FID0_ROIPV1, roipv1, "ROIPV1");
+	IMX296_READBACK(IMX296_FID0_ROIWH1, roiwh1, "ROIWH1");
+	IMX296_READBACK(IMX296_FID0_ROIWV1, roiwv1, "ROIWV1");
 
 #undef IMX296_READBACK
 
 	dev_info(sensor->dev,
-		 "stream-state[%s]: pending=%s active=%s test_pattern=%u ctrl00=0x%02x standby=%u ctrl08=0x%02x reghold=%u ctrl0a=0x%02x xmsta=%u ctrl0b=0x%02x trigen=%u syncsel=0x%02x lowlag=0x%02x pgctrl=0x%02x regen=%u clken=%u pg_mode=%u\n",
+		 "stream-state[%s]: pending=%s active=%s test_pattern=%u ctrl00=0x%02x standby=%u ctrl08=0x%02x reghold=%u ctrl0a=0x%02x xmsta=%u ctrl0b=0x%02x trigen=%u syncsel=0x%02x lowlag=0x%02x pgctrl=0x%02x regen=%u clken=%u pg_mode=%u roi_en=%u roi_pos=(%u,%u) roi_size=(%u,%u)\n",
 		 tag,
 		 imx296_op_mode_name(sensor->pending_mode),
 		 imx296_op_mode_name(sensor->active_mode),
@@ -673,7 +774,9 @@ static void imx296_log_stream_state_locked(struct imx296 *sensor, const char *ta
 		 syncsel, lowlagtrg, pgctrl,
 		 !!(pgctrl & IMX296_PGCTRL_REGEN),
 		 !!(pgctrl & IMX296_PGCTRL_CLKEN),
-		 (pgctrl >> 3) & 0x1f);
+		 (pgctrl >> 3) & 0x1f,
+		 !!(fid0_roi & (IMX296_FID0_ROIH1ON | IMX296_FID0_ROIV1ON)),
+		 roiph1, roipv1, roiwh1, roiwv1);
 	return;
 
 read_fail:
@@ -992,7 +1095,7 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 	if (ret < 0)
 		return ret;
 
-	ret = v4l2_ctrl_handler_init(handler, 11);
+	ret = v4l2_ctrl_handler_init(handler, 15);
 	if (ret)
 		return ret;
 
@@ -1162,6 +1265,7 @@ static int imx296_setup(struct imx296 *sensor)
 		     &ret);
 
 	imx296_write(sensor, IMX296_HMAX, IMX296_HMAX_DEFAULT, &ret);
+	/* In ROI mode VMAX should be ROI height + vertical blanking */
 	imx296_write(sensor, IMX296_VMAX,
 		     format->height + sensor->vblank->val, &ret);
 
@@ -1174,6 +1278,7 @@ static int imx296_setup(struct imx296 *sensor)
 		     &ret);
 	imx296_write(sensor, IMX296_GAINDLY, IMX296_GAINDLY_1FRAME, &ret);
 	imx296_write(sensor, IMX296_BLKLEVEL, 0x03c, &ret);
+	imx296_write(sensor, IMX296_BLKLEVELAUTO, IMX296_BLKLEVELAUTO_OFF, &ret);
 	imx296_write(sensor, IMX296_VINT, IMX296_VINT_EN, &ret);
 
 	return ret;
@@ -1262,8 +1367,10 @@ static int imx296_stream_on(struct imx296 *sensor)
 
 	imx296_log_stream_state_locked(sensor, ret ? "after-on-error" : "after-on");
 
-	__v4l2_ctrl_grab(sensor->vflip, 1);
-	__v4l2_ctrl_grab(sensor->hflip, 1);
+	if (!ret) {
+		__v4l2_ctrl_grab(sensor->vflip, 1);
+		__v4l2_ctrl_grab(sensor->hflip, 1);
+	}
 
 	return ret;
 }
@@ -1286,19 +1393,26 @@ static int imx296_quick_stream(struct imx296 *sensor, bool on)
 	int ret = 0;
 
 	if (on) {
-		imx296_write(sensor, IMX296_CTRL00, 0, &ret);
-		usleep_range(2000, 5000);
-		imx296_write(sensor, IMX296_CTRL0A, 0, &ret);
+		ret = pm_runtime_resume_and_get(sensor->dev);
+		if (ret < 0)
+			return ret;
+		ret = imx296_stream_on(sensor);
+		if (!ret) {
+			sensor->streaming = true;
+		} else {
+			pm_runtime_put_sync(sensor->dev);
+		}
 	} else {
-		imx296_write(sensor, IMX296_CTRL0A, IMX296_CTRL0A_XMSTA, &ret);
-		imx296_write(sensor, IMX296_CTRL00,
-			     IMX296_CTRL00_STANDBY, &ret);
+		ret = imx296_stream_off(sensor);
+		sensor->streaming = false;
+		pm_runtime_mark_last_busy(sensor->dev);
+		pm_runtime_put_autosuspend(sensor->dev);
 	}
 
 	return ret;
 }
 
-static int imx296_mode_switch(struct imx296 *sensor,
+static int imx296_mode_switch_locked(struct imx296 *sensor,
 			      enum imx296_op_mode new_mode)
 {
 	int ret = 0;
@@ -1350,13 +1464,24 @@ out_pm:
 	return ret;
 }
 
+static int __maybe_unused imx296_mode_switch(struct imx296 *sensor,
+			      enum imx296_op_mode new_mode)
+{
+	int ret;
+
+	mutex_lock(&sensor->mutex);
+	ret = imx296_mode_switch_locked(sensor, new_mode);
+	mutex_unlock(&sensor->mutex);
+	return ret;
+}
+
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct imx296 *sensor = container_of(ctrl->handler, struct imx296, ctrls);
 	int ret = 0;
 
 	if (ctrl->id == V4L2_CID_IMX296_OP_MODE)
-		return imx296_mode_switch(sensor, ctrl->val);
+		return imx296_mode_switch_locked(sensor, ctrl->val);
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
@@ -1561,7 +1686,7 @@ static long imx296_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		    sync_mode != INTERNAL_MASTER_MODE)
 			ret = -EINVAL;
 		else
-			sensor->sync_mode = INTERNAL_MASTER_MODE;
+			sensor->sync_mode = sync_mode;
 		break;
 
 	default:
@@ -1643,9 +1768,9 @@ static int imx296_enum_frame_size(struct v4l2_subdev *sd,
 	if (fse->index >= 1 || fse->code != imx296_mbus_code(sensor))
 		return -EINVAL;
 
-	fse->min_width = IMX296_PIXEL_ARRAY_WIDTH;
+	fse->min_width = IMX296_FID0_ROIWH1_MIN;
 	fse->max_width = IMX296_PIXEL_ARRAY_WIDTH;
-	fse->min_height = IMX296_PIXEL_ARRAY_HEIGHT;
+	fse->min_height = IMX296_FID0_ROIWV1_MIN;
 	fse->max_height = IMX296_PIXEL_ARRAY_HEIGHT;
 
 	return 0;
@@ -1674,10 +1799,26 @@ static int imx296_set_format(struct v4l2_subdev *sd,
 	struct imx296 *sensor = to_imx296(sd);
 	struct v4l2_mbus_framefmt *format;
 	struct v4l2_rect *crop;
+	u32 width, height;
 
 	mutex_lock(&sensor->mutex);
 	crop = imx296_get_pad_crop(sensor, cfg, fmt->pad, fmt->which);
 	format = imx296_get_pad_format(sensor, cfg, fmt->pad, fmt->which);
+
+	/* Parse user request, align to 4 pixels and clamp to valid range */
+	width = clamp_t(u32, ALIGN(fmt->format.width, 4),
+			IMX296_FID0_ROIWH1_MIN, IMX296_PIXEL_ARRAY_WIDTH);
+	height = clamp_t(u32, ALIGN(fmt->format.height, 4),
+			 IMX296_FID0_ROIWV1_MIN, IMX296_PIXEL_ARRAY_HEIGHT);
+
+	/* Keep left/top unchanged, shrink size if it overflows */
+	width = min_t(u32, width, IMX296_PIXEL_ARRAY_WIDTH - crop->left);
+	height = min_t(u32, height, IMX296_PIXEL_ARRAY_HEIGHT - crop->top);
+
+	if (width != crop->width || height != crop->height) {
+		crop->width = width;
+		crop->height = height;
+	}
 
 	format->width = crop->width;
 	format->height = crop->height;
@@ -1713,10 +1854,12 @@ static int imx296_get_selection(struct v4l2_subdev *sd,
 	case V4L2_SEL_TGT_CROP_DEFAULT:
 	case V4L2_SEL_TGT_CROP_BOUNDS:
 	case V4L2_SEL_TGT_NATIVE_SIZE:
-		sel->r.left = 0;
-		sel->r.top = 0;
-		sel->r.width = IMX296_PIXEL_ARRAY_WIDTH;
-		sel->r.height = IMX296_PIXEL_ARRAY_HEIGHT;
+		/*
+		 * Rockchip CIF/ISP uses CROP_BOUNDS as the active input
+		 * size, so return the current crop (ROI) rather than the
+		 * full pixel array.
+		 */
+		sel->r = *imx296_get_pad_crop(sensor, cfg, sel->pad, sel->which);
 		break;
 
 	default:
@@ -2009,18 +2152,21 @@ static int imx296_probe(struct i2c_client *client,
 
 	sensor->dev = dev;
 	sensor->client = client;
-	sensor->sync_mode = INTERNAL_MASTER_MODE;
+	sensor->sync_mode = NO_SYNC_MODE;
 
 	ret = of_property_read_string(node, RKMODULE_CAMERA_SYNC_MODE,
 				      &sync_mode_name);
 	if (!ret) {
-		if (strcmp(sync_mode_name, RKMODULE_INTERNAL_MASTER_MODE) != 0)
-			dev_warn(dev,
-				 "sync-mode '%s' is unsupported for IMX296 fast trigger, forcing internal_master\n",
+		if (strcmp(sync_mode_name, RKMODULE_INTERNAL_MASTER_MODE) == 0)
+			sensor->sync_mode = INTERNAL_MASTER_MODE;
+		else if (strcmp(sync_mode_name, RKMODULE_EXTERNAL_MASTER_MODE) == 0)
+			dev_warn(dev, "sync-mode '%s' not supported, keeping no-sync\n",
+				 sync_mode_name);
+		else if (strcmp(sync_mode_name, RKMODULE_SLAVE_MODE) == 0)
+			dev_warn(dev, "sync-mode '%s' not supported, keeping no-sync\n",
 				 sync_mode_name);
 	} else if (ret != -EINVAL) {
-		dev_warn(dev,
-			 "failed to read sync-mode (%d), defaulting to internal_master\n",
+		dev_warn(dev, "failed to read sync-mode (%d), defaulting to no-sync\n",
 			 ret);
 	}
 
@@ -2059,21 +2205,24 @@ static int imx296_probe(struct i2c_client *client,
 		return dev_err_probe(dev, PTR_ERR(sensor->clk),
 				     "failed to get input clock\n");
 
-	sensor->trigger_pulse_us = IMX296_TRIGGER_PULSE_US_DEFAULT;
-	ret = of_property_read_u32(node, OF_IMX296_TRIGGER_PULSE_US,
-				   &trigger_mode);
-	if (!ret) {
-		if (trigger_mode < IMX296_TRIGGER_PULSE_US_MIN ||
-		    trigger_mode > IMX296_TRIGGER_PULSE_US_MAX) {
-			dev_warn(dev,
-				 "trigger pulse width %u us is out of range, defaulting to %u us\n",
-				 trigger_mode, IMX296_TRIGGER_PULSE_US_DEFAULT);
-		} else {
-			sensor->trigger_pulse_us = trigger_mode;
+	{
+		u32 pulse_us = IMX296_TRIGGER_PULSE_US_DEFAULT;
+
+		ret = of_property_read_u32(node, OF_IMX296_TRIGGER_PULSE_US,
+					   &pulse_us);
+		if (!ret) {
+			if (pulse_us < IMX296_TRIGGER_PULSE_US_MIN ||
+			    pulse_us > IMX296_TRIGGER_PULSE_US_MAX) {
+				dev_warn(dev,
+					 "trigger pulse width %u us is out of range, defaulting to %u us\n",
+					 pulse_us, IMX296_TRIGGER_PULSE_US_DEFAULT);
+			} else {
+				sensor->trigger_pulse_us = pulse_us;
+			}
+		} else if (ret != -EINVAL) {
+			return dev_err_probe(dev, ret,
+					     "failed to read trigger pulse width\n");
 		}
-	} else if (ret != -EINVAL) {
-		return dev_err_probe(dev, ret,
-				     "failed to read trigger pulse width\n");
 	}
 
 	sensor->trigger_pwm = imx296_devm_pwm_get_optional(dev, "trigger");
@@ -2155,6 +2304,16 @@ static int imx296_probe(struct i2c_client *client,
 	pm_runtime_set_active(dev);
 	pm_runtime_get_noresume(dev);
 	pm_runtime_enable(dev);
+
+	if (sensor->op_mode_ctrl) {
+		sensor->op_mode_ctrl->default_value = trigger_mode;
+		ret = __v4l2_ctrl_s_ctrl(sensor->op_mode_ctrl, trigger_mode);
+		if (ret < 0) {
+			dev_err(dev,
+				"failed to sync default run mode control (%d)\n", ret);
+			goto err_pm;
+		}
+	}
 
 	ret = v4l2_async_register_subdev_sensor_common(sd);
 	if (ret)

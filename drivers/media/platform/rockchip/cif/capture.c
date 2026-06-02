@@ -4708,6 +4708,8 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 			continue;
 		}
 	}
+	if (!max_size && stream->pixm.plane_fmt[0].sizeimage)
+		max_size = stream->pixm.plane_fmt[0].sizeimage;
 	dummy_buf->size = max_size;
 
 	dummy_buf->is_need_vaddr = true;

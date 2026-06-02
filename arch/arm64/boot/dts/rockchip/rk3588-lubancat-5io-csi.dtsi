@@ -407,7 +407,8 @@
 		rockchip,camera-module-facing = "back";
 		rockchip,camera-module-name = "IMX296LQR-C";
 		rockchip,camera-module-lens-name = "default";
-		rockchip,camera-module-sync-mode = "internal_master";
+		/* single-camera: keep no-sync to avoid CIF group-sync errors */
+		/* rockchip,camera-module-sync-mode = "internal_master"; */
 		trigger-mode = <1>;
 
 		port {
