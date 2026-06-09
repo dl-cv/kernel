@@ -20,8 +20,9 @@
 	pinctrl-0 = <&i2c2m0_xfer>;
 
 	/*
-	 * HYM8563 RTC Chip Node
-	 * compatible: Device compatible string, specifies driver as haoyu,hym8563
+	 * BM8563EHA RTC Chip Node
+	 * compatible: Device compatible strings for Belling BM8563EHA
+		 *   (PCF8563-compatible, also matches haoyu,hym8563 fallback)
 	 * reg: I2C address is 0x51
 	 * #clock-cells: Number of cells when providing clock resources (usually 0)
 	 * clock-frequency: RTC crystal frequency is 32.768KHz
@@ -32,15 +33,15 @@
 	 * wakeup-source: Supports power-off wakeup function
 	 * status: Enable RTC chip
 	 */
-	hym8563: hym8563@51 {
+	bm8563: bm8563@51 {
         status = "okay";
-		compatible = "haoyu,hym8563";
+		compatible = "belling,bm8563", "haoyu,hym8563";
 		reg = <0x51>;
 		#clock-cells = <0>;
 		clock-frequency = <32768>;
-		clock-output-names = "hym8563";
+		clock-output-names = "bm8563";
 		pinctrl-names = "default";
-		pinctrl-0 = <&hym8563_int>;
+		pinctrl-0 = <&bm8563_int>;
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PA5 IRQ_TYPE_LEVEL_LOW>;
 		wakeup-source;
@@ -49,12 +50,12 @@
 
 /*-----------------------------------------------------------
  * Pin Multiplexing Configuration (Pinmux)
- * hym8563_int sub-node under hym8563 node
+ * bm8563_int sub-node under bm8563 node
  * rockchip,pins: Specify GPIO0 PA5 for RTC INT interrupt, function is GPIO, configured with pull-up
  *----------------------------------------------------------*/
 &pinctrl {
-	hym8563 {
-		hym8563_int: hym8563-int {
+	bm8563 {
+		bm8563_int: bm8563-int {
 			rockchip,pins = <0 RK_PA5 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};

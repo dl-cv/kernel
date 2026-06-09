@@ -1120,13 +1120,24 @@ static int yt8531_rxclk_duty_init(struct phy_device *phydev)
 
 static int yt8531S_config_init(struct phy_device *phydev)
 {
-#if (YTPHY8531A_XTAL_INIT)
 	int ret = 0;
+	int val;
 
+#if (YTPHY8531A_XTAL_INIT)
 	ret = yt8531a_xtal_init(phydev);
 	if (ret < 0)
 		return ret;
 #endif
+
+	/* Disable PHY_CLK_OUT/SyncE to free LED1 pin for RJ45 green LED.
+	 * The board uses SoC clock output (clock_in_out = "output"),
+	 * PHY does not need to output clock externally.
+	 */
+	val = ytphy_read_ext(phydev, 0xa012);
+	val &= ~(BIT(7) | BIT(6));
+	ret = ytphy_write_ext(phydev, 0xa012, val);
+	if (ret < 0)
+		return ret;
 
 	return yt8521_config_init(phydev);
 }
@@ -1141,8 +1152,13 @@ static int yt8531_config_init(struct phy_device *phydev)
 		return ret;
 #endif
 
-	/* PHY_CLK_OUT 125M enabled (default) */
-	ret = ytphy_write_ext(phydev, 0xa012, 0xd0);
+	/* Disable PHY_CLK_OUT/SyncE to free LED1 pin for RJ45 green LED.
+	 * The board uses SoC clock output (clock_in_out = "output"),
+	 * PHY does not need to output clock externally.
+	 */
+	val = ytphy_read_ext(phydev, 0xa012);
+	val &= ~(BIT(7) | BIT(6));
+	ret = ytphy_write_ext(phydev, 0xa012, val);
 	if (ret < 0)
 		return ret;
 
