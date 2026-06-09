@@ -262,6 +262,11 @@ config MOTORCOMM_PHY
 	  Enables support for Motorcomm network PHYs.
 	  Currently supports the YT8511, YT8521, YT8531, RK631 gigabit PHY.
 
+config MAXIO_PHY
+	tristate "Maxio PHYs"
+	help
+	  Supports the Maxio MAE0621A/B gigabit PHY.
+
 config NATIONAL_PHY
 	tristate "National Semiconductor PHYs"
 	help

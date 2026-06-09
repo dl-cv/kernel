@@ -23,7 +23,7 @@
 	wireless_bluetooth: wireless-bluetooth {
 		status = "okay";                                      // Enable Bluetooth
 		compatible = "bluetooth-platdata";
-		clocks = <&hym8563>;                            	  // RTC output 32KHz clock
+		clocks = <&bm8563>;                            	  // RTC output 32KHz clock
 		clock-names = "ext_clock";
 		uart_rts_gpios = <&gpio2 RK_PD4 GPIO_ACTIVE_LOW>;     // UART RTS pin
 		pinctrl-names = "default", "rts_gpio";                // Default/RTS pin configuration
@@ -48,7 +48,7 @@
 	wireless_wlan: wireless-wlan {
 		status = "okay";                                // Enable WiFi
 		compatible = "wlan-platdata";
-		clocks = <&hym8563>;                            // RTC output 32KHz clock
+		clocks = <&bm8563>;                            // RTC output 32KHz clock
 		clock-names = "ext_clock";
 		wifi_chip_type = "";                      		// WiFi chip type (currently not identified by this property)
 		pinctrl-names = "default";

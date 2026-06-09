@@ -621,6 +621,8 @@ MODULE_DEVICE_TABLE(i2c, hym8563_id);
 
 static const struct of_device_id hym8563_dt_idtable[] = {
 	{ .compatible = "haoyu,hym8563" },
+	{ .compatible = "belling,bm8563" },
+	{ .compatible = "gatelmode,bm8563" },
 	{},
 };
 MODULE_DEVICE_TABLE(of, hym8563_dt_idtable);
