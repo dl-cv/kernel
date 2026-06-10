@@ -188,7 +188,7 @@ static int sditf_get_set_fmt(struct v4l2_subdev *sd,
 			return ret;
 		}
 
-		input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+		input_sel.target = V4L2_SEL_TGT_CROP;
 		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		input_sel.pad = 0;
 		ret = v4l2_subdev_call(cif_dev->terminal_sensor.sd,
@@ -255,7 +255,7 @@ static int sditf_get_set_fmt(struct v4l2_subdev *sd,
 				return ret;
 			}
 
-			input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+			input_sel.target = V4L2_SEL_TGT_CROP;
 			input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 			input_sel.pad = 0;
 			ret = v4l2_subdev_call(priv->sensor_sd,
