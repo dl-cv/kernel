@@ -138,8 +138,14 @@
 #define IMX296_FID0_ROIWV1			IMX296_REG_16BIT(0x3316)
 #define IMX296_FID0_ROIWV1_MIN			88
 
+/*
+ * VBLANK 决定帧率：fps = OP_CLK / (HMAX * (height + vblank))
+ * OP_CLK=74.25MHz, HMAX=1100, height=1088
+ * 默认 vblank=1162 对应 30fps
+ * 常用对应关系：60fps->37, 50fps->262, 30fps->1162, 25fps->1612, 15fps->3412
+ */
 #define IMX296_HMAX_DEFAULT			1100U
-#define IMX296_VBLANK_DEFAULT			30U
+#define IMX296_VBLANK_DEFAULT			1162U
 #define IMX296_VBLANK_MAX			(1048575U - IMX296_PIXEL_ARRAY_HEIGHT)
 #define IMX296_EXPOSURE_DEFAULT_LINES		1104U
 #define IMX296_ANALOG_GAIN_MIN			0U
@@ -758,16 +764,6 @@ static u32 imx296_frame_lines_locked(struct imx296 *sensor,
 	return format->height + vblank;
 }
 
-static u32 imx296_free_run_max_exposure_lines_locked(struct imx296 *sensor)
-{
-	u32 frame_lines = imx296_frame_lines_locked(sensor, IMX296_FREE_RUN);
-
-	if (frame_lines > IMX296_MIN_MEMORY_WAIT_LINES)
-		return frame_lines - IMX296_MIN_MEMORY_WAIT_LINES;
-
-	return 1;
-}
-
 static u32 imx296_exposure_us_to_lines_locked(struct imx296 *sensor,
 					      u32 exposure_us,
 					      u32 frame_lines)
@@ -947,8 +943,12 @@ static void imx296_update_ctrl_visibility_locked(struct imx296 *sensor,
 				   mode == IMX296_FREE_RUN);
 }
 
-static void imx296_update_free_run_exposure_range_locked(struct imx296 *sensor)
+static void imx296_update_free_run_exposure_range_locked(struct imx296 *sensor,
+							 u32 vblank)
 {
+	u32 frame_lines = sensor->format.height + vblank;
+	u32 max_lines = frame_lines > IMX296_MIN_MEMORY_WAIT_LINES ?
+			frame_lines - IMX296_MIN_MEMORY_WAIT_LINES : 1;
 	u32 min_us;
 	u32 max_us;
 	u32 def_us;
@@ -957,8 +957,7 @@ static void imx296_update_free_run_exposure_range_locked(struct imx296 *sensor)
 		return;
 
 	min_us = imx296_lines_to_exposure_us(1);
-	max_us = imx296_lines_to_exposure_us(
-		imx296_free_run_max_exposure_lines_locked(sensor));
+	max_us = imx296_lines_to_exposure_us(max_lines);
 	def_us = clamp_val(imx296_lines_to_exposure_us(IMX296_EXPOSURE_DEFAULT_LINES),
 			   min_us, max_us);
 
@@ -1078,7 +1077,8 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 	}
 
 	sensor->subdev.ctrl_handler = handler;
-	imx296_update_free_run_exposure_range_locked(sensor);
+	imx296_update_free_run_exposure_range_locked(sensor,
+						    sensor->vblank->val);
 	imx296_update_ctrl_visibility_locked(sensor, sensor->pending_mode);
 
 	return 0;
@@ -1241,7 +1241,8 @@ static int imx296_restore_ctrls_for_mode_locked(struct imx296 *sensor,
 		return ret;
 
 	if (mode == IMX296_FREE_RUN) {
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor,
+							    sensor->vblank->val);
 
 		ret = imx296_apply_vblank_locked(sensor, sensor->vblank->val);
 		if (ret)
@@ -1363,7 +1364,7 @@ static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor, ctrl->val);
 		break;
 	default:
 		break;
@@ -1691,7 +1692,8 @@ static int imx296_set_format(struct v4l2_subdev *sd,
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
 		imx296_setup_hblank(sensor, format->width);
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor,
+							    sensor->vblank->val);
 	}
 
 	fmt->format = *format;
@@ -1769,7 +1771,8 @@ static int imx296_set_selection(struct v4l2_subdev *sd,
 
 	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
 		imx296_setup_hblank(sensor, format->width);
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor,
+							    sensor->vblank->val);
 	}
 
 	mutex_unlock(&sensor->mutex);
