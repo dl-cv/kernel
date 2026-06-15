@@ -288,7 +288,7 @@ static int rkcif_scale_set_fmt(struct rkcif_scale_vdev *scale_vdev,
 			return ret;
 		}
 
-		input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+		input_sel.target = V4L2_SEL_TGT_CROP;
 		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		input_sel.pad = 0;
 		ret = v4l2_subdev_call(cif_dev->terminal_sensor.sd,

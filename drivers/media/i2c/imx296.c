@@ -758,16 +758,6 @@ static u32 imx296_frame_lines_locked(struct imx296 *sensor,
 	return format->height + vblank;
 }
 
-static u32 imx296_free_run_max_exposure_lines_locked(struct imx296 *sensor)
-{
-	u32 frame_lines = imx296_frame_lines_locked(sensor, IMX296_FREE_RUN);
-
-	if (frame_lines > IMX296_MIN_MEMORY_WAIT_LINES)
-		return frame_lines - IMX296_MIN_MEMORY_WAIT_LINES;
-
-	return 1;
-}
-
 static u32 imx296_exposure_us_to_lines_locked(struct imx296 *sensor,
 					      u32 exposure_us,
 					      u32 frame_lines)
@@ -947,8 +937,12 @@ static void imx296_update_ctrl_visibility_locked(struct imx296 *sensor,
 				   mode == IMX296_FREE_RUN);
 }
 
-static void imx296_update_free_run_exposure_range_locked(struct imx296 *sensor)
+static void imx296_update_free_run_exposure_range_locked(struct imx296 *sensor,
+							 u32 vblank)
 {
+	u32 frame_lines = sensor->format.height + vblank;
+	u32 max_lines = frame_lines > IMX296_MIN_MEMORY_WAIT_LINES ?
+			frame_lines - IMX296_MIN_MEMORY_WAIT_LINES : 1;
 	u32 min_us;
 	u32 max_us;
 	u32 def_us;
@@ -957,8 +951,7 @@ static void imx296_update_free_run_exposure_range_locked(struct imx296 *sensor)
 		return;
 
 	min_us = imx296_lines_to_exposure_us(1);
-	max_us = imx296_lines_to_exposure_us(
-		imx296_free_run_max_exposure_lines_locked(sensor));
+	max_us = imx296_lines_to_exposure_us(max_lines);
 	def_us = clamp_val(imx296_lines_to_exposure_us(IMX296_EXPOSURE_DEFAULT_LINES),
 			   min_us, max_us);
 
@@ -1078,7 +1071,8 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 	}
 
 	sensor->subdev.ctrl_handler = handler;
-	imx296_update_free_run_exposure_range_locked(sensor);
+	imx296_update_free_run_exposure_range_locked(sensor,
+						    sensor->vblank->val);
 	imx296_update_ctrl_visibility_locked(sensor, sensor->pending_mode);
 
 	return 0;
@@ -1241,7 +1235,8 @@ static int imx296_restore_ctrls_for_mode_locked(struct imx296 *sensor,
 		return ret;
 
 	if (mode == IMX296_FREE_RUN) {
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor,
+							    sensor->vblank->val);
 
 		ret = imx296_apply_vblank_locked(sensor, sensor->vblank->val);
 		if (ret)
@@ -1363,7 +1358,7 @@ static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor, ctrl->val);
 		break;
 	default:
 		break;
@@ -1662,6 +1657,11 @@ static int imx296_get_format(struct v4l2_subdev *sd,
 	mutex_lock(&sensor->mutex);
 	format = imx296_get_pad_format(sensor, state, fmt->pad, fmt->which);
 	format->code = imx296_mbus_code(sensor);
+	/*
+	 * Report actual crop size so downstream subdevs get the real
+	 * output dimensions. ROI selection already updates format width
+	 * and height in imx296_set_selection().
+	 */
 	fmt->format = *format;
 	mutex_unlock(&sensor->mutex);
 
@@ -1691,7 +1691,8 @@ static int imx296_set_format(struct v4l2_subdev *sd,
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
 		imx296_setup_hblank(sensor, format->width);
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor,
+							    sensor->vblank->val);
 	}
 
 	fmt->format = *format;
@@ -1769,7 +1770,8 @@ static int imx296_set_selection(struct v4l2_subdev *sd,
 
 	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
 		imx296_setup_hblank(sensor, format->width);
-		imx296_update_free_run_exposure_range_locked(sensor);
+		imx296_update_free_run_exposure_range_locked(sensor,
+							    sensor->vblank->val);
 	}
 
 	mutex_unlock(&sensor->mutex);
