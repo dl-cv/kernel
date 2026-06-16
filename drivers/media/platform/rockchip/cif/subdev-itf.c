@@ -266,15 +266,22 @@ static int sditf_get_fmt(struct v4l2_subdev *sd,
 		pixm.width = priv->cap_info.width;
 		pixm.height = priv->cap_info.height;
 
-		ret = sditf_apply_fmt_to_streams(priv, &pixm, false);
-		if (ret)
-			return ret;
+		/* rkcif_set_fmt requires terminal_sensor.sd; skip stream
+		 * configuration when falling back to priv->sensor_sd.
+		 */
+		if (cif_dev->terminal_sensor.sd) {
+			ret = sditf_apply_fmt_to_streams(priv, &pixm, false);
+			if (ret)
+				return ret;
+		}
 	} else {
 		fmt->which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		fmt->pad = 0;
 		fmt->format.code = MEDIA_BUS_FMT_SBGGR10_1X10;
 		fmt->format.width = 640;
 		fmt->format.height = 480;
+		priv->cap_info.width = 640;
+		priv->cap_info.height = 480;
 	}
 
 	return 0;
@@ -351,9 +358,14 @@ static int sditf_set_fmt(struct v4l2_subdev *sd,
 	priv->cap_info.width = sensor_fmt.format.width;
 	priv->cap_info.height = sensor_fmt.format.height;
 
-	ret = sditf_apply_fmt_to_streams(priv, &pixm, try);
-	if (ret)
-		return ret;
+	/* rkcif_set_fmt requires terminal_sensor.sd; skip stream
+	 * configuration when falling back to priv->sensor_sd.
+	 */
+	if (cif_dev->terminal_sensor.sd) {
+		ret = sditf_apply_fmt_to_streams(priv, &pixm, try);
+		if (ret)
+			return ret;
+	}
 
 	fmt->format.width = pixm.width;
 	fmt->format.height = pixm.height;
