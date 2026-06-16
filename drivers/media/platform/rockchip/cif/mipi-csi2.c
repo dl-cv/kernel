@@ -440,8 +440,8 @@ static int csi2_get_set_fmt(struct v4l2_subdev *sd,
 		input_sel.target = V4L2_SEL_TGT_CROP;
 		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		input_sel.pad = 0;
-		ret = v4l2_subdev_call(sensor, pad, get_selection, NULL, &input_sel);
-		if (!ret) {
+		if (!v4l2_subdev_call(sensor, pad, get_selection, NULL,
+				      &input_sel)) {
 			fmt->format.width = input_sel.r.width;
 			fmt->format.height = input_sel.r.height;
 		}
