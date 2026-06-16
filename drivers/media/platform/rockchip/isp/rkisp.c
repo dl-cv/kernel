@@ -3183,19 +3183,20 @@ static int rkisp_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
 		    fmt.format.code != isp_dev->isp_sdev.in_frm.code) {
 			fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 			fmt.pad = RKISP_ISP_PAD_SINK;
-			rkisp_isp_sd_set_fmt(sd, NULL, &fmt);
-
-			/* use sensor fmt size as crop directly,
-			 * since cif sditf doesn't support get_selection
-			 */
-			sel.r.left = 0;
-			sel.r.top = 0;
-			sel.r.width = fmt.format.width;
-			sel.r.height = fmt.format.height;
-			sel.target = V4L2_SEL_TGT_CROP;
-			sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-			sel.pad = RKISP_ISP_PAD_SINK;
-			rkisp_isp_sd_set_selection(sd, NULL, &sel);
+			if (!rkisp_isp_sd_set_fmt(sd, NULL, &fmt)) {
+				/* use sensor fmt size as crop directly,
+				 * since cif sditf doesn't support
+				 * get_selection
+				 */
+				sel.r.left = 0;
+				sel.r.top = 0;
+				sel.r.width = fmt.format.width;
+				sel.r.height = fmt.format.height;
+				sel.target = V4L2_SEL_TGT_CROP;
+				sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+				sel.pad = RKISP_ISP_PAD_SINK;
+				rkisp_isp_sd_set_selection(sd, NULL, &sel);
+			}
 		}
 	}
 
