@@ -287,6 +287,7 @@ static int sditf_set_fmt(struct v4l2_subdev *sd,
 	struct sditf_priv *priv = to_sditf_priv(sd);
 	struct rkcif_device *cif_dev = priv->cif_dev;
 	struct v4l2_subdev_format sensor_fmt;
+	struct v4l2_subdev_selection input_sel;
 	struct v4l2_pix_format_mplane pixm;
 	struct v4l2_subdev *sensor_sd;
 	int ret;
@@ -321,6 +322,20 @@ static int sditf_set_fmt(struct v4l2_subdev *sd,
 		return ret;
 	}
 
+	/*
+	 * Query sensor crop to get actual ROI dimensions, consistent
+	 * with sditf_get_fmt behavior. Fall back to full sensor size
+	 * if the sensor does not support CROP selection.
+	 */
+	input_sel.target = V4L2_SEL_TGT_CROP;
+	input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+	input_sel.pad = 0;
+	if (!v4l2_subdev_call(sensor_sd, pad, get_selection, NULL,
+			      &input_sel)) {
+		sensor_fmt.format.width = input_sel.r.width;
+		sensor_fmt.format.height = input_sel.r.height;
+	}
+
 	pixm.pixelformat = rkcif_mbus_pixelcode_to_v4l2(fmt->format.code);
 	if (!rkcif_find_output_fmt(NULL, pixm.pixelformat)) {
 		fmt->format.code = sensor_fmt.format.code;
@@ -330,8 +345,11 @@ static int sditf_set_fmt(struct v4l2_subdev *sd,
 	pixm.width = fmt->format.width;
 	pixm.height = fmt->format.height;
 
-	priv->cap_info.width = pixm.width;
-	priv->cap_info.height = pixm.height;
+	/* Use sensor's actual crop dimensions for cap_info to stay
+	 * consistent with sditf_get_fmt.
+	 */
+	priv->cap_info.width = sensor_fmt.format.width;
+	priv->cap_info.height = sensor_fmt.format.height;
 
 	ret = sditf_apply_fmt_to_streams(priv, &pixm, try);
 	if (ret)
