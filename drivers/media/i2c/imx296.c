@@ -1663,6 +1663,11 @@ static int imx296_get_format(struct v4l2_subdev *sd,
 	mutex_lock(&sensor->mutex);
 	format = imx296_get_pad_format(sensor, state, fmt->pad, fmt->which);
 	format->code = imx296_mbus_code(sensor);
+	/*
+	 * Report actual crop size so downstream subdevs get the real
+	 * output dimensions. ROI selection already updates format width
+	 * and height in imx296_set_selection().
+	 */
 	fmt->format = *format;
 	mutex_unlock(&sensor->mutex);
 

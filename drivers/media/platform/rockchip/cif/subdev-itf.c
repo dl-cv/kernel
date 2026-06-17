@@ -162,36 +162,98 @@ static int sditf_g_mbus_config(struct v4l2_subdev *sd, unsigned int pad_id,
 	return -EINVAL;
 }
 
-static int sditf_get_set_fmt(struct v4l2_subdev *sd,
-			     struct v4l2_subdev_state *sd_state,
-			     struct v4l2_subdev_format *fmt)
+static int sditf_apply_fmt_to_streams(struct sditf_priv *priv,
+				      struct v4l2_pix_format_mplane *pixm,
+				      bool try)
+{
+	struct rkcif_device *cif_dev = priv->cif_dev;
+	const struct cif_output_fmt *out_fmt;
+	bool is_uncompact = false;
+	int ret;
+
+	out_fmt = rkcif_find_output_fmt(NULL, pixm->pixelformat);
+	if (priv->toisp_inf.link_mode == TOISP_UNITE && out_fmt &&
+	    ((pixm->width / 2 - RKMOUDLE_UNITE_EXTEND_PIXEL) * out_fmt->raw_bpp / 8) & 0xf)
+		is_uncompact = true;
+
+	v4l2_dbg(1, rkcif_debug, &cif_dev->v4l2_dev,
+		"%s, width %d, height %d, hdr mode %d\n",
+		__func__, pixm->width, pixm->height, priv->hdr_cfg.hdr_mode);
+
+	if (priv->hdr_cfg.hdr_mode == NO_HDR ||
+	    priv->hdr_cfg.hdr_mode == HDR_COMPR) {
+		ret = rkcif_set_fmt(&cif_dev->stream[0], pixm, try);
+	} else if (priv->hdr_cfg.hdr_mode == HDR_X2) {
+		if (priv->mode.rdbk_mode == RKISP_VICAP_ONLINE &&
+		    priv->toisp_inf.link_mode == TOISP_UNITE) {
+			if (is_uncompact) {
+				cif_dev->stream[0].is_compact = false;
+				cif_dev->stream[0].is_high_align = true;
+			} else {
+				cif_dev->stream[0].is_compact = true;
+			}
+		}
+		ret = rkcif_set_fmt(&cif_dev->stream[0], pixm, try);
+		if (!ret)
+			ret = rkcif_set_fmt(&cif_dev->stream[1], pixm, try);
+	} else if (priv->hdr_cfg.hdr_mode == HDR_X3) {
+		if (priv->mode.rdbk_mode == RKISP_VICAP_ONLINE &&
+		    priv->toisp_inf.link_mode == TOISP_UNITE) {
+			if (is_uncompact) {
+				cif_dev->stream[0].is_compact = false;
+				cif_dev->stream[0].is_high_align = true;
+				cif_dev->stream[1].is_compact = false;
+				cif_dev->stream[1].is_high_align = true;
+			} else {
+				cif_dev->stream[0].is_compact = true;
+				cif_dev->stream[1].is_compact = true;
+			}
+		}
+		ret = rkcif_set_fmt(&cif_dev->stream[0], pixm, try);
+		if (!ret)
+			ret = rkcif_set_fmt(&cif_dev->stream[1], pixm, try);
+		if (!ret)
+			ret = rkcif_set_fmt(&cif_dev->stream[2], pixm, try);
+	} else {
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+static int sditf_get_fmt(struct v4l2_subdev *sd,
+			 struct v4l2_subdev_state *sd_state,
+			 struct v4l2_subdev_format *fmt)
 {
 	struct sditf_priv *priv = to_sditf_priv(sd);
 	struct rkcif_device *cif_dev = priv->cif_dev;
 	struct v4l2_subdev_selection input_sel;
 	struct v4l2_pix_format_mplane pixm;
-	const struct cif_output_fmt *out_fmt;
+	struct v4l2_subdev *sensor_sd;
 	int ret = -EINVAL;
-	bool is_uncompact = false;
 
 	if (!cif_dev->terminal_sensor.sd)
 		rkcif_update_sensor_info(&cif_dev->stream[0]);
 
-	if (cif_dev->terminal_sensor.sd) {
+	sensor_sd = cif_dev->terminal_sensor.sd;
+	if (!sensor_sd)
+		sensor_sd = priv->sensor_sd;
+
+	if (sensor_sd) {
 		sditf_get_hdr_mode(priv);
 		fmt->which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		fmt->pad = 0;
-		ret = v4l2_subdev_call(cif_dev->terminal_sensor.sd, pad, get_fmt, NULL, fmt);
+		ret = v4l2_subdev_call(sensor_sd, pad, get_fmt, NULL, fmt);
 		if (ret) {
 			v4l2_err(&priv->sd,
 				 "%s: get sensor format failed\n", __func__);
 			return ret;
 		}
 
-		input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+		input_sel.target = V4L2_SEL_TGT_CROP;
 		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		input_sel.pad = 0;
-		ret = v4l2_subdev_call(cif_dev->terminal_sensor.sd,
+		ret = v4l2_subdev_call(sensor_sd,
 				       pad, get_selection, NULL,
 				       &input_sel);
 		if (!ret) {
@@ -204,80 +266,112 @@ static int sditf_get_set_fmt(struct v4l2_subdev *sd,
 		pixm.width = priv->cap_info.width;
 		pixm.height = priv->cap_info.height;
 
-		out_fmt = rkcif_find_output_fmt(NULL, pixm.pixelformat);
-		if (priv->toisp_inf.link_mode == TOISP_UNITE &&
-		    ((pixm.width / 2 - RKMOUDLE_UNITE_EXTEND_PIXEL) * out_fmt->raw_bpp / 8) & 0xf)
-			is_uncompact = true;
-
-		v4l2_dbg(1, rkcif_debug, &cif_dev->v4l2_dev,
-			"%s, width %d, height %d, hdr mode %d\n",
-			__func__, fmt->format.width, fmt->format.height, priv->hdr_cfg.hdr_mode);
-		if (priv->hdr_cfg.hdr_mode == NO_HDR ||
-		    priv->hdr_cfg.hdr_mode == HDR_COMPR) {
-			rkcif_set_fmt(&cif_dev->stream[0], &pixm, false);
-		} else if (priv->hdr_cfg.hdr_mode == HDR_X2) {
-			if (priv->mode.rdbk_mode == RKISP_VICAP_ONLINE &&
-			    priv->toisp_inf.link_mode == TOISP_UNITE) {
-				if (is_uncompact) {
-					cif_dev->stream[0].is_compact = false;
-					cif_dev->stream[0].is_high_align = true;
-				} else {
-					cif_dev->stream[0].is_compact = true;
-				}
-			}
-			rkcif_set_fmt(&cif_dev->stream[0], &pixm, false);
-			rkcif_set_fmt(&cif_dev->stream[1], &pixm, false);
-		} else if (priv->hdr_cfg.hdr_mode == HDR_X3) {
-			if (priv->mode.rdbk_mode == RKISP_VICAP_ONLINE &&
-			    priv->toisp_inf.link_mode == TOISP_UNITE) {
-				if (is_uncompact) {
-					cif_dev->stream[0].is_compact = false;
-					cif_dev->stream[0].is_high_align = true;
-					cif_dev->stream[1].is_compact = false;
-					cif_dev->stream[1].is_high_align = true;
-				} else {
-					cif_dev->stream[0].is_compact = true;
-					cif_dev->stream[1].is_compact = true;
-				}
-			}
-			rkcif_set_fmt(&cif_dev->stream[0], &pixm, false);
-			rkcif_set_fmt(&cif_dev->stream[1], &pixm, false);
-			rkcif_set_fmt(&cif_dev->stream[2], &pixm, false);
+		/*
+		 * rkcif_set_fmt requires terminal_sensor.sd; skip stream
+		 * configuration when falling back to priv->sensor_sd.
+		 */
+		if (cif_dev->terminal_sensor.sd) {
+			ret = sditf_apply_fmt_to_streams(priv, &pixm, false);
+			if (ret)
+				return ret;
 		}
 	} else {
-		if (priv->sensor_sd) {
-			fmt->which = V4L2_SUBDEV_FORMAT_ACTIVE;
-			fmt->pad = 0;
-			ret = v4l2_subdev_call(priv->sensor_sd, pad, get_fmt, NULL, fmt);
-			if (ret) {
-				v4l2_err(&priv->sd,
-					 "%s: get sensor format failed\n", __func__);
-				return ret;
-			}
-
-			input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
-			input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-			input_sel.pad = 0;
-			ret = v4l2_subdev_call(priv->sensor_sd,
-					       pad, get_selection, NULL,
-					       &input_sel);
-			if (!ret) {
-				fmt->format.width = input_sel.r.width;
-				fmt->format.height = input_sel.r.height;
-			}
-			priv->cap_info.width = fmt->format.width;
-			priv->cap_info.height = fmt->format.height;
-			pixm.pixelformat = rkcif_mbus_pixelcode_to_v4l2(fmt->format.code);
-			pixm.width = priv->cap_info.width;
-			pixm.height = priv->cap_info.height;
-		} else {
-			fmt->which = V4L2_SUBDEV_FORMAT_ACTIVE;
-			fmt->pad = 0;
-			fmt->format.code = MEDIA_BUS_FMT_SBGGR10_1X10;
-			fmt->format.width = 640;
-			fmt->format.height = 480;
-		}
+		fmt->which = V4L2_SUBDEV_FORMAT_ACTIVE;
+		fmt->pad = 0;
+		fmt->format.code = MEDIA_BUS_FMT_SBGGR10_1X10;
+		fmt->format.width = 640;
+		fmt->format.height = 480;
+		priv->cap_info.width = 640;
+		priv->cap_info.height = 480;
 	}
+
+	return 0;
+}
+
+static int sditf_set_fmt(struct v4l2_subdev *sd,
+			 struct v4l2_subdev_state *sd_state,
+			 struct v4l2_subdev_format *fmt)
+{
+	struct sditf_priv *priv = to_sditf_priv(sd);
+	struct rkcif_device *cif_dev = priv->cif_dev;
+	struct v4l2_subdev_format sensor_fmt;
+	struct v4l2_subdev_selection input_sel;
+	struct v4l2_pix_format_mplane pixm;
+	struct v4l2_subdev *sensor_sd;
+	int ret;
+	bool try = (fmt->which == V4L2_SUBDEV_FORMAT_TRY);
+
+	if (fmt->pad != 0)
+		return -EINVAL;
+
+	if (!cif_dev->terminal_sensor.sd)
+		rkcif_update_sensor_info(&cif_dev->stream[0]);
+
+	sensor_sd = cif_dev->terminal_sensor.sd;
+	if (!sensor_sd)
+		sensor_sd = priv->sensor_sd;
+
+	if (!sensor_sd) {
+		fmt->format.code = MEDIA_BUS_FMT_SBGGR10_1X10;
+		fmt->format.width = 640;
+		fmt->format.height = 480;
+		return 0;
+	}
+
+	sditf_get_hdr_mode(priv);
+
+	memset(&sensor_fmt, 0, sizeof(sensor_fmt));
+	sensor_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+	sensor_fmt.pad = 0;
+	ret = v4l2_subdev_call(sensor_sd, pad, get_fmt, NULL, &sensor_fmt);
+	if (ret) {
+		v4l2_err(&priv->sd,
+			 "%s: get sensor format failed\n", __func__);
+		return ret;
+	}
+
+	/*
+	 * Query sensor crop to get actual ROI dimensions, consistent
+	 * with sditf_get_fmt behavior. Fall back to full sensor size
+	 * if the sensor does not support CROP selection.
+	 */
+	input_sel.target = V4L2_SEL_TGT_CROP;
+	input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+	input_sel.pad = 0;
+	if (!v4l2_subdev_call(sensor_sd, pad, get_selection, NULL,
+			      &input_sel)) {
+		sensor_fmt.format.width = input_sel.r.width;
+		sensor_fmt.format.height = input_sel.r.height;
+	}
+
+	pixm.pixelformat = rkcif_mbus_pixelcode_to_v4l2(fmt->format.code);
+	if (!rkcif_find_output_fmt(NULL, pixm.pixelformat)) {
+		fmt->format.code = sensor_fmt.format.code;
+		pixm.pixelformat = rkcif_mbus_pixelcode_to_v4l2(fmt->format.code);
+	}
+
+	pixm.width = fmt->format.width;
+	pixm.height = fmt->format.height;
+
+	/*
+	 * Use sensor's actual crop dimensions for cap_info to stay
+	 * consistent with sditf_get_fmt.
+	 */
+	priv->cap_info.width = sensor_fmt.format.width;
+	priv->cap_info.height = sensor_fmt.format.height;
+
+	/*
+	 * rkcif_set_fmt requires terminal_sensor.sd; skip stream
+	 * configuration when falling back to priv->sensor_sd.
+	 */
+	if (cif_dev->terminal_sensor.sd) {
+		ret = sditf_apply_fmt_to_streams(priv, &pixm, try);
+		if (ret)
+			return ret;
+	}
+
+	fmt->format.width = pixm.width;
+	fmt->format.height = pixm.height;
 
 	return 0;
 }
@@ -512,7 +606,7 @@ static long sditf_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		pisp_buf_info = (struct rkisp_init_buf *)arg;
 		priv->buf_num = pisp_buf_info->buf_cnt;
 		priv->cif_dev->fb_res_bufs = pisp_buf_info->buf_cnt;
-		sditf_get_set_fmt(&priv->sd, NULL, &fmt);
+		sditf_get_fmt(&priv->sd, NULL, &fmt);
 		if (pisp_buf_info->hdr_wrap_line <= priv->cap_info.height) {
 			priv->hdr_wrap_line = pisp_buf_info->hdr_wrap_line;
 			v4l2_dbg(1, rkcif_debug, &cif_dev->v4l2_dev,  "hdr_wrap_line %d\n",
@@ -1119,7 +1213,7 @@ static int sditf_start_stream(struct sditf_priv *priv)
 	int stream_cnt = 0;
 	int i = 0;
 
-	sditf_get_set_fmt(&priv->sd, NULL, &fmt);
+	sditf_get_fmt(&priv->sd, NULL, &fmt);
 	if (priv->mode.rdbk_mode == RKISP_VICAP_ONLINE) {
 		sditf_enable_immediately(priv);
 		mode = RKCIF_STREAM_MODE_TOISP;
@@ -1432,8 +1526,8 @@ static int sditf_s_rx_buffer(struct v4l2_subdev *sd,
 }
 
 static const struct v4l2_subdev_pad_ops sditf_subdev_pad_ops = {
-	.set_fmt = sditf_get_set_fmt,
-	.get_fmt = sditf_get_set_fmt,
+	.set_fmt = sditf_set_fmt,
+	.get_fmt = sditf_get_fmt,
 	.get_selection = sditf_get_selection,
 	.get_mbus_config = sditf_g_mbus_config,
 };

@@ -6817,7 +6817,7 @@ static void rkcif_sync_crop_info(struct rkcif_stream *stream)
 	int ret;
 
 	if (dev->terminal_sensor.sd) {
-		input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+		input_sel.target = V4L2_SEL_TGT_CROP;
 		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 		input_sel.pad = 0;
 		ret = v4l2_subdev_call(dev->terminal_sensor.sd,
@@ -6825,6 +6825,12 @@ static void rkcif_sync_crop_info(struct rkcif_stream *stream)
 				       &input_sel);
 		if (!ret) {
 			stream->crop[CROP_SRC_SENSOR] = input_sel.r;
+			/*
+			 * Sensor already outputs ROI data, CIF should not
+			 * apply the offset again.
+			 */
+			stream->crop[CROP_SRC_SENSOR].left = 0;
+			stream->crop[CROP_SRC_SENSOR].top = 0;
 			stream->crop_enable = true;
 			stream->crop_mask |= CROP_SRC_SENSOR_MASK;
 			dev->terminal_sensor.selection = input_sel;
@@ -9785,12 +9791,26 @@ static int rkcif_lvds_sd_set_fmt(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_format *fmt)
 {
 	struct v4l2_subdev *sensor = get_lvds_remote_sensor(sd);
+	struct v4l2_subdev_selection input_sel;
+	int ret;
 
 	/*
 	 * Do not allow format changes and just relay whatever
 	 * set currently in the sensor.
 	 */
-	return v4l2_subdev_call(sensor, pad, get_fmt, NULL, fmt);
+	ret = v4l2_subdev_call(sensor, pad, get_fmt, NULL, fmt);
+	if (!ret) {
+		input_sel.target = V4L2_SEL_TGT_CROP;
+		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+		input_sel.pad = 0;
+		if (!v4l2_subdev_call(sensor, pad, get_selection, NULL,
+				      &input_sel)) {
+			fmt->format.width = input_sel.r.width;
+			fmt->format.height = input_sel.r.height;
+		}
+	}
+
+	return ret;
 }
 
 static int rkcif_lvds_sd_get_fmt(struct v4l2_subdev *sd,
@@ -9799,15 +9819,26 @@ static int rkcif_lvds_sd_get_fmt(struct v4l2_subdev *sd,
 {
 	struct rkcif_lvds_subdev *subdev = container_of(sd, struct rkcif_lvds_subdev, sd);
 	struct v4l2_subdev *sensor = get_lvds_remote_sensor(sd);
+	struct v4l2_subdev_selection input_sel;
 	int ret;
 
 	/*
 	 * Do not allow format changes and just relay whatever
-	 * set currently in the sensor.
+	 * set currently in the sensor. If the sensor uses selection
+	 * for ROI, query crop to get the actual output size.
 	 */
 	ret = v4l2_subdev_call(sensor, pad, get_fmt, NULL, fmt);
-	if (!ret)
+	if (!ret) {
+		input_sel.target = V4L2_SEL_TGT_CROP;
+		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+		input_sel.pad = 0;
+		if (!v4l2_subdev_call(sensor, pad, get_selection, NULL,
+				      &input_sel)) {
+			fmt->format.width = input_sel.r.width;
+			fmt->format.height = input_sel.r.height;
+		}
 		subdev->in_fmt = fmt->format;
+	}
 
 	return ret;
 }
@@ -12287,7 +12318,10 @@ void rkcif_set_default_fmt(struct rkcif_device *cif_dev)
 			memset(&fmt, 0, sizeof(fmt));
 			fmt.pad = i;
 			fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-			v4l2_subdev_call(cif_dev->terminal_sensor.sd, pad, get_fmt, NULL, &fmt);
+			ret = v4l2_subdev_call(cif_dev->terminal_sensor.sd,
+					       pad, get_fmt, NULL, &fmt);
+			if (ret)
+				continue;
 
 			memset(&pixm, 0, sizeof(pixm));
 			pixm.pixelformat = rkcif_mbus_pixelcode_to_v4l2(fmt.format.code);
@@ -12296,12 +12330,11 @@ void rkcif_set_default_fmt(struct rkcif_device *cif_dev)
 
 			memset(&input_sel, 0, sizeof(input_sel));
 			input_sel.pad = i;
-			input_sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+			input_sel.target = V4L2_SEL_TGT_CROP;
 			input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-			ret = v4l2_subdev_call(cif_dev->terminal_sensor.sd,
-					       pad, get_selection, NULL,
-					       &input_sel);
-			if (!ret) {
+			if (!v4l2_subdev_call(cif_dev->terminal_sensor.sd,
+					      pad, get_selection, NULL,
+					      &input_sel)) {
 				pixm.width = input_sel.r.width;
 				pixm.height = input_sel.r.height;
 			}

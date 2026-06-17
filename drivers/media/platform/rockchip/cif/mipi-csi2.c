@@ -428,14 +428,25 @@ static int csi2_get_set_fmt(struct v4l2_subdev *sd,
 	int ret;
 	struct csi2_dev *csi2 = sd_to_dev(sd);
 	struct v4l2_subdev *sensor = get_remote_sensor(sd);
+	struct v4l2_subdev_selection input_sel;
 
 	/*
 	 * Do not allow format changes and just relay whatever
-	 * set currently in the sensor.
+	 * set currently in the sensor. Query sensor crop to get
+	 * actual output size for sensors that use selection for ROI.
 	 */
 	ret = v4l2_subdev_call(sensor, pad, get_fmt, NULL, fmt);
-	if (!ret)
+	if (!ret) {
+		input_sel.target = V4L2_SEL_TGT_CROP;
+		input_sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+		input_sel.pad = 0;
+		if (!v4l2_subdev_call(sensor, pad, get_selection, NULL,
+				      &input_sel)) {
+			fmt->format.width = input_sel.r.width;
+			fmt->format.height = input_sel.r.height;
+		}
 		csi2->format_mbus = fmt->format;
+	}
 
 	return ret;
 }

@@ -3172,6 +3172,35 @@ static int rkisp_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
 		return -EINVAL;
 	}
 
+	/* sync sensor fmt/crop if changed (e.g. sensor ROI updated) */
+	if (isp_dev->active_sensor && !rkisp_update_sensor_info(isp_dev)) {
+		struct v4l2_subdev_format fmt = {0};
+		struct v4l2_subdev_selection sel = {0};
+
+		fmt = isp_dev->active_sensor->fmt[0];
+		if (fmt.format.width != isp_dev->isp_sdev.in_frm.width ||
+		    fmt.format.height != isp_dev->isp_sdev.in_frm.height ||
+		    fmt.format.code != isp_dev->isp_sdev.in_frm.code) {
+			fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+			fmt.pad = RKISP_ISP_PAD_SINK;
+			if (!rkisp_isp_sd_set_fmt(sd, NULL, &fmt)) {
+				/*
+				 * Use sensor fmt size as crop directly,
+				 * since cif sditf doesn't support
+				 * get_selection.
+				 */
+				sel.r.left = 0;
+				sel.r.top = 0;
+				sel.r.width = fmt.format.width;
+				sel.r.height = fmt.format.height;
+				sel.target = V4L2_SEL_TGT_CROP;
+				sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+				sel.pad = RKISP_ISP_PAD_SINK;
+				rkisp_isp_sd_set_selection(sd, NULL, &sel);
+			}
+		}
+	}
+
 	rkisp_config_cif(isp_dev);
 	rkisp_isp_start(isp_dev);
 	if (!hw_dev->is_single &&
