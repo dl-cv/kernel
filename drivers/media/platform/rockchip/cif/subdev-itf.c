@@ -266,7 +266,8 @@ static int sditf_get_fmt(struct v4l2_subdev *sd,
 		pixm.width = priv->cap_info.width;
 		pixm.height = priv->cap_info.height;
 
-		/* rkcif_set_fmt requires terminal_sensor.sd; skip stream
+		/*
+		 * rkcif_set_fmt requires terminal_sensor.sd; skip stream
 		 * configuration when falling back to priv->sensor_sd.
 		 */
 		if (cif_dev->terminal_sensor.sd) {
@@ -352,13 +353,15 @@ static int sditf_set_fmt(struct v4l2_subdev *sd,
 	pixm.width = fmt->format.width;
 	pixm.height = fmt->format.height;
 
-	/* Use sensor's actual crop dimensions for cap_info to stay
+	/*
+	 * Use sensor's actual crop dimensions for cap_info to stay
 	 * consistent with sditf_get_fmt.
 	 */
 	priv->cap_info.width = sensor_fmt.format.width;
 	priv->cap_info.height = sensor_fmt.format.height;
 
-	/* rkcif_set_fmt requires terminal_sensor.sd; skip stream
+	/*
+	 * rkcif_set_fmt requires terminal_sensor.sd; skip stream
 	 * configuration when falling back to priv->sensor_sd.
 	 */
 	if (cif_dev->terminal_sensor.sd) {

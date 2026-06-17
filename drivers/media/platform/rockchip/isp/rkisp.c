@@ -3184,9 +3184,10 @@ static int rkisp_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
 			fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 			fmt.pad = RKISP_ISP_PAD_SINK;
 			if (!rkisp_isp_sd_set_fmt(sd, NULL, &fmt)) {
-				/* use sensor fmt size as crop directly,
+				/*
+				 * Use sensor fmt size as crop directly,
 				 * since cif sditf doesn't support
-				 * get_selection
+				 * get_selection.
 				 */
 				sel.r.left = 0;
 				sel.r.top = 0;

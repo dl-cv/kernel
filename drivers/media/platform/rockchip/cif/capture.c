@@ -6825,8 +6825,9 @@ static void rkcif_sync_crop_info(struct rkcif_stream *stream)
 				       &input_sel);
 		if (!ret) {
 			stream->crop[CROP_SRC_SENSOR] = input_sel.r;
-			/* sensor already outputs ROI data, CIF should not
-			 * apply the offset again
+			/*
+			 * Sensor already outputs ROI data, CIF should not
+			 * apply the offset again.
 			 */
 			stream->crop[CROP_SRC_SENSOR].left = 0;
 			stream->crop[CROP_SRC_SENSOR].top = 0;
