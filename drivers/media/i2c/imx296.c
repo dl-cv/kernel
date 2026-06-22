@@ -1198,17 +1198,31 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 					      IMX296_ANALOG_GAIN_MIN);
 
 	if (sensor->light_source_gpio) {
+		const struct v4l2_ctrl_config light_source_enable_cfg = {
+			.ops = &imx296_ctrl_ops,
+			.id = V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE,
+			.name = "Light Source Enable",
+			.type = V4L2_CTRL_TYPE_BOOLEAN,
+			.min = 0,
+			.max = 1,
+			.step = 1,
+			.def = 0,
+		};
+		const struct v4l2_ctrl_config light_source_offset_cfg = {
+			.ops = &imx296_ctrl_ops,
+			.id = V4L2_CID_IMX296_LIGHT_SOURCE_OFFSET_US,
+			.name = "Light Source Offset (us)",
+			.type = V4L2_CTRL_TYPE_INTEGER,
+			.min = IMX296_LIGHT_SOURCE_OFFSET_US_MIN,
+			.max = IMX296_LIGHT_SOURCE_OFFSET_US_MAX,
+			.step = 1,
+			.def = sensor->light_source_offset_default_us,
+		};
+
 		sensor->light_source_enable =
-			v4l2_ctrl_new_std(handler, &imx296_ctrl_ops,
-					  V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE,
-					  0, 1, 1, 0);
+			v4l2_ctrl_new_custom(handler, &light_source_enable_cfg, NULL);
 		sensor->light_source_offset_us =
-			v4l2_ctrl_new_std(handler, &imx296_ctrl_ops,
-					  V4L2_CID_IMX296_LIGHT_SOURCE_OFFSET_US,
-					  IMX296_LIGHT_SOURCE_OFFSET_US_MIN,
-					  IMX296_LIGHT_SOURCE_OFFSET_US_MAX,
-					  1,
-					  sensor->light_source_offset_default_us);
+			v4l2_ctrl_new_custom(handler, &light_source_offset_cfg, NULL);
 	}
 
 	sensor->hflip = v4l2_ctrl_new_std(handler, &imx296_ctrl_ops,
