@@ -50,6 +50,11 @@
 
 		reset-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_LOW>;
 
+		/* Kernel light source control on OUTPUT1 (GPIO0_C7) */
+		light-source-gpios = <&gpio0 RK_PC7 GPIO_ACTIVE_HIGH>;
+		light-source-active-level = "high";
+		light-source-exposure-offset-us = <0>;
+
 		/* External trigger: PWM output on GPIO0_B5 (pwm1_ch1_m0) */
 		pwm-names = "trigger";
 		pwms = <&pwm1_6ch_1 0 10000000 PWM_POLARITY_INVERTED>;
