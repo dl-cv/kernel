@@ -169,7 +169,6 @@
 #define OF_IMX296_LIGHT_SOURCE_GPIO		"light-source-gpios"
 #define OF_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL	"light-source-active-level"
 #define OF_IMX296_LIGHT_SOURCE_OFFSET_US	"light-source-exposure-offset-us"
-#define IMX296_LIGHT_SOURCE_GPIO_MAX		2
 #define IMX296_LIGHT_SOURCE_OFFSET_US_DEFAULT	0
 #define IMX296_LIGHT_SOURCE_OFFSET_US_MIN	(-1000000)
 #define IMX296_LIGHT_SOURCE_OFFSET_US_MAX	1000000
@@ -181,7 +180,6 @@
 #define V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE	(V4L2_CID_USER_IMX296_BASE + 0x2)
 #define V4L2_CID_IMX296_LIGHT_SOURCE_OFFSET_US	(V4L2_CID_USER_IMX296_BASE + 0x3)
 #define V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL	(V4L2_CID_USER_IMX296_BASE + 0x4)
-#define V4L2_CID_IMX296_LIGHT_SOURCE_GPIO_SELECT	(V4L2_CID_USER_IMX296_BASE + 0x5)
 
 enum imx296_op_mode {
 	IMX296_FREE_RUN = 0,
@@ -252,16 +250,14 @@ struct imx296 {
 	struct v4l2_ctrl *op_mode_ctrl;
 
 	/* Kernel light source control */
-	struct gpio_desc *light_source_gpios[IMX296_LIGHT_SOURCE_GPIO_MAX];
+	struct gpio_desc *light_source_gpio;
 	struct v4l2_ctrl *light_source_enable;
 	struct v4l2_ctrl *light_source_offset_us;
 	struct v4l2_ctrl *light_source_active_level;
-	struct v4l2_ctrl *light_source_gpio_select;
 	struct hrtimer light_source_on_timer;
 	struct hrtimer light_source_off_timer;
 	u32 light_source_exposure_us;
 	s32 light_source_offset_default_us;
-	u32 light_source_gpio_count;
 	bool light_source_active_high_default;
 	bool light_source_requested;
 };
@@ -488,21 +484,6 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
  * disable it at runtime without re-exporting the GPIO.
  */
 
-static struct gpio_desc *imx296_light_source_current_gpio(struct imx296 *sensor)
-{
-	u32 idx;
-
-	if (!sensor->light_source_gpio_count || !sensor->light_source_requested)
-		return NULL;
-
-	idx = sensor->light_source_gpio_select ?
-		sensor->light_source_gpio_select->val : 0;
-	if (idx >= sensor->light_source_gpio_count)
-		idx = 0;
-
-	return sensor->light_source_gpios[idx];
-}
-
 static bool imx296_light_source_active_high(struct imx296 *sensor)
 {
 	if (sensor->light_source_active_level)
@@ -512,16 +493,14 @@ static bool imx296_light_source_active_high(struct imx296 *sensor)
 
 static void imx296_light_source_gpio_set(struct imx296 *sensor, bool on)
 {
-	struct gpio_desc *gpio;
 	int level;
 
-	gpio = imx296_light_source_current_gpio(sensor);
-	if (!gpio)
+	if (!sensor->light_source_gpio || !sensor->light_source_requested)
 		return;
 
 	level = on ? (imx296_light_source_active_high(sensor) ? 1 : 0)
 		   : (imx296_light_source_active_high(sensor) ? 0 : 1);
-	gpiod_set_value_cansleep(gpio, level);
+	gpiod_set_value_cansleep(sensor->light_source_gpio, level);
 }
 
 static void imx296_light_source_cancel_timers(struct imx296 *sensor)
@@ -598,7 +577,7 @@ static void imx296_light_source_start(struct imx296 *sensor)
 {
 	u32 exposure_us;
 
-	if (!sensor->light_source_gpio_count || !sensor->light_source_requested)
+	if (!sensor->light_source_gpio || !sensor->light_source_requested)
 		return;
 
 	imx296_light_source_cancel_timers(sensor);
@@ -633,7 +612,7 @@ static void imx296_light_source_trigger(struct imx296 *sensor)
 {
 	u32 exposure_us;
 
-	if (!sensor->light_source_gpio_count || !sensor->light_source_requested)
+	if (!sensor->light_source_gpio || !sensor->light_source_requested)
 		return;
 	if (!sensor->light_source_enable || !sensor->light_source_enable->val)
 		return;
@@ -1227,7 +1206,7 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 					      IMX296_ANALOG_GAIN_STEP,
 					      IMX296_ANALOG_GAIN_MIN);
 
-	if (sensor->light_source_gpio_count) {
+	if (sensor->light_source_gpio) {
 		const struct v4l2_ctrl_config light_source_enable_cfg = {
 			.ops = &imx296_ctrl_ops,
 			.id = V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE,
@@ -1265,27 +1244,6 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 			v4l2_ctrl_new_custom(handler, &light_source_offset_cfg, NULL);
 		sensor->light_source_active_level =
 			v4l2_ctrl_new_custom(handler, &light_source_active_level_cfg, NULL);
-
-		if (sensor->light_source_gpio_count > 1) {
-			static const char * const light_source_gpio_select_menu[] = {
-				"OUTPUT1", "OUTPUT2"
-			};
-			const struct v4l2_ctrl_config light_source_gpio_select_cfg = {
-				.ops = &imx296_ctrl_ops,
-				.id = V4L2_CID_IMX296_LIGHT_SOURCE_GPIO_SELECT,
-				.name = "Light Source GPIO Select",
-				.type = V4L2_CTRL_TYPE_MENU,
-				.min = 0,
-				.max = sensor->light_source_gpio_count - 1,
-				.def = 0,
-				.qmenu = light_source_gpio_select_menu,
-			};
-
-			sensor->light_source_gpio_select =
-				v4l2_ctrl_new_custom(handler,
-						     &light_source_gpio_select_cfg,
-						     NULL);
-		}
 	}
 
 	sensor->hflip = v4l2_ctrl_new_std(handler, &imx296_ctrl_ops,
@@ -1656,7 +1614,6 @@ static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 		return 0;
 	case V4L2_CID_IMX296_LIGHT_SOURCE_OFFSET_US:
 	case V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL:
-	case V4L2_CID_IMX296_LIGHT_SOURCE_GPIO_SELECT:
 		return 0;
 	default:
 		break;
@@ -2426,32 +2383,23 @@ static int imx296_probe(struct i2c_client *client,
 
 	mutex_init(&sensor->mutex);
 
-	/* Optional kernel light source GPIOs: only parsed if present in DT. */
+	/* Optional kernel light source GPIO: only parsed if present in DT. */
 	if (of_find_property(node, OF_IMX296_LIGHT_SOURCE_GPIO, NULL)) {
 		const char *active_level = NULL;
 		s32 offset_us = IMX296_LIGHT_SOURCE_OFFSET_US_DEFAULT;
-		unsigned int i;
 
-		for (i = 0; i < IMX296_LIGHT_SOURCE_GPIO_MAX; i++) {
-			struct gpio_desc *gpio;
-
-			gpio = devm_gpiod_get_index_optional(dev, "light-source",
-							     i, GPIOD_OUT_LOW);
-			if (IS_ERR(gpio)) {
-				ret = PTR_ERR(gpio);
-				dev_err_probe(dev, ret,
-					      "failed to get light-source-gpios[%u]\n",
-					      i);
-				goto err_destroy_mutex;
-			}
-			if (!gpio)
-				break;
-
-			sensor->light_source_gpios[i] = gpio;
-			sensor->light_source_gpio_count++;
+		sensor->light_source_gpio = devm_gpiod_get_optional(dev,
+								    "light-source",
+								    GPIOD_OUT_LOW);
+		if (IS_ERR(sensor->light_source_gpio)) {
+			ret = PTR_ERR(sensor->light_source_gpio);
+			dev_err_probe(dev, ret,
+				      "failed to get light-source-gpios\n");
+			sensor->light_source_gpio = NULL;
+			goto err_destroy_mutex;
 		}
 
-		if (sensor->light_source_gpio_count) {
+		if (sensor->light_source_gpio) {
 			ret = of_property_read_string(node,
 						      OF_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL,
 						      &active_level);
@@ -2478,9 +2426,9 @@ static int imx296_probe(struct i2c_client *client,
 			sensor->light_source_requested = true;
 
 			dev_info(dev,
-				 "kernel light source GPIO ready, active-%s, offset %d us, gpios=%u\n",
+				 "kernel light source GPIO ready, active-%s, offset %d us\n",
 				 sensor->light_source_active_high_default ? "high" : "low",
-				 offset_us, sensor->light_source_gpio_count);
+				 offset_us);
 		}
 	}
 
