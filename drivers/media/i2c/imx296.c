@@ -449,6 +449,12 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 		return ret;
 
 	/*
+	 * Light source must be turned on at the start of the trigger pulse,
+	 * while the sensor exposure is active.
+	 */
+	imx296_light_source_trigger(sensor);
+
+	/*
 	 * Keep the PWM enabled long enough for the low-active portion to finish,
 	 * then disable before the next period starts so userspace gets exactly
 	 * one low pulse per write.
@@ -476,8 +482,6 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 		dev_warn(sensor->dev,
 			 "trigger pulse was emitted while active mode is %s; switch run_mode to master_fast_trigger for one-shot capture\n",
 			 imx296_op_mode_name(sensor->active_mode));
-
-	imx296_light_source_trigger(sensor);
 
 	return 0;
 }
