@@ -50,8 +50,8 @@
 
 		reset-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_LOW>;
 
-		/* Kernel light source control on OUTPUT1 (GPIO0_C7) */
-		light-source-gpios = <&gpio0 RK_PC7 GPIO_ACTIVE_HIGH>;
+		/* Kernel light source control on OUTPUT1/OUTPUT2 */
+		light-source-gpios = <&gpio0 RK_PC7 GPIO_ACTIVE_HIGH>, <&gpio3 RK_PA2 GPIO_ACTIVE_HIGH>;
 		light-source-active-level = "high";
 		light-source-exposure-offset-us = <0>;
 
