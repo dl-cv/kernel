@@ -169,9 +169,13 @@
 #define OF_IMX296_LIGHT_SOURCE_GPIO		"light-source-gpios"
 #define OF_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL	"light-source-active-level"
 #define OF_IMX296_LIGHT_SOURCE_OFFSET_US	"light-source-exposure-offset-us"
+#define OF_IMX296_LIGHT_SOURCE_DURATION_ADJUST_US	"light-source-exposure-duration-adjust-us"
 #define IMX296_LIGHT_SOURCE_OFFSET_US_DEFAULT	0
 #define IMX296_LIGHT_SOURCE_OFFSET_US_MIN	(-1000000)
 #define IMX296_LIGHT_SOURCE_OFFSET_US_MAX	1000000
+#define IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_DEFAULT	0
+#define IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_MIN	(-1000000)
+#define IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_MAX	1000000
 
 #ifndef V4L2_CID_USER_IMX296_BASE
 #define V4L2_CID_USER_IMX296_BASE		(V4L2_CID_USER_BASE + 0x10d0)
@@ -180,6 +184,7 @@
 #define V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE	(V4L2_CID_USER_IMX296_BASE + 0x2)
 #define V4L2_CID_IMX296_LIGHT_SOURCE_OFFSET_US	(V4L2_CID_USER_IMX296_BASE + 0x3)
 #define V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL	(V4L2_CID_USER_IMX296_BASE + 0x4)
+#define V4L2_CID_IMX296_LIGHT_SOURCE_DURATION_ADJUST_US	(V4L2_CID_USER_IMX296_BASE + 0x6)
 
 enum imx296_op_mode {
 	IMX296_FREE_RUN = 0,
@@ -254,10 +259,12 @@ struct imx296 {
 	struct v4l2_ctrl *light_source_enable;
 	struct v4l2_ctrl *light_source_offset_us;
 	struct v4l2_ctrl *light_source_active_level;
+	struct v4l2_ctrl *light_source_duration_adjust_us;
 	struct hrtimer light_source_on_timer;
 	struct hrtimer light_source_off_timer;
 	u32 light_source_exposure_us;
 	s32 light_source_offset_default_us;
+	s32 light_source_duration_adjust_default_us;
 	bool light_source_active_high_default;
 	bool light_source_requested;
 };
@@ -522,6 +529,16 @@ static u32 imx296_light_source_frame_interval_us(struct imx296 *sensor)
 
 static void imx296_light_source_schedule_on(struct imx296 *sensor);
 
+static s32 imx296_light_source_duration_us(struct imx296 *sensor)
+{
+	s32 duration = (s32)sensor->light_source_exposure_us;
+
+	if (sensor->light_source_duration_adjust_us)
+		duration += sensor->light_source_duration_adjust_us->val;
+
+	return duration;
+}
+
 static enum hrtimer_restart imx296_light_source_off_timer_fn(struct hrtimer *timer)
 {
 	struct imx296 *sensor = container_of(timer, struct imx296,
@@ -535,21 +552,19 @@ static enum hrtimer_restart imx296_light_source_on_timer_fn(struct hrtimer *time
 {
 	struct imx296 *sensor = container_of(timer, struct imx296,
 					     light_source_on_timer);
-	u32 exposure_us;
+	s32 duration_us;
 
 	if (!sensor->streaming ||
 	    !sensor->light_source_enable || !sensor->light_source_enable->val)
 		return HRTIMER_NORESTART;
 
-	exposure_us = sensor->light_source_exposure_us;
-	if (sensor->light_source_offset_us)
-		exposure_us = (s32)exposure_us + sensor->light_source_offset_us->val;
-	if ((s32)exposure_us <= 0)
+	duration_us = imx296_light_source_duration_us(sensor);
+	if (duration_us <= 0)
 		return HRTIMER_NORESTART;
 
 	imx296_light_source_gpio_set(sensor, true);
 	hrtimer_start(&sensor->light_source_off_timer,
-		      ns_to_ktime((u64)exposure_us * 1000ULL),
+		      ns_to_ktime((u64)duration_us * 1000ULL),
 		      HRTIMER_MODE_REL);
 
 	imx296_light_source_schedule_on(sensor);
@@ -575,7 +590,8 @@ static void imx296_light_source_schedule_on(struct imx296 *sensor)
 
 static void imx296_light_source_start(struct imx296 *sensor)
 {
-	u32 exposure_us;
+	s32 offset_us = 0;
+	s32 duration_us;
 
 	if (!sensor->light_source_gpio || !sensor->light_source_requested)
 		return;
@@ -589,17 +605,28 @@ static void imx296_light_source_start(struct imx296 *sensor)
 	if (sensor->active_mode == IMX296_XTRIG_ONE_SHOT)
 		return;
 
-	exposure_us = sensor->light_source_exposure_us;
-	if (sensor->light_source_offset_us)
-		exposure_us = (s32)exposure_us + sensor->light_source_offset_us->val;
-	if ((s32)exposure_us <= 0)
+	duration_us = imx296_light_source_duration_us(sensor);
+	if (duration_us <= 0)
 		return;
 
-	imx296_light_source_gpio_set(sensor, true);
-	hrtimer_start(&sensor->light_source_off_timer,
-		      ns_to_ktime((u64)exposure_us * 1000ULL),
-		      HRTIMER_MODE_REL);
-	imx296_light_source_schedule_on(sensor);
+	if (sensor->light_source_offset_us)
+		offset_us = sensor->light_source_offset_us->val;
+
+	if (offset_us <= 0) {
+		/*
+		 * Negative offset means "earlier than stream-on", which is
+		 * impossible; light immediately and keep the duration.
+		 */
+		imx296_light_source_gpio_set(sensor, true);
+		hrtimer_start(&sensor->light_source_off_timer,
+			      ns_to_ktime((u64)duration_us * 1000ULL),
+			      HRTIMER_MODE_REL);
+		imx296_light_source_schedule_on(sensor);
+	} else {
+		hrtimer_start(&sensor->light_source_on_timer,
+			      ns_to_ktime((u64)(u32)offset_us * 1000ULL),
+			      HRTIMER_MODE_REL);
+	}
 }
 
 static void imx296_light_source_stop(struct imx296 *sensor)
@@ -610,7 +637,8 @@ static void imx296_light_source_stop(struct imx296 *sensor)
 
 static void imx296_light_source_trigger(struct imx296 *sensor)
 {
-	u32 exposure_us;
+	s32 offset_us = 0;
+	s32 duration_us;
 
 	if (!sensor->light_source_gpio || !sensor->light_source_requested)
 		return;
@@ -619,19 +647,34 @@ static void imx296_light_source_trigger(struct imx296 *sensor)
 
 	/*
 	 * In one-shot trigger mode the sensor exposure follows the width of the
-	 * external trigger pulse.  Use that pulse width plus the fixed offset as
-	 * the light duration.
+	 * external trigger pulse.  The light duration is the pulse width plus an
+	 * optional user adjustment.
 	 */
-	exposure_us = sensor->trigger_pulse_us + IMX296_EXPOSURE_OFFSET_NS / 1000;
-	if (sensor->light_source_offset_us)
-		exposure_us = (s32)exposure_us + sensor->light_source_offset_us->val;
-	if ((s32)exposure_us <= 0)
+	duration_us = (s32)(sensor->trigger_pulse_us +
+			    IMX296_EXPOSURE_OFFSET_NS / 1000);
+	if (sensor->light_source_duration_adjust_us)
+		duration_us += sensor->light_source_duration_adjust_us->val;
+	if (duration_us <= 0)
 		return;
 
-	imx296_light_source_gpio_set(sensor, true);
-	hrtimer_start(&sensor->light_source_off_timer,
-		      ns_to_ktime((u64)exposure_us * 1000ULL),
-		      HRTIMER_MODE_REL);
+	if (sensor->light_source_offset_us)
+		offset_us = sensor->light_source_offset_us->val;
+
+	if (offset_us <= 0) {
+		imx296_light_source_gpio_set(sensor, true);
+		hrtimer_start(&sensor->light_source_off_timer,
+			      ns_to_ktime((u64)duration_us * 1000ULL),
+			      HRTIMER_MODE_REL);
+	} else {
+		/*
+		 * Store trigger-mode duration so the on_timer can use it after the
+		 * positive offset delay.
+		 */
+		sensor->light_source_exposure_us = (u32)duration_us;
+		hrtimer_start(&sensor->light_source_on_timer,
+			      ns_to_ktime((u64)(u32)offset_us * 1000ULL),
+			      HRTIMER_MODE_REL);
+	}
 }
 
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);
@@ -1237,6 +1280,16 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 			.step = 1,
 			.def = sensor->light_source_active_high_default ? 1 : 0,
 		};
+		const struct v4l2_ctrl_config light_source_duration_adjust_cfg = {
+			.ops = &imx296_ctrl_ops,
+			.id = V4L2_CID_IMX296_LIGHT_SOURCE_DURATION_ADJUST_US,
+			.name = "Light Source Duration Adjust (us)",
+			.type = V4L2_CTRL_TYPE_INTEGER,
+			.min = IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_MIN,
+			.max = IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_MAX,
+			.step = 1,
+			.def = sensor->light_source_duration_adjust_default_us,
+		};
 
 		sensor->light_source_enable =
 			v4l2_ctrl_new_custom(handler, &light_source_enable_cfg, NULL);
@@ -1244,6 +1297,8 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 			v4l2_ctrl_new_custom(handler, &light_source_offset_cfg, NULL);
 		sensor->light_source_active_level =
 			v4l2_ctrl_new_custom(handler, &light_source_active_level_cfg, NULL);
+		sensor->light_source_duration_adjust_us =
+			v4l2_ctrl_new_custom(handler, &light_source_duration_adjust_cfg, NULL);
 	}
 
 	sensor->hflip = v4l2_ctrl_new_std(handler, &imx296_ctrl_ops,
@@ -1614,6 +1669,7 @@ static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 		return 0;
 	case V4L2_CID_IMX296_LIGHT_SOURCE_OFFSET_US:
 	case V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL:
+	case V4L2_CID_IMX296_LIGHT_SOURCE_DURATION_ADJUST_US:
 		return 0;
 	default:
 		break;
@@ -2387,6 +2443,7 @@ static int imx296_probe(struct i2c_client *client,
 	if (of_find_property(node, OF_IMX296_LIGHT_SOURCE_GPIO, NULL)) {
 		const char *active_level = NULL;
 		s32 offset_us = IMX296_LIGHT_SOURCE_OFFSET_US_DEFAULT;
+		s32 duration_adjust_us = IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_DEFAULT;
 
 		sensor->light_source_gpio = devm_gpiod_get_optional(dev,
 								    "light-source",
@@ -2421,14 +2478,26 @@ static int imx296_probe(struct i2c_client *client,
 			}
 			sensor->light_source_offset_default_us = offset_us;
 
+			of_property_read_s32(node,
+					     OF_IMX296_LIGHT_SOURCE_DURATION_ADJUST_US,
+					     &duration_adjust_us);
+			if (duration_adjust_us < IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_MIN ||
+			    duration_adjust_us > IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_MAX) {
+				dev_warn(dev,
+					 "light-source-exposure-duration-adjust-us %d out of range, using default\n",
+					 duration_adjust_us);
+				duration_adjust_us = IMX296_LIGHT_SOURCE_DURATION_ADJUST_US_DEFAULT;
+			}
+			sensor->light_source_duration_adjust_default_us = duration_adjust_us;
+
 			/* Set idle level and mark as requested. */
 			imx296_light_source_gpio_set(sensor, false);
 			sensor->light_source_requested = true;
 
 			dev_info(dev,
-				 "kernel light source GPIO ready, active-%s, offset %d us\n",
+				 "kernel light source GPIO ready, active-%s, offset %d us, duration adjust %d us\n",
 				 sensor->light_source_active_high_default ? "high" : "low",
-				 offset_us);
+				 offset_us, duration_adjust_us);
 		}
 	}
 
