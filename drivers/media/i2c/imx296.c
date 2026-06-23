@@ -453,11 +453,21 @@ static int imx296_light_source_init_locked(struct imx296 *sensor)
 
 	idle_value = imx296_light_source_value_locked(sensor, false);
 	ret = gpiod_direction_output(sensor->light_source_gpio, idle_value);
-	if (ret < 0)
+	if (ret < 0) {
 		dev_err(sensor->dev,
 			"failed to set light source gpio direction (%d)\n", ret);
+		return ret;
+	}
 
-	return ret;
+	/*
+	 * gpiod_direction_output() only guarantees the initial value when the
+	 * line changes from input to output. After that, some gpiochip drivers
+	 * skip updating the value if the direction is already output, so set the
+	 * idle level explicitly here.
+	 */
+	imx296_light_source_set_locked(sensor, false);
+
+	return 0;
 }
 
 static int imx296_trigger_once_locked(struct imx296 *sensor)
