@@ -168,6 +168,10 @@
 #define V4L2_CID_USER_IMX296_BASE		(V4L2_CID_USER_BASE + 0x10d0)
 #endif
 #define V4L2_CID_IMX296_OP_MODE			(V4L2_CID_USER_IMX296_BASE + 0x1)
+#define V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE		(V4L2_CID_USER_IMX296_BASE + 0x2)
+#define V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL	(V4L2_CID_USER_IMX296_BASE + 0x3)
+#define V4L2_CID_IMX296_LIGHT_SOURCE_ADVANCE_US		(V4L2_CID_USER_IMX296_BASE + 0x4)
+#define V4L2_CID_IMX296_LIGHT_SOURCE_OFF_DELAY_US	(V4L2_CID_USER_IMX296_BASE + 0x5)
 
 enum imx296_op_mode {
 	IMX296_FREE_RUN = 0,
@@ -214,6 +218,18 @@ struct imx296 {
 	enum imx296_op_mode active_mode;
 	enum imx296_op_mode pending_mode;
 	u32 trigger_pulse_us;
+
+	struct gpio_desc *light_source_gpio;
+	struct pinctrl_state *pins_active_high;
+	bool light_source_enabled;
+	bool light_source_active_level;
+	u32 light_source_advance_us;
+	u32 light_source_off_delay_us;
+
+	struct v4l2_ctrl *light_source_enable_ctrl;
+	struct v4l2_ctrl *light_source_active_level_ctrl;
+	struct v4l2_ctrl *light_source_advance_us_ctrl;
+	struct v4l2_ctrl *light_source_off_delay_us_ctrl;
 
 	u32 module_index;
 	const char *module_facing;
@@ -386,11 +402,81 @@ static int imx296_init_trigger_pwm(struct imx296 *sensor)
 	return pwm_apply_state(sensor->trigger_pwm, &state);
 }
 
+static int imx296_light_source_value_locked(struct imx296 *sensor, bool on)
+{
+	/*
+	 * active_level: false = low active, true = high active.
+	 * Low active:  on -> GPIO 0, off -> GPIO 1.
+	 * High active: on -> GPIO 1, off -> GPIO 0.
+	 */
+	return on ? sensor->light_source_active_level : !sensor->light_source_active_level;
+}
+
+static int imx296_light_source_apply_pinctrl_locked(struct imx296 *sensor)
+{
+	struct pinctrl_state *state;
+
+	if (!sensor->pinctrl)
+		return 0;
+
+	state = sensor->light_source_active_level ? sensor->pins_active_high
+						  : sensor->pins_default;
+	if (!state)
+		return 0;
+
+	return pinctrl_select_state(sensor->pinctrl, state);
+}
+
+static void imx296_light_source_set_locked(struct imx296 *sensor, bool on)
+{
+	if (!sensor->light_source_gpio)
+		return;
+
+	gpiod_set_value(sensor->light_source_gpio,
+			imx296_light_source_value_locked(sensor, on));
+}
+
+static int imx296_light_source_init_locked(struct imx296 *sensor)
+{
+	int idle_value;
+	int ret;
+
+	if (!sensor->light_source_gpio)
+		return 0;
+
+	ret = imx296_light_source_apply_pinctrl_locked(sensor);
+	if (ret < 0) {
+		dev_warn(sensor->dev,
+			 "failed to select light source pinctrl state (%d)\n", ret);
+		return ret;
+	}
+
+	idle_value = imx296_light_source_value_locked(sensor, false);
+	ret = gpiod_direction_output(sensor->light_source_gpio, idle_value);
+	if (ret < 0) {
+		dev_err(sensor->dev,
+			"failed to set light source gpio direction (%d)\n", ret);
+		return ret;
+	}
+
+	/*
+	 * gpiod_direction_output() only guarantees the initial value when the
+	 * line changes from input to output. After that, some gpiochip drivers
+	 * skip updating the value if the direction is already output, so set the
+	 * idle level explicitly here.
+	 */
+	imx296_light_source_set_locked(sensor, false);
+
+	return 0;
+}
+
 static int imx296_trigger_once_locked(struct imx296 *sensor)
 {
 	struct pwm_state state;
 	u64 duty_ns;
 	u32 pulse_us;
+	u32 advance_us;
+	u32 off_delay_us;
 	int ret;
 
 	if (!sensor->trigger_pwm)
@@ -401,6 +487,23 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 			   IMX296_TRIGGER_PULSE_US_MAX);
 	duty_ns = (u64)pulse_us * 1000ULL;
 
+	advance_us = sensor->light_source_enabled ?
+			 sensor->light_source_advance_us : 0;
+	off_delay_us = sensor->light_source_enabled ?
+		       sensor->light_source_off_delay_us : 0;
+
+	if (sensor->light_source_enabled && sensor->light_source_gpio) {
+		imx296_light_source_set_locked(sensor, true);
+		if (advance_us > 0) {
+			if (advance_us <= 1000)
+				udelay(advance_us);
+			else
+				usleep_range(advance_us,
+					     advance_us + max_t(u32, 20U,
+								advance_us / 10U));
+		}
+	}
+
 	pwm_get_state(sensor->trigger_pwm, &state);
 	state.period = imx296_trigger_period_ns(
 		duty_ns, imx296_pwm_period_ns(sensor->trigger_pwm));
@@ -410,7 +513,7 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 
 	ret = pwm_apply_state(sensor->trigger_pwm, &state);
 	if (ret)
-		return ret;
+		goto out_light;
 
 	/*
 	 * Keep the PWM enabled long enough for the low-active portion to finish,
@@ -426,7 +529,7 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 	state.enabled = false;
 	ret = pwm_apply_state(sensor->trigger_pwm, &state);
 	if (ret)
-		return ret;
+		goto out_light;
 
 	dev_info(sensor->dev,
 		 "trigger pulse emitted: width=%u us idle=high active=low mode=%s streaming=%u\n",
@@ -441,7 +544,20 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 			 "trigger pulse was emitted while active mode is %s; switch run_mode to master_fast_trigger for one-shot capture\n",
 			 imx296_op_mode_name(sensor->active_mode));
 
-	return 0;
+out_light:
+	if (sensor->light_source_enabled && sensor->light_source_gpio) {
+		if (off_delay_us > 0) {
+			if (off_delay_us <= 1000)
+				udelay(off_delay_us);
+			else
+				usleep_range(off_delay_us,
+					     off_delay_us + max_t(u32, 20U,
+								  off_delay_us / 10U));
+		}
+		imx296_light_source_set_locked(sensor, false);
+	}
+
+	return ret;
 }
 
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);
@@ -462,6 +578,50 @@ static const struct v4l2_ctrl_config imx296_op_mode_ctrl_cfg = {
 	.max = IMX296_XTRIG_ONE_SHOT,
 	.def = IMX296_FREE_RUN,
 	.qmenu = imx296_op_mode_menu,
+};
+
+static const struct v4l2_ctrl_config imx296_light_source_enable_cfg = {
+	.ops = &imx296_ctrl_ops,
+	.id = V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE,
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.name = "light_source_enable",
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config imx296_light_source_active_level_cfg = {
+	.ops = &imx296_ctrl_ops,
+	.id = V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL,
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.name = "light_source_active_level",
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config imx296_light_source_advance_us_cfg = {
+	.ops = &imx296_ctrl_ops,
+	.id = V4L2_CID_IMX296_LIGHT_SOURCE_ADVANCE_US,
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.name = "light_source_advance_us",
+	.min = 0,
+	.max = 100000,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config imx296_light_source_off_delay_us_cfg = {
+	.ops = &imx296_ctrl_ops,
+	.id = V4L2_CID_IMX296_LIGHT_SOURCE_OFF_DELAY_US,
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.name = "light_source_off_delay_us",
+	.min = 0,
+	.max = 1000000,
+	.step = 1,
+	.def = 0,
 };
 
 static ssize_t run_mode_show(struct device *dev,
@@ -798,10 +958,10 @@ static int imx296_power_on(struct imx296 *sensor)
 {
 	int ret;
 
-	if (!IS_ERR_OR_NULL(sensor->pins_default)) {
-		ret = pinctrl_select_state(sensor->pinctrl, sensor->pins_default);
+	if (!IS_ERR_OR_NULL(sensor->pinctrl)) {
+		ret = imx296_light_source_apply_pinctrl_locked(sensor);
 		if (ret < 0)
-			dev_dbg(sensor->dev, "could not set default pin state\n");
+			dev_dbg(sensor->dev, "could not set light source pin state\n");
 	}
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(sensor->supplies),
@@ -994,7 +1154,7 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 	if (ret < 0)
 		return ret;
 
-	ret = v4l2_ctrl_handler_init(handler, 11);
+	ret = v4l2_ctrl_handler_init(handler, 15);
 	if (ret)
 		return ret;
 
@@ -1051,6 +1211,19 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 	sensor->op_mode_ctrl = v4l2_ctrl_new_custom(handler,
 						    &imx296_op_mode_ctrl_cfg,
 						    NULL);
+
+	sensor->light_source_enable_ctrl = v4l2_ctrl_new_custom(handler,
+							       &imx296_light_source_enable_cfg,
+							       NULL);
+	sensor->light_source_active_level_ctrl = v4l2_ctrl_new_custom(handler,
+								      &imx296_light_source_active_level_cfg,
+								      NULL);
+	sensor->light_source_advance_us_ctrl = v4l2_ctrl_new_custom(handler,
+								  &imx296_light_source_advance_us_cfg,
+								  NULL);
+	sensor->light_source_off_delay_us_ctrl = v4l2_ctrl_new_custom(handler,
+								    &imx296_light_source_off_delay_us_cfg,
+								    NULL);
 
 	v4l2_ctrl_new_fwnode_properties(handler, &imx296_ctrl_ops, &props);
 
@@ -1366,6 +1539,18 @@ static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_VBLANK:
 		imx296_update_free_run_exposure_range_locked(sensor, ctrl->val);
 		break;
+	case V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE:
+		sensor->light_source_enabled = !!ctrl->val;
+		break;
+	case V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL:
+		sensor->light_source_active_level = !!ctrl->val;
+		break;
+	case V4L2_CID_IMX296_LIGHT_SOURCE_ADVANCE_US:
+		sensor->light_source_advance_us = ctrl->val;
+		break;
+	case V4L2_CID_IMX296_LIGHT_SOURCE_OFF_DELAY_US:
+		sensor->light_source_off_delay_us = ctrl->val;
+		break;
 	default:
 		break;
 	}
@@ -1396,6 +1581,21 @@ static int imx296_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	case V4L2_CID_TEST_PATTERN:
 		ret = imx296_apply_test_pattern_locked(sensor, ctrl->val);
+		break;
+
+	case V4L2_CID_IMX296_LIGHT_SOURCE_ENABLE:
+		if (sensor->streaming && sensor->active_mode == IMX296_FREE_RUN)
+			imx296_light_source_set_locked(sensor,
+						       sensor->light_source_enabled);
+		break;
+
+	case V4L2_CID_IMX296_LIGHT_SOURCE_ACTIVE_LEVEL:
+		ret = imx296_light_source_init_locked(sensor);
+		if (ret < 0)
+			break;
+		if (sensor->streaming && sensor->active_mode == IMX296_FREE_RUN)
+			imx296_light_source_set_locked(sensor,
+						       sensor->light_source_enabled);
 		break;
 
 	default:
@@ -1439,6 +1639,7 @@ static int imx296_s_stream(struct v4l2_subdev *sd, int enable)
 
 	if (!enable) {
 		ret = imx296_stream_off(sensor);
+		imx296_light_source_set_locked(sensor, false);
 		if (!ret) {
 			sensor->streaming = false;
 			pm_runtime_mark_last_busy(sensor->dev);
@@ -1469,8 +1670,16 @@ static int imx296_s_stream(struct v4l2_subdev *sd, int enable)
 	if (ret)
 		goto err_pm;
 
+	ret = imx296_light_source_init_locked(sensor);
+	if (ret)
+		goto err_pm;
+
 	sensor->active_mode = sensor->pending_mode;
 	sensor->streaming = true;
+
+	if (sensor->active_mode == IMX296_FREE_RUN && sensor->light_source_enabled)
+		imx296_light_source_set_locked(sensor, true);
+
 	goto unlock;
 
 err_pm:
@@ -2086,6 +2295,53 @@ static int imx296_probe(struct i2c_client *client,
 				     "failed to read trigger pulse width\n");
 	}
 
+	sensor->light_source_enabled = false;
+	sensor->light_source_active_level = false;
+	sensor->light_source_advance_us = 0;
+	sensor->light_source_off_delay_us = 0;
+
+	sensor->light_source_gpio = devm_gpiod_get_optional(dev, "light-source",
+							    GPIOD_ASIS);
+	if (IS_ERR(sensor->light_source_gpio))
+		return dev_err_probe(dev, PTR_ERR(sensor->light_source_gpio),
+				     "failed to get light-source-gpios\n");
+
+	{
+		const char *active_level_name = NULL;
+
+		ret = of_property_read_string(node, "light-source-active-level",
+					      &active_level_name);
+		if (!ret && active_level_name) {
+			if (strcmp(active_level_name, "high") == 0)
+				sensor->light_source_active_level = true;
+			else if (strcmp(active_level_name, "low") != 0)
+				dev_warn(dev,
+					 "invalid light-source-active-level '%s', defaulting to low\n",
+					 active_level_name);
+		} else if (ret != -EINVAL) {
+			dev_warn(dev,
+				 "failed to read light-source-active-level (%d), defaulting to low\n",
+				 ret);
+		}
+	}
+
+	of_property_read_u32(node, "light-source-exposure-advance-us",
+			     &sensor->light_source_advance_us);
+	of_property_read_u32(node, "light-source-exposure-off-delay-us",
+			     &sensor->light_source_off_delay_us);
+	if (sensor->light_source_advance_us > 100000) {
+		dev_warn(dev,
+			 "light-source-exposure-advance-us %u out of range, clamp to 100000\n",
+			 sensor->light_source_advance_us);
+		sensor->light_source_advance_us = 100000;
+	}
+	if (sensor->light_source_off_delay_us > 1000000) {
+		dev_warn(dev,
+			 "light-source-exposure-off-delay-us %u out of range, clamp to 1000000\n",
+			 sensor->light_source_off_delay_us);
+		sensor->light_source_off_delay_us = 1000000;
+	}
+
 	sensor->trigger_pwm = imx296_devm_pwm_get_optional(dev, "trigger");
 	if (IS_ERR(sensor->trigger_pwm))
 		return dev_err_probe(dev, PTR_ERR(sensor->trigger_pwm),
@@ -2104,6 +2360,11 @@ static int imx296_probe(struct i2c_client *client,
 					     OF_CAMERA_PINCTRL_STATE_SLEEP);
 		if (IS_ERR(sensor->pins_sleep))
 			sensor->pins_sleep = NULL;
+
+		sensor->pins_active_high =
+			pinctrl_lookup_state(sensor->pinctrl, "active-high");
+		if (IS_ERR(sensor->pins_active_high))
+			sensor->pins_active_high = NULL;
 	} else {
 		sensor->pinctrl = NULL;
 	}
@@ -2141,6 +2402,11 @@ static int imx296_probe(struct i2c_client *client,
 	ret = imx296_power_on(sensor);
 	if (ret)
 		goto err_destroy_mutex;
+
+	ret = imx296_light_source_init_locked(sensor);
+	if (ret)
+		dev_warn(dev,
+			 "failed to initialize light source gpio (%d)\n", ret);
 
 	ret = imx296_identify_model(sensor);
 	if (ret)
