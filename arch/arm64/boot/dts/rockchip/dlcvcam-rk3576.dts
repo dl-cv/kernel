@@ -177,8 +177,9 @@
 	/*
 	 * Board Cooling Fan Configuration
 	 *
-	 * Three profiles: silent / normal / turbo
-	 * Managed by Rockchip pwm-fan driver with profile switching via sysfs.
+	 * Preset profiles: silent / normal / turbo, plus target-temperature
+	 * curves (30/35/40/45/50/55/60 °C full-speed). Profile switching via
+	 * sysfs; CamOS can fall back to manual_mode=1 + pwm1 when needed.
 	 */
 	fan: pwm-fan {
 		status = "okay";
@@ -230,6 +231,34 @@
 			55000    4
 			60000    5
 		>;
+
+		/* 30 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-30 = <0 8 46 117 255>;
+		rockchip,temp-trips-30 = <7000 1 15000 2 22000 3 30000 4>;
+
+		/* 35 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-35 = <0 5 41 122 255>;
+		rockchip,temp-trips-35 = <8000 1 17000 2 26000 3 35000 4>;
+
+		/* 40 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-40 = <0 8 46 125 255>;
+		rockchip,temp-trips-40 = <10000 1 20000 2 30000 3 40000 4>;
+
+		/* 45 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-45 = <0 8 43 117 255>;
+		rockchip,temp-trips-45 = <11000 1 22000 2 33000 3 45000 4>;
+
+		/* 50 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-50 = <0 8 46 120 255>;
+		rockchip,temp-trips-50 = <12000 1 25000 2 37000 3 50000 4>;
+
+		/* 55 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-55 = <0 8 43 122 255>;
+		rockchip,temp-trips-55 = <13000 1 27000 2 41000 3 55000 4>;
+
+		/* 60 °C 满速曲线：0% -> 100% */
+		rockchip,cooling-levels-60 = <0 8 46 125 255>;
+		rockchip,temp-trips-60 = <15000 1 30000 2 45000 3 60000 4>;
 	};
 
 	/*

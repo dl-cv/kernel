@@ -22,30 +22,58 @@
 #include <soc/rockchip/rockchip_system_monitor.h>
 
 #define MAX_PWM 255
-#define PWM_FAN_PROFILE_COUNT 3
+#define PWM_FAN_PROFILE_COUNT 10
 
 enum pwm_fan_mode {
 	PWM_FAN_MODE_SILENT = 0,
 	PWM_FAN_MODE_NORMAL,
 	PWM_FAN_MODE_TURBO,
+	PWM_FAN_MODE_COOL_30,
+	PWM_FAN_MODE_COOL_35,
+	PWM_FAN_MODE_COOL_40,
+	PWM_FAN_MODE_COOL_45,
+	PWM_FAN_MODE_COOL_50,
+	PWM_FAN_MODE_COOL_55,
+	PWM_FAN_MODE_COOL_60,
 };
 
 static const char * const pwm_fan_mode_names[PWM_FAN_PROFILE_COUNT] = {
 	"silent",
 	"normal",
 	"turbo",
+	"30",
+	"35",
+	"40",
+	"45",
+	"50",
+	"55",
+	"60",
 };
 
 static const char * const pwm_fan_mode_levels_props[PWM_FAN_PROFILE_COUNT] = {
 	"rockchip,cooling-levels-silent",
 	"rockchip,cooling-levels-normal",
 	"rockchip,cooling-levels-turbo",
+	"rockchip,cooling-levels-30",
+	"rockchip,cooling-levels-35",
+	"rockchip,cooling-levels-40",
+	"rockchip,cooling-levels-45",
+	"rockchip,cooling-levels-50",
+	"rockchip,cooling-levels-55",
+	"rockchip,cooling-levels-60",
 };
 
 static const char * const pwm_fan_mode_trips_props[PWM_FAN_PROFILE_COUNT] = {
 	"rockchip,temp-trips-silent",
 	"rockchip,temp-trips-normal",
 	"rockchip,temp-trips-turbo",
+	"rockchip,temp-trips-30",
+	"rockchip,temp-trips-35",
+	"rockchip,temp-trips-40",
+	"rockchip,temp-trips-45",
+	"rockchip,temp-trips-50",
+	"rockchip,temp-trips-55",
+	"rockchip,temp-trips-60",
 };
 
 struct thermal_trips {
@@ -306,10 +334,17 @@ static DEVICE_ATTR_RW(fan_mode_name);
 static ssize_t fan_mode_names_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%s %s %s\n",
-		       pwm_fan_mode_names[PWM_FAN_MODE_SILENT],
-		       pwm_fan_mode_names[PWM_FAN_MODE_NORMAL],
-		       pwm_fan_mode_names[PWM_FAN_MODE_TURBO]);
+	int i;
+	ssize_t len = 0;
+
+	for (i = 0; i < PWM_FAN_PROFILE_COUNT; i++) {
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s%s",
+				 pwm_fan_mode_names[i],
+				 (i + 1 < PWM_FAN_PROFILE_COUNT) ? " " : "");
+	}
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+
+	return len;
 }
 
 static DEVICE_ATTR_RO(fan_mode_names);
