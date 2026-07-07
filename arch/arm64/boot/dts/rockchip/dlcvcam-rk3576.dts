@@ -189,46 +189,59 @@
 		pwms = <&pwm2_8ch_3 0 500000 0>;
 
 		/* Fallback cooling levels for thermal framework */
-		cooling-levels = <26 77 128 179 255>;
+		cooling-levels = <26 51 77 102 128 153 179 204 230 255>;
 		rockchip,temp-trips = <
-			0        1
-			50000    2
-			60000    3
-			70000    4
-			75000    4
+			30000    1
+			35000    2
+			40000    3
+			45000    4
+			50000    5
+			55000    6
+			60000    7
+			65000    8
+			70000    9
 		>;
 
-		/* Silent: 50°C 10% -> 75°C 100% */
-		rockchip,cooling-levels-silent = <26 26 51 77 102 128 179 255>;
+		/* Silent: 30 °C 10 % -> 75 °C 100 % */
+		rockchip,cooling-levels-silent = <26 26 51 77 102 128 153 179 204 230 255>;
 		rockchip,temp-trips-silent = <
-			50000    1
-			55000    2
-			60000    3
-			65000    4
-			70000    5
-			72000    6
-			75000    7
+			30000    1
+			35000    2
+			40000    3
+			45000    4
+			50000    5
+			55000    6
+			60000    7
+			65000    8
+			70000    9
+			75000    10
 		>;
 
-		/* Normal: 45°C 10% -> 70°C 100% */
-		rockchip,cooling-levels-normal = <26 26 77 128 179 217 255>;
+		/* Normal: 30 °C 20 % -> 70 °C 100 % */
+		rockchip,cooling-levels-normal = <26 51 77 102 128 153 179 204 230 255>;
 		rockchip,temp-trips-normal = <
-			45000    1
-			50000    2
-			55000    3
-			60000    4
-			65000    5
-			70000    6
+			30000    1
+			35000    2
+			40000    3
+			45000    4
+			50000    5
+			55000    6
+			60000    7
+			65000    8
+			70000    9
 		>;
 
-		/* Turbo: 40°C 10% -> 60°C 100% */
-		rockchip,cooling-levels-turbo = <26 26 77 128 191 255>;
+		/* Turbo: 30 °C 30 % -> 65 °C 100 % */
+		rockchip,cooling-levels-turbo = <26 77 102 128 153 179 204 230 255>;
 		rockchip,temp-trips-turbo = <
-			40000    1
-			45000    2
-			50000    3
-			55000    4
-			60000    5
+			30000    1
+			35000    2
+			40000    3
+			45000    4
+			50000    5
+			55000    6
+			60000    7
+			65000    8
 		>;
 	};
 
