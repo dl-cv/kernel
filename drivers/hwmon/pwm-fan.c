@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/pwm.h>
 #include <linux/regulator/consumer.h>
+#include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/thermal.h>
 #include <linux/timer.h>
