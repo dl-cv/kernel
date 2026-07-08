@@ -28,7 +28,7 @@
 
 /* User-space supplied temperature -> fan speed percent curve point.
  * Temp is in millidegree Celsius to match thermal notifier data.
- * Percent is 0-100 and will be quantized to 10% steps by the driver.
+ * Percent is 0-100 and is mapped directly to PWM 0-255 by the driver.
  */
 struct pwm_fan_curve_point {
 	int temp;
@@ -126,13 +126,15 @@ struct pwm_fan_ctx {
 	bool manual_mode;	/* when true, thermal notifier does not override pwm1 */
 
 	/* Reference to the base 11-step cooling levels (0%,10%,...,100%).
-	 * Used by the user-space configurable fan curve for quantization.
+	 * Used for thermal cooling device state reporting when the user
+	 * configurable fan curve is enabled.
 	 */
 	unsigned int *base_pwm_fan_cooling_levels;
 	unsigned int base_pwm_fan_max_state;
 
 	/* User-space configurable fan curve.  When enabled, thermal control
-	 * interpolates between these points and quantizes to 10% speed steps.
+	 * interpolates between these points and maps the resulting percent
+	 * directly to a PWM value (0-255).
 	 */
 	struct pwm_fan_curve_point user_curve[FAN_CURVE_MAX_POINTS];
 	int user_curve_count;
@@ -829,7 +831,7 @@ static int pwm_fan_curve_to_pwm(struct pwm_fan_ctx *ctx, int temp)
 {
 	struct pwm_fan_curve_point *curve = ctx->user_curve;
 	int n = ctx->user_curve_count;
-	int i, percent = 0, state;
+	int i, percent = 0;
 
 	if (n < 2)
 		return ctx->pwm_value;
@@ -858,14 +860,12 @@ static int pwm_fan_curve_to_pwm(struct pwm_fan_ctx *ctx, int temp)
 		}
 	}
 
-	/* Quantize to 10% speed steps */
-	state = DIV_ROUND_CLOSEST(percent, 10);
-	if (state < 0)
-		state = 0;
-	if (state > ctx->pwm_fan_max_state)
-		state = ctx->pwm_fan_max_state;
+	if (percent < 0)
+		percent = 0;
+	if (percent > 100)
+		percent = 100;
 
-	return ctx->pwm_fan_cooling_levels[state];
+	return DIV_ROUND_CLOSEST(percent * MAX_PWM, 100);
 }
 
 static int pwm_fan_temp_to_state(struct pwm_fan_ctx *ctx, int temp)
