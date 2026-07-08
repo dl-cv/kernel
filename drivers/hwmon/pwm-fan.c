@@ -16,36 +16,75 @@
 #include <linux/platform_device.h>
 #include <linux/pwm.h>
 #include <linux/regulator/consumer.h>
+#include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/thermal.h>
 #include <linux/timer.h>
 #include <soc/rockchip/rockchip_system_monitor.h>
 
 #define MAX_PWM 255
-#define PWM_FAN_PROFILE_COUNT 3
+#define PWM_FAN_PROFILE_COUNT 10
+#define FAN_CURVE_MAX_POINTS 32
+
+/* User-space supplied temperature -> fan speed percent curve point.
+ * Temp is in millidegree Celsius to match thermal notifier data.
+ * Percent is 0-100 and is mapped directly to PWM 0-255 by the driver.
+ */
+struct pwm_fan_curve_point {
+	int temp;
+	int percent;
+};
 
 enum pwm_fan_mode {
 	PWM_FAN_MODE_SILENT = 0,
 	PWM_FAN_MODE_NORMAL,
 	PWM_FAN_MODE_TURBO,
+	PWM_FAN_MODE_COOL_30,
+	PWM_FAN_MODE_COOL_35,
+	PWM_FAN_MODE_COOL_40,
+	PWM_FAN_MODE_COOL_45,
+	PWM_FAN_MODE_COOL_50,
+	PWM_FAN_MODE_COOL_55,
+	PWM_FAN_MODE_COOL_60,
 };
 
 static const char * const pwm_fan_mode_names[PWM_FAN_PROFILE_COUNT] = {
 	"silent",
 	"normal",
 	"turbo",
+	"30",
+	"35",
+	"40",
+	"45",
+	"50",
+	"55",
+	"60",
 };
 
 static const char * const pwm_fan_mode_levels_props[PWM_FAN_PROFILE_COUNT] = {
 	"rockchip,cooling-levels-silent",
 	"rockchip,cooling-levels-normal",
 	"rockchip,cooling-levels-turbo",
+	"rockchip,cooling-levels-30",
+	"rockchip,cooling-levels-35",
+	"rockchip,cooling-levels-40",
+	"rockchip,cooling-levels-45",
+	"rockchip,cooling-levels-50",
+	"rockchip,cooling-levels-55",
+	"rockchip,cooling-levels-60",
 };
 
 static const char * const pwm_fan_mode_trips_props[PWM_FAN_PROFILE_COUNT] = {
 	"rockchip,temp-trips-silent",
 	"rockchip,temp-trips-normal",
 	"rockchip,temp-trips-turbo",
+	"rockchip,temp-trips-30",
+	"rockchip,temp-trips-35",
+	"rockchip,temp-trips-40",
+	"rockchip,temp-trips-45",
+	"rockchip,temp-trips-50",
+	"rockchip,temp-trips-55",
+	"rockchip,temp-trips-60",
 };
 
 struct thermal_trips {
@@ -85,6 +124,22 @@ struct pwm_fan_ctx {
 	bool last_temp_valid;
 	bool mode_control_supported;
 	bool manual_mode;	/* when true, thermal notifier does not override pwm1 */
+
+	/* Reference to the base 11-step cooling levels (0%,10%,...,100%).
+	 * Used for thermal cooling device state reporting when the user
+	 * configurable fan curve is enabled.
+	 */
+	unsigned int *base_pwm_fan_cooling_levels;
+	unsigned int base_pwm_fan_max_state;
+
+	/* User-space configurable fan curve.  When enabled, thermal control
+	 * interpolates between these points and maps the resulting percent
+	 * directly to a PWM value (0-255).
+	 */
+	struct pwm_fan_curve_point user_curve[FAN_CURVE_MAX_POINTS];
+	int user_curve_count;
+	bool user_curve_enabled;
+	unsigned int user_curve_prev_mode;
 };
 
 /* This handler assumes self resetting edge triggered interrupt. */
@@ -306,13 +361,158 @@ static DEVICE_ATTR_RW(fan_mode_name);
 static ssize_t fan_mode_names_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%s %s %s\n",
-		       pwm_fan_mode_names[PWM_FAN_MODE_SILENT],
-		       pwm_fan_mode_names[PWM_FAN_MODE_NORMAL],
-		       pwm_fan_mode_names[PWM_FAN_MODE_TURBO]);
+	int i;
+	ssize_t len = 0;
+
+	for (i = 0; i < PWM_FAN_PROFILE_COUNT; i++) {
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s%s",
+				 pwm_fan_mode_names[i],
+				 (i + 1 < PWM_FAN_PROFILE_COUNT) ? " " : "");
+	}
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+
+	return len;
 }
 
 static DEVICE_ATTR_RO(fan_mode_names);
+
+static int pwm_fan_parse_curve(struct pwm_fan_ctx *ctx, const char *buf)
+{
+	struct pwm_fan_curve_point tmp[FAN_CURVE_MAX_POINTS];
+	const char *p = buf;
+	int count = 0;
+
+	while (*p) {
+		int temp, percent;
+		int consumed;
+
+		/* Skip whitespace and commas */
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',')
+			p++;
+		if (!*p)
+			break;
+
+		if (sscanf(p, "%d:%d%n", &temp, &percent, &consumed) != 2)
+			return -EINVAL;
+		p += consumed;
+
+		if (temp < 0 || temp > 125000)
+			return -EINVAL;
+		if (percent < 0 || percent > 100)
+			return -EINVAL;
+
+		if (count >= FAN_CURVE_MAX_POINTS)
+			return -EINVAL;
+
+		if (count > 0 && temp <= tmp[count - 1].temp)
+			return -EINVAL;
+
+		tmp[count].temp = temp;
+		tmp[count].percent = percent;
+		count++;
+	}
+
+	if (count < 2)
+		return -EINVAL;
+
+	memcpy(ctx->user_curve, tmp, sizeof(tmp[0]) * count);
+	ctx->user_curve_count = count;
+	return 0;
+}
+
+static ssize_t fan_curve_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < ctx->user_curve_count; i++) {
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%d:%d%s",
+				 ctx->user_curve[i].temp,
+				 ctx->user_curve[i].percent,
+				 (i + 1 < ctx->user_curve_count) ? " " : "\n");
+	}
+
+	return len;
+}
+
+static ssize_t fan_curve_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+	int ret;
+
+	if (!ctx->mode_control_supported)
+		return -EOPNOTSUPP;
+
+	ret = pwm_fan_parse_curve(ctx, buf);
+	if (ret)
+		return ret;
+
+	/* Re-apply immediately if we have a recent temperature */
+	if (ctx->user_curve_enabled && ctx->thermal_notifier_is_ok &&
+	    ctx->last_temp_valid && !ctx->manual_mode) {
+		ret = pwm_fan_apply_temp(ctx, ctx->last_temp);
+		if (ret)
+			return ret;
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fan_curve);
+
+static ssize_t fan_curve_enable_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%u\n", ctx->user_curve_enabled ? 1 : 0);
+}
+
+static ssize_t fan_curve_enable_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+	unsigned long val;
+	int ret;
+
+	if (!ctx->mode_control_supported)
+		return -EOPNOTSUPP;
+
+	if (kstrtoul(buf, 10, &val) || val > 1)
+		return -EINVAL;
+
+	if (val) {
+		if (ctx->user_curve_count < 2)
+			return -EINVAL;
+		if (!ctx->base_pwm_fan_cooling_levels)
+			return -EINVAL;
+		ctx->user_curve_prev_mode = ctx->mode;
+		ctx->user_curve_enabled = true;
+		ctx->pwm_fan_cooling_levels = ctx->base_pwm_fan_cooling_levels;
+		ctx->pwm_fan_max_state = ctx->base_pwm_fan_max_state;
+	} else {
+		ctx->user_curve_enabled = false;
+		ret = pwm_fan_switch_mode(ctx, ctx->user_curve_prev_mode, true);
+		if (ret)
+			return ret;
+	}
+
+	if (ctx->thermal_notifier_is_ok && ctx->last_temp_valid &&
+	    !ctx->manual_mode) {
+		ret = pwm_fan_apply_temp(ctx, ctx->last_temp);
+		if (ret)
+			return ret;
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fan_curve_enable);
 
 static SENSOR_DEVICE_ATTR_RW(pwm1, pwm, 0);
 static SENSOR_DEVICE_ATTR_RO(fan1_input, rpm, 0);
@@ -324,6 +524,8 @@ static struct attribute *pwm_fan_attrs[] = {
 	&dev_attr_fan_mode.attr,
 	&dev_attr_fan_mode_name.attr,
 	&dev_attr_fan_mode_names.attr,
+	&dev_attr_fan_curve.attr,
+	&dev_attr_fan_curve_enable.attr,
 	NULL,
 };
 
@@ -341,7 +543,9 @@ static umode_t pwm_fan_attrs_visible(struct kobject *kobj, struct attribute *a,
 
 	if ((a == &dev_attr_fan_mode.attr ||
 	     a == &dev_attr_fan_mode_name.attr ||
-	     a == &dev_attr_fan_mode_names.attr) &&
+	     a == &dev_attr_fan_mode_names.attr ||
+	     a == &dev_attr_fan_curve.attr ||
+	     a == &dev_attr_fan_curve_enable.attr) &&
 	    !ctx->mode_control_supported)
 		return 0;
 
@@ -466,8 +670,14 @@ static int pwm_fan_of_get_cooling_data(struct device *dev,
 					 &ctx->pwm_fan_max_state);
 	if (ret == -ENOENT)
 		return 0;
+	if (ret)
+		return ret;
 
-	return ret;
+	/* Preserve the base 11-step cooling levels for the user curve. */
+	ctx->base_pwm_fan_cooling_levels = ctx->pwm_fan_cooling_levels;
+	ctx->base_pwm_fan_max_state = ctx->pwm_fan_max_state;
+
+	return 0;
 }
 
 static void pwm_fan_regulator_disable(void *data)
@@ -617,6 +827,47 @@ static int pwm_fan_init_profiles(struct device *dev, struct pwm_fan_ctx *ctx)
 	return 0;
 }
 
+static int pwm_fan_curve_to_pwm(struct pwm_fan_ctx *ctx, int temp)
+{
+	struct pwm_fan_curve_point *curve = ctx->user_curve;
+	int n = ctx->user_curve_count;
+	int i, percent = 0;
+
+	if (n < 2)
+		return ctx->pwm_value;
+
+	if (temp <= curve[0].temp) {
+		percent = curve[0].percent;
+	} else if (temp >= curve[n - 1].temp) {
+		percent = curve[n - 1].percent;
+	} else {
+		for (i = 1; i < n; i++) {
+			if (temp <= curve[i].temp) {
+				int t0 = curve[i - 1].temp;
+				int t1 = curve[i].temp;
+				int p0 = curve[i - 1].percent;
+				int p1 = curve[i].percent;
+
+				if (t1 == t0) {
+					percent = p0;
+				} else {
+					percent = p0 + DIV_ROUND_CLOSEST(
+						(p1 - p0) * (temp - t0),
+						(t1 - t0));
+				}
+				break;
+			}
+		}
+	}
+
+	if (percent < 0)
+		percent = 0;
+	if (percent > 100)
+		percent = 100;
+
+	return DIV_ROUND_CLOSEST(percent * MAX_PWM, 100);
+}
+
 static int pwm_fan_temp_to_state(struct pwm_fan_ctx *ctx, int temp)
 {
 	struct thermal_trips *trips = ctx->thermal_trips;
@@ -635,7 +886,18 @@ static int pwm_fan_temp_to_state(struct pwm_fan_ctx *ctx, int temp)
 
 static int pwm_fan_apply_temp(struct pwm_fan_ctx *ctx, int temp)
 {
-	int state, ret;
+	int state, ret, pwm;
+
+	if (ctx->user_curve_enabled && ctx->user_curve_count >= 2) {
+		pwm = pwm_fan_curve_to_pwm(ctx, temp);
+		if (pwm == ctx->pwm_value)
+			return 0;
+		ret = __set_pwm(ctx, pwm);
+		if (ret)
+			return ret;
+		pwm_fan_update_state(ctx, pwm);
+		return 0;
+	}
 
 	state = pwm_fan_temp_to_state(ctx, temp);
 	if (state > ctx->pwm_fan_max_state)
@@ -665,6 +927,7 @@ static int pwm_fan_switch_mode(struct pwm_fan_ctx *ctx, unsigned int mode,
 		return -EINVAL;
 
 	ctx->mode = mode;
+	ctx->user_curve_enabled = false;
 	ctx->pwm_fan_cooling_levels = profile->cooling_levels;
 	ctx->pwm_fan_max_state = profile->max_state;
 	ctx->thermal_trips = profile->thermal_trips;
@@ -810,7 +1073,7 @@ static int pwm_fan_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 
-		ret = pwm_fan_switch_mode(ctx, PWM_FAN_MODE_NORMAL, false);
+		ret = pwm_fan_switch_mode(ctx, PWM_FAN_MODE_COOL_55, false);
 		if (ret)
 			return ret;
 
