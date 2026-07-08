@@ -1073,7 +1073,7 @@ static int pwm_fan_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 
-		ret = pwm_fan_switch_mode(ctx, PWM_FAN_MODE_NORMAL, false);
+		ret = pwm_fan_switch_mode(ctx, PWM_FAN_MODE_COOL_55, false);
 		if (ret)
 			return ret;
 
