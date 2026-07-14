@@ -146,6 +146,7 @@
  */
 #define IMX296_HMAX_DEFAULT			1100U
 #define IMX296_VBLANK_DEFAULT			1162U
+#define IMX296_VBLANK_MIN			37U
 #define IMX296_VBLANK_MAX			(1048575U - IMX296_PIXEL_ARRAY_HEIGHT)
 #define IMX296_EXPOSURE_DEFAULT_LINES		1104U
 #define IMX296_ANALOG_GAIN_MIN			0U
@@ -1185,7 +1186,7 @@ static int imx296_ctrls_init(struct imx296 *sensor)
 
 	sensor->vblank = v4l2_ctrl_new_std(handler, &imx296_ctrl_ops,
 					   V4L2_CID_VBLANK,
-					   IMX296_VBLANK_DEFAULT,
+					   IMX296_VBLANK_MIN,
 					   IMX296_VBLANK_MAX, 1,
 					   IMX296_VBLANK_DEFAULT);
 
