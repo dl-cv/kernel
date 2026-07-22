@@ -243,6 +243,7 @@ struct imx296 {
 	enum imx296_op_mode active_mode;
 	enum imx296_op_mode pending_mode;
 	u32 trigger_pulse_us;
+	u64 trigger_pwm_base_period_ns;
 
 	struct gpio_desc *light_source_gpio;
 	struct pinctrl_state *pins_active_high;
@@ -385,20 +386,26 @@ static struct pwm_device *imx296_devm_pwm_get_optional(struct device *dev,
 	return pwm;
 }
 
-static u64 imx296_pwm_period_ns(struct pwm_device *pwm)
+static u64 imx296_trigger_base_period_ns(struct imx296 *sensor)
 {
-	struct pwm_state state;
 	struct pwm_args args;
 
-	if (!pwm)
-		return 0;
+	/*
+	 * Cache the firmware-provided period once. The runtime PWM state may have
+	 * been enlarged for an earlier long pulse and must never become the base
+	 * for later calculations, otherwise a short pulse cannot restore the
+	 * original trigger rate until reboot.
+	 */
+	if (!sensor->trigger_pwm)
+		return IMX296_TRIGGER_PERIOD_NS_DEFAULT;
+	if (sensor->trigger_pwm_base_period_ns)
+		return sensor->trigger_pwm_base_period_ns;
 
-	pwm_get_state(pwm, &state);
-	if (state.period)
-		return state.period;
+	pwm_get_args(sensor->trigger_pwm, &args);
+	sensor->trigger_pwm_base_period_ns = args.period ?
+		args.period : IMX296_TRIGGER_PERIOD_NS_DEFAULT;
 
-	pwm_get_args(pwm, &args);
-	return args.period;
+	return sensor->trigger_pwm_base_period_ns;
 }
 
 static u64 imx296_trigger_period_ns(u64 pulse_ns, u64 base_period_ns)
@@ -411,22 +418,33 @@ static u64 imx296_trigger_period_ns(u64 pulse_ns, u64 base_period_ns)
 	return max(base_period_ns, min_period_ns);
 }
 
-static int imx296_init_trigger_pwm(struct imx296 *sensor)
+static int imx296_apply_trigger_pwm_idle_locked(struct imx296 *sensor)
 {
-	struct pwm_state state = { 0 };
+	struct pwm_state state;
 	u64 pulse_ns;
 
 	if (!sensor->trigger_pwm)
 		return 0;
 
 	pulse_ns = (u64)sensor->trigger_pulse_us * 1000ULL;
+	pwm_get_state(sensor->trigger_pwm, &state);
 	state.period = imx296_trigger_period_ns(
-		pulse_ns, imx296_pwm_period_ns(sensor->trigger_pwm));
+		pulse_ns, imx296_trigger_base_period_ns(sensor));
 	state.duty_cycle = 0;
 	state.polarity = PWM_POLARITY_INVERSED;
 	state.enabled = false;
 
 	return pwm_apply_state(sensor->trigger_pwm, &state);
+}
+
+static int imx296_init_trigger_pwm(struct imx296 *sensor)
+{
+	if (!sensor->trigger_pwm)
+		return 0;
+
+	imx296_trigger_base_period_ns(sensor);
+
+	return imx296_apply_trigger_pwm_idle_locked(sensor);
 }
 
 static int imx296_light_source_value_locked(struct imx296 *sensor, bool on)
@@ -533,7 +551,7 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 
 	pwm_get_state(sensor->trigger_pwm, &state);
 	state.period = imx296_trigger_period_ns(
-		duty_ns, imx296_pwm_period_ns(sensor->trigger_pwm));
+		duty_ns, imx296_trigger_base_period_ns(sensor));
 	state.duty_cycle = duty_ns;
 	state.polarity = PWM_POLARITY_INVERSED;
 	state.enabled = true;
@@ -780,6 +798,7 @@ static ssize_t trigger_pulse_us_store(struct device *dev,
 {
 	struct imx296 *sensor = imx296_from_dev(dev);
 	unsigned int pulse_us;
+	int ret = 0;
 
 	if (!sensor)
 		return -ENODEV;
@@ -795,13 +814,21 @@ static ssize_t trigger_pulse_us_store(struct device *dev,
 		u32 old_pulse = sensor->trigger_pulse_us;
 
 		sensor->trigger_pulse_us = pulse_us;
+		ret = imx296_apply_trigger_pwm_idle_locked(sensor);
+		if (ret) {
+			sensor->trigger_pulse_us = old_pulse;
+			imx296_apply_trigger_pwm_idle_locked(sensor);
+			goto unlock;
+		}
 		dev_info(dev,
 			 "trigger pulse width set to %u us (was %u)\n",
 			 pulse_us, old_pulse);
 	}
+
+unlock:
 	mutex_unlock(&sensor->mutex);
 
-	return count;
+	return ret ? ret : count;
 }
 
 static DEVICE_ATTR_RW(trigger_pulse_us);
