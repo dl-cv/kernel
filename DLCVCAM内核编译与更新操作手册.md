@@ -20,7 +20,54 @@ which aarch64-linux-gnu-gcc
 
 ## 2. 编译内核
 
-### 2.1 初次配置（仅需执行一次）
+### 2.1 日期构建编号规则
+
+DLCVCAM 发布内核使用仓库根目录的 `DLCVCAM_BUILD_VERSION` 作为构建编号，
+格式固定为：
+
+```text
+YYYYMMDDNN
+```
+
+其中 `YYYYMMDD` 是发布日期，`NN` 是当天两位序号，从 `01` 开始。例如：
+
+```text
+2026072201
+```
+
+合入 `master` 前必须把该文件更新为实际合入日期；同一天发布多个内核时依次使用
+`01`、`02`、`03`。不要通过修改 `VERSION/PATCHLEVEL/SUBLEVEL` 记录发布日期，
+这样可以保持 `uname -r` 和 `/lib/modules/6.1.99-rk3576` 路径稳定。
+
+开发机查看仓库默认构建编号：
+
+```bash
+cat DLCVCAM_BUILD_VERSION
+make -s dlcvcam-build-version
+```
+
+板卡刷入对应内核后查看：
+
+```bash
+uname -v
+cat /proc/version
+```
+
+输出示例：
+
+```text
+#2026072201 SMP Wed Jul 22 10:46:10 CST 2026
+```
+
+正常发布构建不需要再手工传入 `KBUILD_BUILD_VERSION`。CI 或临时构建仍可显式传入
+该变量覆盖仓库值，但交付镜像必须使用 `DLCVCAM_BUILD_VERSION` 中已提交的编号。
+建议镜像文件名同时记录构建编号和 Git 短提交，例如：
+
+```text
+boot-rk3576-6.1.99-2026072201-e8c10e0f.img
+```
+
+### 2.2 初次配置（仅需执行一次）
 
 ```bash
 cd /home/ypw/kernel
@@ -36,7 +83,7 @@ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lubancat_linux_rk3576_defconfig
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 ```
 
-### 2.2 增量编译（日常修改后）
+### 2.3 增量编译（日常修改后）
 
 ```bash
 cd /home/ypw/kernel
@@ -65,6 +112,13 @@ BOOT_ITS=boot.its ./scripts/mkimg --dtb dlcvcam-rk3576.dtb
 
 ```bash
 mkimage -l boot.img
+```
+
+同时确认本次编译使用的日期构建编号：
+
+```bash
+make -s ARCH=arm64 O=/path/to/kernel-out dlcvcam-build-version
+# 2026072201
 ```
 
 ---
