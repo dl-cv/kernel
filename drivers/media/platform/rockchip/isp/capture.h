@@ -35,6 +35,7 @@
 #ifndef _RKISP_PATH_VIDEO_H
 #define _RKISP_PATH_VIDEO_H
 
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 
 #include "common.h"
@@ -302,6 +303,7 @@ struct rkisp_stream {
 	bool is_crop_upd;
 	bool is_using_resmem;
 	bool frame_early;
+	u64 early_done_sof_ns;
 	bool need_scl_upd;
 	bool is_attach_info;
 	wait_queue_head_t done;
@@ -334,6 +336,9 @@ struct rkisp_capture_device {
 	struct tasklet_struct rd_tasklet;
 	atomic_t refcnt;
 	u32 wait_line;
+	u32 early_done_delay_us;
+	struct hrtimer early_done_timer;
+	atomic_t early_done_pending;
 	u32 wrap_width;
 	u32 wrap_line;
 	bool is_done_early;
@@ -348,6 +353,9 @@ extern struct rockit_isp_ops rockit_isp_ops;
 
 void rkisp_stream_vir_cpy_image(struct work_struct *work);
 void rkisp_stream_buf_done_early(struct rkisp_device *dev);
+void rkisp_stream_buf_done_early_delayed(struct rkisp_device *dev,
+					 u32 delay_us);
+void rkisp_stream_cancel_early_done(struct rkisp_device *dev);
 void rkisp_stream_buf_done(struct rkisp_stream *stream,
 			   struct rkisp_buffer *buf);
 void rkisp_unregister_stream_vdev(struct rkisp_stream *stream);

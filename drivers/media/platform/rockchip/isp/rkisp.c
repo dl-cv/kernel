@@ -56,6 +56,18 @@
 #define ISP_V4L2_EVENT_ELEMS 4
 
 #define ISP_SUBDEV_NAME DRIVER_NAME "-isp-subdev"
+
+#ifndef V4L2_CID_USER_IMX296_BASE
+#define V4L2_CID_USER_IMX296_BASE	(V4L2_CID_USER_BASE + 0x10d0)
+#endif
+#define V4L2_CID_IMX296_OP_MODE		(V4L2_CID_USER_IMX296_BASE + 0x1)
+#define IMX296_XTRIG_ONE_SHOT		1
+#define ISP39_OUT_LINE_COUNTER_TAIL	8
+
+static unsigned int rkisp_imx296_tail_wait_us = 50000;
+module_param_named(imx296_tail_wait_us, rkisp_imx296_tail_wait_us, uint, 0644);
+MODULE_PARM_DESC(imx296_tail_wait_us,
+		 "V39 IMX296 fast-trigger tail DMA hrtimer delay before buffer done (us)");
 /*
  * NOTE: MIPI controller and input MUX are also configured in this file,
  * because ISP Subdev is not only describe ISP submodule(input size,format, output size, format),
@@ -88,6 +100,36 @@
 static void rkisp_config_cmsk(struct rkisp_device *dev);
 static void rkisp_config_aiisp(struct rkisp_device *dev);
 static void rkisp_config_fpn(struct rkisp_device *dev);
+
+#if IS_REACHABLE(CONFIG_VIDEO_IMX296)
+extern bool imx296_is_fast_trigger_active(void);
+#endif
+
+static bool rkisp_imx296_fast_trigger_active(struct rkisp_device *dev)
+{
+	struct v4l2_subdev *sensor;
+	struct v4l2_ctrl *mode;
+
+	/* Direct sensor-to-ISP topologies can read the control normally. */
+	if (dev->active_sensor && dev->active_sensor->sd) {
+		sensor = dev->active_sensor->sd;
+		mode = v4l2_ctrl_find(sensor->ctrl_handler,
+				      V4L2_CID_IMX296_OP_MODE);
+		if (mode)
+			return v4l2_ctrl_g_ctrl(mode) == IMX296_XTRIG_ONE_SHOT;
+	}
+
+	/*
+	 * RK3576 routes IMX296 -> RKCIF -> RKISP across two media devices.
+	 * RKISP therefore sees the CIF bridge as active_sensor and cannot walk
+	 * to the IMX296 control handler.  Use the sensor's read-only mode bridge.
+	 */
+#if IS_REACHABLE(CONFIG_VIDEO_IMX296)
+	return imx296_is_fast_trigger_active();
+#else
+	return false;
+#endif
+}
 
 static inline struct rkisp_device *sd_to_isp_dev(struct v4l2_subdev *sd)
 {
@@ -2218,6 +2260,7 @@ static int rkisp_isp_stop(struct rkisp_device *dev)
 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
 		 "%s refcnt:%d\n", __func__,
 		 atomic_read(&hw->refcnt));
+	rkisp_stream_cancel_early_done(dev);
 
 	if (atomic_read(&hw->refcnt) > 1)
 		goto end;
@@ -2346,11 +2389,38 @@ end:
 static int rkisp_isp_start(struct rkisp_device *dev)
 {
 	struct rkisp_hw_dev *hw = dev->hw_dev;
+	u32 height = dev->isp_sdev.out_crop.height;
 	u32 val;
 
 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
 		 "%s refcnt:%d link_num:%d\n", __func__,
 		 atomic_read(&hw->refcnt), hw->dev_link_num);
+
+	/*
+	 * IMX296 Fast Trigger keeps the MIPI frame open until the next XTRIG.
+	 * Complete the current ISP buffer at the last observable V39 output line
+	 * so a trigger publishes its own frame instead of N-1.  The V39 output
+	 * line counter stops eight counts below the active height (for example,
+	 * 1080 for a 1088-line frame), so height - 1 can never assert the line
+	 * interrupt. Program one count before that terminal value, then keep the
+	 * buffer owned by the ISP for a short tail-DMA drain interval before
+	 * vb2_done. Free-run and other sensors retain the configured/default
+	 * wait_line behavior and have no added delay.
+	 */
+	dev->cap_dev.early_done_delay_us = 0;
+	rkisp_stream_cancel_early_done(dev);
+	if (dev->isp_ver == ISP_V39 && height > 1 &&
+	    rkisp_imx296_fast_trigger_active(dev)) {
+		dev->cap_dev.wait_line =
+			height > ISP39_OUT_LINE_COUNTER_TAIL + 1 ?
+			height - ISP39_OUT_LINE_COUNTER_TAIL - 1 : 1;
+		dev->cap_dev.early_done_delay_us =
+			min_t(u32, rkisp_imx296_tail_wait_us, 100000U);
+		v4l2_info(&dev->v4l2_dev,
+			  "IMX296 fast trigger: early buffer done at line %u/%u, tail wait %u us\n",
+			  dev->cap_dev.wait_line, height,
+			  dev->cap_dev.early_done_delay_us);
+	}
 
 	dev->cap_dev.is_done_early = false;
 	if (dev->cap_dev.wait_line >= dev->isp_sdev.out_crop.height)
@@ -3858,7 +3928,15 @@ static void rkisp_queue_event_aiisp(struct rkisp_device *dev, u32 irq)
 			rd_line += dev->aiisp_cfg.rd_linecnt;
 			if (rd_line > h)
 				rd_line = h - 1;
-			rkisp_write(dev, ISP32_ISP_IRQ_CFG0, rd_line, true);
+			/*
+			 * IRQ_CFG0 low 16 bits belong to AIISP's quarter-line
+			 * interrupt; high 16 bits belong to capture early-done.
+			 * Preserve the IMX296 Fast Trigger threshold when AIISP
+			 * advances its read line at runtime.
+			 */
+			rkisp_write(dev, ISP32_ISP_IRQ_CFG0,
+				    (rd_line & 0xffff) |
+				    (dev->cap_dev.wait_line << 16), true);
 		}
 	} else {
 		wr_line = ISP39_AIISP_WR_LINECNT(val);
@@ -3901,7 +3979,8 @@ static void rkisp_config_aiisp(struct rkisp_device *dev)
 	irq_mask = ISP39_AIISP_LINECNT_DONE | ISP3X_OUT_FRM_QUARTER;
 	en_mask = ISP39_AIISP_EN;
 
-	rd_line = dev->aiisp_cfg.rd_linecnt;
+	rd_line = (dev->aiisp_cfg.rd_linecnt & 0xffff) |
+		  (dev->cap_dev.wait_line << 16);
 	wr_line = dev->aiisp_cfg.wr_linecnt << 16;
 
 	rkisp_write(dev, ISP32_ISP_IRQ_CFG0, rd_line, false);
@@ -5087,7 +5166,14 @@ vs_skip:
 	if (isp_mis & ISP3X_OUT_FRM_HALF) {
 		writel(ISP3X_OUT_FRM_HALF, base + CIF_ISP_ICR);
 		rkisp_dvbm_event(dev, ISP3X_OUT_FRM_HALF);
-		rkisp_stream_buf_done_early(dev);
+		/*
+		 * V39 exposes the last usable line interrupt before all tail lines
+		 * have reached memory. Arm a high-resolution timer and keep ownership
+		 * until those writes drain; doing vb2_done immediately can expose
+		 * green/stale bottom rows to userspace. The timer avoids a long udelay
+		 * in this hard-IRQ handler.
+		 */
+		rkisp_stream_buf_done_early_delayed(dev, dev->cap_dev.early_done_delay_us);
 	}
 	if (isp_mis & ISP3X_OUT_FRM_END) {
 		writel(ISP3X_OUT_FRM_END, base + CIF_ISP_ICR);
@@ -5112,4 +5198,3 @@ irqreturn_t rkisp_vs_isr_handler(int irq, void *ctx)
 
 	return IRQ_HANDLED;
 }
-

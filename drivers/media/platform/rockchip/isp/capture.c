@@ -600,6 +600,50 @@ void rkisp_stream_buf_done_early(struct rkisp_device *dev)
 	}
 }
 
+static enum hrtimer_restart rkisp_early_done_timer(struct hrtimer *timer)
+{
+	struct rkisp_capture_device *cap_dev =
+		container_of(timer, struct rkisp_capture_device, early_done_timer);
+
+	rkisp_stream_buf_done_early(cap_dev->ispdev);
+	atomic_set(&cap_dev->early_done_pending, 0);
+	return HRTIMER_NORESTART;
+}
+
+void rkisp_stream_buf_done_early_delayed(struct rkisp_device *dev,
+					 u32 delay_us)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+
+	if (!delay_us) {
+		rkisp_stream_buf_done_early(dev);
+		return;
+	}
+
+	/* One line IRQ is expected per SOF. Do not move an already armed deadline. */
+	if (atomic_cmpxchg(&cap_dev->early_done_pending, 0, 1))
+		return;
+
+	hrtimer_start(&cap_dev->early_done_timer,
+		      ns_to_ktime((u64)delay_us * NSEC_PER_USEC),
+		      HRTIMER_MODE_REL);
+}
+
+void rkisp_stream_cancel_early_done(struct rkisp_device *dev)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+	int ret;
+
+	if (in_interrupt()) {
+		ret = hrtimer_try_to_cancel(&cap_dev->early_done_timer);
+		if (ret < 0)
+			return;
+	} else {
+		hrtimer_cancel(&cap_dev->early_done_timer);
+	}
+	atomic_set(&cap_dev->early_done_pending, 0);
+}
+
 int rkisp_stream_buf_cnt(struct rkisp_stream *stream)
 {
 	unsigned long lock_flags = 0;
@@ -1911,6 +1955,10 @@ int rkisp_register_stream_vdevs(struct rkisp_device *dev)
 	memset(cap_dev, 0, sizeof(*cap_dev));
 	cap_dev->ispdev = dev;
 	atomic_set(&cap_dev->refcnt, 0);
+	atomic_set(&cap_dev->early_done_pending, 0);
+	hrtimer_init(&cap_dev->early_done_timer, CLOCK_MONOTONIC,
+		     HRTIMER_MODE_REL);
+	cap_dev->early_done_timer.function = rkisp_early_done_timer;
 
 	if (dev->isp_ver <= ISP_V13) {
 		if (dev->isp_ver == ISP_V12) {
@@ -1962,6 +2010,8 @@ int rkisp_register_stream_vdevs(struct rkisp_device *dev)
 
 void rkisp_unregister_stream_vdevs(struct rkisp_device *dev)
 {
+	rkisp_stream_cancel_early_done(dev);
+
 	if (dev->isp_ver <= ISP_V13)
 		rkisp_unregister_stream_v1x(dev);
 	else if (dev->isp_ver == ISP_V20)

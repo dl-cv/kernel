@@ -1039,6 +1039,7 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 	struct capture_fmt *isp_fmt = &stream->out_isp_fmt;
 	unsigned long lock_flags = 0;
 	struct rkisp_buffer *buf = NULL;
+	u64 sof_ns = dev->isp_sdev.frm_timestamp;
 	u32 i, seq;
 
 	if (stream->id == RKISP_STREAM_VIR)
@@ -1050,12 +1051,26 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		if (stream->id == RKISP_STREAM_MP && dev->cap_dev.wrap_line)
 			return 0;
 		spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+		/*
+		 * wait_line can fire very close to the normal MI frame interrupt.
+		 * If IRQ wins first, FRAME_WORK must not consume the next buffer;
+		 * if FRAME_WORK wins first, IRQ must only advance the queue.  The
+		 * SOF timestamp uniquely identifies both callbacks as one frame.
+		 */
+		if (sof_ns && stream->early_done_sof_ns == sof_ns) {
+			spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+			if (state == FRAME_IRQ)
+				goto end;
+			return 0;
+		}
 		if (state == FRAME_IRQ && stream->curr_buf)
 			stream->frame_early = false;
 		else
 			stream->frame_early = true;
 		buf = stream->curr_buf;
 		stream->curr_buf = NULL;
+		if (buf && sof_ns)
+			stream->early_done_sof_ns = sof_ns;
 		spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
 		if ((!stream->frame_early && state == FRAME_WORK) ||
 		    (stream->frame_early && state == FRAME_IRQ))
@@ -1126,7 +1141,6 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		stream->dbg.delay = ns - dev->isp_sdev.frm_timestamp;
 		stream->dbg.timestamp = ns;
 		stream->dbg.id = seq;
-
 		if (vir->streaming && vir->conn_id == stream->id) {
 			spin_lock_irqsave(&vir->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &dev->cap_dev.vir_cpy.queue);
@@ -1490,6 +1504,7 @@ rkisp_start_streaming(struct vb2_queue *queue, unsigned int count)
 	}
 
 	memset(&stream->dbg, 0, sizeof(stream->dbg));
+	stream->early_done_sof_ns = 0;
 
 	atomic_inc(&dev->cap_dev.refcnt);
 	if (!dev->isp_inp || !stream->linked) {
