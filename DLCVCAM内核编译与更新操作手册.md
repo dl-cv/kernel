@@ -212,11 +212,13 @@ python3 scripts/dlcvcam_verify_bootimg.py gen-sidecar boot-rk3576-....img
 | 硬挂复位 | Admin `10-dlcvcam-watchdog.conf`（`RuntimeWatchdogSec`） |
 | 升级前 seed recovery / 只写 boot | Admin 内核升级逻辑 |
 
+板端完整说明（sync / boot-try / confirm / 看门狗 / 检查表）：CamOS `docs/admin/DLCVCAM内核防砖与金镜像维护.md`。
+
 **原则（产品路径）：**
 
 - 日常升级**只写 boot**；recovery 为金镜像，稳定后才手工提升。  
 - 不使用完整 userspace bootguard 状态机。  
-- 板端安装与操作以 Admin / u-boot `tools/dlcvcam/README.md` 为准。
+- 板端安装与操作以 Admin 上述文档及 u-boot `tools/dlcvcam/README.md` 为准。
 
 ---
 
