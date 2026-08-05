@@ -8,6 +8,9 @@ Verifies:
   2) FIT/FDT structure parse
   3) Embedded per-image hash nodes (fdt / kernel / resource, ...)
 
+Delivery sidecar is only:
+  <img>.sha256   whole-file SHA-256 (sha256sum format)
+
 Exit codes:
   0  OK
   1  verification failed
@@ -18,8 +21,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
-import os
 import struct
 import sys
 from pathlib import Path
@@ -242,13 +245,9 @@ def resolve_image_blob(data: bytes, img: Dict[str, Any], fdt_totalsize_hint: int
 
     off = img.get("data_offset")
     if off is not None:
-        # external data: offset relative to end of FIT header (aligned external area)
-        # U-Boot -E external data: payload starts after FIT totalsize, often aligned.
-        # data-offset is relative to the external data base (right after FIT).
-        base = fdt_totalsize_hint
-        # mkimage -E -p 0x800: external data base is max(totalsize aligned, -p alignment)
-        # For our images, data-position is absolute; data-offset path kept for completeness.
-        pos2 = base + off
+        # external data: offset relative to end of FIT header (aligned external area).
+        # Our images use absolute data-position; data-offset kept as fallback only.
+        pos2 = fdt_totalsize_hint + off
         end = pos2 + size
         if end > len(data):
             raise VerifyError(
@@ -328,7 +327,7 @@ def verify_fit_hashes(data: bytes) -> Tuple[bool, List[str], List[Dict[str, Any]
                     continue
             actual = factory(blob).digest()
             hinfo["actual"] = actual.hex()
-            ok = hmac_compare(actual, val)
+            ok = hmac.compare_digest(actual, val)
             hinfo["ok"] = ok
             if ok:
                 messages.append(
@@ -347,15 +346,6 @@ def verify_fit_hashes(data: bytes) -> Tuple[bool, List[str], List[Dict[str, Any]
     return all_ok, messages, details
 
 
-def hmac_compare(a: bytes, b: bytes) -> bool:
-    if len(a) != len(b):
-        return False
-    diff = 0
-    for x, y in zip(a, b):
-        diff |= x ^ y
-    return diff == 0
-
-
 def load_expect_sha256(img: Path, explicit: Optional[str], sidecar: Optional[Path]) -> Optional[str]:
     if explicit:
         v = explicit.strip().lower()
@@ -365,44 +355,12 @@ def load_expect_sha256(img: Path, explicit: Optional[str], sidecar: Optional[Pat
     candidates: List[Path] = []
     if sidecar:
         candidates.append(sidecar)
+    # Preferred: <name>.img.sha256
     candidates.append(Path(str(img) + ".sha256"))
-    candidates.append(img.with_suffix(img.suffix + ".sha256"))
-    # also boot-xxx.img.sha256 already covered; try stem.sha256
-    candidates.append(img.with_suffix(".sha256"))
     for c in candidates:
         if c.is_file():
             return parse_sha256_sidecar(c.read_text(encoding="utf-8", errors="replace"))
     return None
-
-
-def write_manifest(img: Path, file_sha: str, fit_details: List[Dict[str, Any]], meta: Dict[str, Any]) -> Path:
-    out = Path(str(img) + ".dlcvcam.json")
-    doc = {
-        "format": "dlcvcam-bootimg-manifest-v1",
-        "file": img.name,
-        "size": img.stat().st_size,
-        "sha256": file_sha,
-        "fit_images": [
-            {
-                "name": d.get("name"),
-                "type": d.get("type"),
-                "data_size": d.get("data_size"),
-                "data_position": d.get("data_position"),
-                "hashes": [
-                    {
-                        "node": h.get("node"),
-                        "algo": h.get("algo"),
-                        "sha": h.get("expected") or h.get("actual"),
-                    }
-                    for h in d.get("hashes", [])
-                ],
-            }
-            for d in fit_details
-        ],
-        "meta": meta,
-    }
-    out.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return out
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -426,7 +384,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     # whole-file hash
     try:
-        expect = load_expect_sha256(img, args.expect_sha256, Path(args.sha256_file) if args.sha256_file else None)
+        expect = load_expect_sha256(
+            img, args.expect_sha256, Path(args.sha256_file) if args.sha256_file else None
+        )
     except VerifyError as ex:
         eprint(f"[ERR] {ex}")
         return 2
@@ -437,11 +397,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
             return 1
         print("whole-file: (no sidecar / --expect-sha256, skip)")
     else:
-        if hmac_compare(bytes.fromhex(expect), bytes.fromhex(file_sha)):
-            print(f"[OK]   whole-file sha256 matches")
+        if hmac.compare_digest(bytes.fromhex(expect), bytes.fromhex(file_sha)):
+            print("[OK]   whole-file sha256 matches")
         else:
             failed = True
-            print(f"[FAIL] whole-file sha256 mismatch")
+            print("[FAIL] whole-file sha256 mismatch")
             print(f"       expect {expect}")
             print(f"       actual {file_sha}")
 
@@ -484,32 +444,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_gen_sidecar(args: argparse.Namespace) -> int:
+    """Write whole-file <img>.sha256 only (no JSON manifest)."""
     img = Path(args.image)
     if not img.is_file():
         eprint(f"文件不存在: {img}")
         return 2
-    data = img.read_bytes()
-    file_sha = hashlib.sha256(data).hexdigest()
 
+    file_sha = sha256_file(img)
     sha_path = Path(args.sha256_file) if args.sha256_file else Path(str(img) + ".sha256")
     sha_path.write_text(f"{file_sha}  {img.name}\n", encoding="utf-8")
 
-    fit_details: List[Dict[str, Any]] = []
-    try:
-        _ok, _msgs, fit_details = verify_fit_hashes(data)
-    except VerifyError as ex:
-        eprint(f"警告: FIT 解析失败，仍写入整包 sha256: {ex}")
-
-    meta = {
-        "build_version": args.build_version or "",
-        "git": args.git or "",
-        "kernelrelease": args.kernelrelease or "",
-        "generated_by": "scripts/dlcvcam_verify_bootimg.py",
-    }
-    man_path = write_manifest(img, file_sha, fit_details, meta)
-
     print(f"wrote {sha_path}")
-    print(f"wrote {man_path}")
     print(f"sha256 {file_sha}")
     return 0
 
@@ -522,16 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("image", help="boot.img / boot-rk3576-*.img 路径")
     v.add_argument("--expect-sha256", help="期望的整包 sha256 hex")
     v.add_argument("--sha256-file", help="整包 sha256 sidecar 路径")
-    v.add_argument("--require-sidecar", action="store_true", help="必须存在整包 sha256")
-    v.add_argument("--json-out", help="把详细结果写到 JSON")
+    v.add_argument("--require-sidecar", action="store_true", help="必须存在整包 .sha256")
+    v.add_argument("--json-out", help="把详细校验结果写到 JSON（调试用，非交付物）")
     v.set_defaults(func=cmd_verify)
 
-    g = sub.add_parser("gen-sidecar", help="为 boot.img 生成 .sha256 与 .dlcvcam.json")
+    g = sub.add_parser("gen-sidecar", help="为 boot.img 生成 .sha256（整包 hash）")
     g.add_argument("image", help="boot.img 路径")
-    g.add_argument("--sha256-file", help="输出 .sha256 路径")
-    g.add_argument("--build-version", default="")
-    g.add_argument("--git", default="")
-    g.add_argument("--kernelrelease", default="")
+    g.add_argument("--sha256-file", help="输出 .sha256 路径（默认 <image>.sha256）")
     g.set_defaults(func=cmd_gen_sidecar)
 
     return p

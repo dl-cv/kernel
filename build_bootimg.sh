@@ -3,9 +3,8 @@
 # - 自动判断初次配置 / 增量编译
 # - 若 DLCVCAM_BUILD_VERSION 对应提交与当前 HEAD 不同，则按当天日期自动 bump
 # - 产出带构建编号与短提交的 boot 镜像：boot-rk3576-6.1.99-YYYYMMDDNN-<gitsha>.img
-# - 同时生成完整性 sidecar（不使用签名）：
-#     <img>.sha256          整包 SHA-256
-#     <img>.dlcvcam.json    整包哈希 + FIT 内嵌分量哈希清单
+# - 同时生成整包完整性 sidecar（不使用签名，仅 .sha256）：
+#     <img>.sha256          整包 SHA-256（防传错包/截断；FIT 内嵌 hash 另由 verify 检查）
 #   板端烧录前：python3 scripts/dlcvcam_verify_bootimg.py verify <img> --require-sidecar
 #
 # 用法:
@@ -194,6 +193,7 @@ is_worktree_dirty_except_build_version() {
 			boot.img|resource.img|zboot.img|out|out/*) continue ;;
 			boot.img.sha256|boot.img.dlcvcam.json) continue ;;
 			boot-rk3576-*.img|boot-rk3576-*.img.sha256|boot-rk3576-*.img.dlcvcam.json) continue ;;
+			# legacy *.dlcvcam.json ignored if leftover from older builds
 			arch/arm64/boot/Image|arch/arm64/boot/Image.lz4) continue ;;
 			.config|.config.old) continue ;;
 			bad_packages|bad_packages/*) continue ;;
@@ -203,31 +203,28 @@ is_worktree_dirty_except_build_version() {
 	return 1
 }
 
-write_bootimg_integrity_sidecars() {
-	# 生成整包 sha256 + JSON 清单；板端烧录前用 scripts/dlcvcam_verify_bootimg.py 校验
-	# 不使用签名，仅防传输损坏 / 误传 / 非密码学意义上的篡改发现
+write_bootimg_sha256_sidecar() {
+	# 只生成整包 .sha256；板端烧录前用 scripts/dlcvcam_verify_bootimg.py 做
+	# 整包 SHA + FIT 内嵌 hash（无签名）
 	local img="$1"
-	local build_id="$2"
-	local kernelrelease="$3"
-	local git_desc="$4"
 	local verify_py="${SCRIPT_DIR}/scripts/dlcvcam_verify_bootimg.py"
 
-	[[ -f "${img}" ]] || die "write_bootimg_integrity_sidecars: 缺少 ${img}"
+	[[ -f "${img}" ]] || die "write_bootimg_sha256_sidecar: 缺少 ${img}"
+
+	# 清理旧版 JSON 清单（若存在），避免误当交付物
+	rm -f "${img}.dlcvcam.json"
 
 	if [[ -f "${verify_py}" ]] && command -v python3 >/dev/null 2>&1; then
 		python3 "${verify_py}" gen-sidecar "${img}" \
-			--build-version "${build_id}" \
-			--kernelrelease "${kernelrelease:-}" \
-			--git "${git_desc}" \
-			|| die "生成完整性 sidecar 失败: ${img}"
+			|| die "生成 .sha256 失败: ${img}"
 		# 自检：刚生成的包必须能通过 FIT 内嵌 hash + 整包 sha256
 		python3 "${verify_py}" verify "${img}" --require-sidecar \
 			|| die "打包后自检失败（不应发生）: ${img}"
 		return
 	fi
 
-	# 兜底：无 python 时只写整包 sha256
-	warn "python3 或 scripts/dlcvcam_verify_bootimg.py 不可用，仅写入 ${img}.sha256"
+	# 兜底：无 python 时只写整包 sha256（无法做 FIT 自检）
+	warn "python3 或 scripts/dlcvcam_verify_bootimg.py 不可用，仅写入 ${img}.sha256（跳过 FIT 自检）"
 	need_cmd sha256sum
 	sha256sum "${img}" | awk -v n="$(basename "${img}")" '{print $1 "  " n}' > "${img}.sha256"
 }
@@ -254,9 +251,9 @@ package_named_image() {
 	build_id="$(make -s ARCH="${ARCH}" dlcvcam-build-version 2>/dev/null || echo "${build_ver}")"
 	git_desc="$(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 
-	log "生成完整性校验文件（整包 sha256 + FIT 清单）..."
-	write_bootimg_integrity_sidecars "boot.img" "${build_id}" "${kernelrelease:-}" "${git_desc}"
-	write_bootimg_integrity_sidecars "${out_name}" "${build_id}" "${kernelrelease:-}" "${git_desc}"
+	log "生成整包 .sha256 并自检（FIT 内嵌 hash + 整包 sha256）..."
+	write_bootimg_sha256_sidecar "boot.img"
+	write_bootimg_sha256_sidecar "${out_name}"
 
 	ok "完成"
 	echo
@@ -266,11 +263,10 @@ package_named_image() {
 	echo "  boot.img      : $(ls -lh boot.img | awk '{print $5}')"
 	echo "  交付镜像      : ${out_name}  ($(ls -lh "${out_name}" | awk '{print $5}'))"
 	echo "  整包校验      : ${out_name}.sha256"
-	echo "  清单          : ${out_name}.dlcvcam.json"
 	echo
 	echo "烧录前在板卡上校验（不验签，仅 hash）："
 	echo "  python3 scripts/dlcvcam_verify_bootimg.py verify ${out_name} --require-sidecar"
-	echo "  # 或只验 FIT 内嵌 sha256（无 sidecar 时）："
+	echo "  # 或只验 FIT 内嵌 sha256（无 .sha256 时）："
 	echo "  python3 scripts/dlcvcam_verify_bootimg.py verify ${out_name}"
 	echo
 	echo "下一步：校验通过后再用 RKDevTool / rkdeveloptool 烧录 ${out_name}"

@@ -179,5 +179,5 @@ extboot*
 # DLCVCAM local build / test artifacts (not sources)
 /bad_packages/
 *.img.sha256
-*.img.dlcvcam.json
+*.img.dlcvcam.json   # legacy; no longer generated
 /boot-rk3576-*.img
