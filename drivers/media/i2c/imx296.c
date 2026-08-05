@@ -182,6 +182,12 @@
 
 /* Datasheet: changing ROI geometry produces one invalid output frame. */
 #define IMX296_ROI_INVALID_FRAME_WAIT_US	50000U
+/*
+ * After leaving fast-trigger, one short XTRIG is needed so the sensor closes the
+ * open MIPI frame before free-run stream_on. Without it ISP can latch a green
+ * or half-written buffer on the next free-run frames.
+ */
+#define IMX296_XTRIG_CLOSE_FRAME_WAIT_US	50000U
 
 enum imx296_op_mode {
 	IMX296_FREE_RUN = 0,
@@ -604,6 +610,47 @@ out_light:
 
 	return ret;
 }
+
+/*
+ * Emit one XTRIG without light-source side effects so an open fast-trigger
+ * frame can finish readout. Caller must hold sensor->mutex.
+ */
+static int imx296_dummy_trigger_locked(struct imx296 *sensor, const char *reason)
+{
+	bool saved_light_en;
+	int ret;
+
+	if (!sensor->trigger_pwm) {
+		dev_dbg(sensor->dev,
+			"dummy trigger skipped (no pwm) reason=%s\n", reason);
+		return -ENODEV;
+	}
+
+	if (!sensor->streaming ||
+	    sensor->active_mode != IMX296_XTRIG_ONE_SHOT) {
+		dev_dbg(sensor->dev,
+			"dummy trigger skipped (streaming=%u active=%s) reason=%s\n",
+			sensor->streaming,
+			imx296_op_mode_name(sensor->active_mode), reason);
+		return 0;
+	}
+
+	saved_light_en = sensor->light_source_enabled;
+	sensor->light_source_enabled = false;
+	ret = imx296_trigger_once_locked(sensor);
+	sensor->light_source_enabled = saved_light_en;
+	if (ret) {
+		dev_warn(sensor->dev,
+			 "dummy trigger failed (%d) reason=%s\n", ret, reason);
+		return ret;
+	}
+
+	usleep_range(IMX296_XTRIG_CLOSE_FRAME_WAIT_US,
+		     IMX296_XTRIG_CLOSE_FRAME_WAIT_US + 5000U);
+	dev_dbg(sensor->dev, "dummy trigger done reason=%s\n", reason);
+	return 0;
+}
+
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);
 static int imx296_mode_switch(struct imx296 *sensor,
 			      enum imx296_op_mode new_mode);
@@ -1442,6 +1489,8 @@ static int imx296_apply_mode_regs_locked(struct imx296 *sensor,
 		imx296_write(sensor, IMX296_SYNCSEL,
 			     IMX296_SYNCSEL_NORMAL, &ret);
 		imx296_disable_trigger_outputs_locked(sensor, &ret);
+		/* Free-run uses next-frame gain application. */
+		imx296_write(sensor, IMX296_GAINDLY, IMX296_GAINDLY_1FRAME, &ret);
 		break;
 
 	case IMX296_XTRIG_ONE_SHOT:
@@ -1457,6 +1506,12 @@ static int imx296_apply_mode_regs_locked(struct imx296 *sensor,
 			     IMX296_LOWLAGTRG_FAST, &ret);
 		imx296_write(sensor, IMX296_SYNCSEL, IMX296_SYNCSEL_HIZ, &ret);
 		imx296_disable_trigger_outputs_locked(sensor, &ret);
+		/*
+		 * Fast-trigger gain must take effect on the first XTRIG after a
+		 * control update. setup() already picks 0x08 for pending FT, but
+		 * hot mode_switch does not re-run setup — program it here too.
+		 */
+		imx296_write(sensor, IMX296_GAINDLY, IMX296_GAINDLY_0FRAME, &ret);
 		break;
 
 	default:
@@ -1552,11 +1607,17 @@ static int imx296_quick_stream(struct imx296 *sensor, bool on)
 static int imx296_mode_switch(struct imx296 *sensor,
 			      enum imx296_op_mode new_mode)
 {
+	enum imx296_op_mode old_mode;
 	int ret = 0;
 
 	if (new_mode > IMX296_XTRIG_ONE_SHOT)
 		return -EINVAL;
 
+	/*
+	 * Publish the requested mode to RKISP before the sensor is stopped so
+	 * the next isp_start (CamOS PAUSED->READY->PLAYING) programs the matching
+	 * early-done policy for the target mode.
+	 */
 	atomic_set(&imx296_fast_trigger_mode,
 		   new_mode == IMX296_XTRIG_ONE_SHOT);
 	sensor->pending_mode = new_mode;
@@ -1571,6 +1632,16 @@ static int imx296_mode_switch(struct imx296 *sensor,
 	ret = pm_runtime_resume_and_get(sensor->dev);
 	if (ret < 0)
 		return ret;
+
+	old_mode = sensor->active_mode;
+
+	/*
+	 * Fast-trigger leaves the MIPI frame open until the next XTRIG. Close it
+	 * before STANDBY so CIF/ISP do not keep a half-written buffer that later
+	 * surfaces as a green frame when returning to free-run / monitor.
+	 */
+	if (old_mode == IMX296_XTRIG_ONE_SHOT)
+		imx296_dummy_trigger_locked(sensor, "leave-fast-trigger");
 
 	ret = imx296_stream_off(sensor);
 	if (ret)
@@ -1593,8 +1664,26 @@ static int imx296_mode_switch(struct imx296 *sensor,
 	sensor->active_mode = new_mode;
 	sensor->streaming = true;
 
+	/*
+	 * Datasheet: one invalid frame after ROI geometry change. If the crop
+	 * changed while we were still in FT (or ROI was pending across the
+	 * switch), drain it now that free-run is producing frames again. For a
+	 * switch into FT the free-run path in s_stream already drained it when
+	 * CamOS restarts in free-run first; keep a free-run drain here for the
+	 * hot streaming path used by sysfs without a full STREAMOFF.
+	 */
+	if (sensor->roi_boundary_pending &&
+	    sensor->active_mode == IMX296_FREE_RUN) {
+		usleep_range(IMX296_ROI_INVALID_FRAME_WAIT_US,
+			     IMX296_ROI_INVALID_FRAME_WAIT_US + 5000U);
+		sensor->roi_boundary_pending = false;
+	}
+
 out_pm:
 	if (ret && !sensor->streaming) {
+		/* Roll the mode bridge back so ISP does not keep FT early-done. */
+		atomic_set(&imx296_fast_trigger_mode,
+			   sensor->active_mode == IMX296_XTRIG_ONE_SHOT);
 		pm_runtime_mark_last_busy(sensor->dev);
 		pm_runtime_put_autosuspend(sensor->dev);
 	} else {
@@ -1714,6 +1803,13 @@ static int imx296_s_stream(struct v4l2_subdev *sd, int enable)
 		goto unlock;
 
 	if (!enable) {
+		/*
+		 * Close any open fast-trigger frame before STANDBY so the last
+		 * ISP buffer is not left half-written (green) across STREAMOFF.
+		 */
+		if (sensor->active_mode == IMX296_XTRIG_ONE_SHOT)
+			imx296_dummy_trigger_locked(sensor, "stream-off");
+
 		ret = imx296_stream_off(sensor);
 		imx296_light_source_set_locked(sensor, false);
 		if (!ret) {
@@ -1725,6 +1821,10 @@ static int imx296_s_stream(struct v4l2_subdev *sd, int enable)
 	}
 
 	imx296_update_ctrl_visibility_locked(sensor, sensor->pending_mode);
+
+	/* Keep the RKISP early-done bridge aligned with the mode about to start. */
+	atomic_set(&imx296_fast_trigger_mode,
+		   sensor->pending_mode == IMX296_XTRIG_ONE_SHOT);
 
 	ret = pm_runtime_resume_and_get(sensor->dev);
 	if (ret < 0)
@@ -1757,12 +1857,18 @@ static int imx296_s_stream(struct v4l2_subdev *sd, int enable)
 	 * The datasheet specifies one invalid frame after ROI geometry changes.
 	 * CamOS restarts the sensor in free-run before switching to fast trigger,
 	 * so let that invalid frame drain before userspace can change run mode.
+	 * If stream-on lands directly in fast-trigger (no free-run settle), close
+	 * the invalid frame with a dummy XTRIG instead.
 	 */
-	if (sensor->roi_boundary_pending &&
-	    sensor->active_mode == IMX296_FREE_RUN) {
-		usleep_range(IMX296_ROI_INVALID_FRAME_WAIT_US,
-			     IMX296_ROI_INVALID_FRAME_WAIT_US + 5000U);
-		sensor->roi_boundary_pending = false;
+	if (sensor->roi_boundary_pending) {
+		if (sensor->active_mode == IMX296_FREE_RUN) {
+			usleep_range(IMX296_ROI_INVALID_FRAME_WAIT_US,
+				     IMX296_ROI_INVALID_FRAME_WAIT_US + 5000U);
+			sensor->roi_boundary_pending = false;
+		} else if (sensor->active_mode == IMX296_XTRIG_ONE_SHOT) {
+			imx296_dummy_trigger_locked(sensor, "roi-boundary");
+			sensor->roi_boundary_pending = false;
+		}
 	}
 
 	if (sensor->active_mode == IMX296_FREE_RUN && sensor->light_source_enabled)
@@ -1771,6 +1877,8 @@ static int imx296_s_stream(struct v4l2_subdev *sd, int enable)
 	goto unlock;
 
 err_pm:
+	atomic_set(&imx296_fast_trigger_mode,
+		   sensor->active_mode == IMX296_XTRIG_ONE_SHOT);
 	pm_runtime_put_sync(sensor->dev);
 unlock:
 	mutex_unlock(&sensor->mutex);

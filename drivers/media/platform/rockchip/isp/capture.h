@@ -339,6 +339,8 @@ struct rkisp_capture_device {
 	u32 early_done_delay_us;
 	struct hrtimer early_done_timer;
 	atomic_t early_done_pending;
+	/* SOF ns of the frame for which early_done_timer is armed (0 = none). */
+	u64 early_done_armed_sof_ns;
 	u32 wrap_width;
 	u32 wrap_line;
 	bool is_done_early;

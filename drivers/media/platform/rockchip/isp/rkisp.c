@@ -63,8 +63,17 @@
 #define V4L2_CID_IMX296_OP_MODE		(V4L2_CID_USER_IMX296_BASE + 0x1)
 #define IMX296_XTRIG_ONE_SHOT		1
 #define ISP39_OUT_LINE_COUNTER_TAIL	8
+/*
+ * After the V39 last-usable-line IRQ the remaining ~8 output lines still need
+ * to reach DRAM before vb2_done. At full-width 10-bit / ~74.25 MHz pixel clock
+ * that is well under 1 ms; keep a small safety margin. A multi-frame delay
+ * (e.g. 50 ms) lets the timer fire after the next SOF and green-out the wrong
+ * buffer on free-run↔trigger transitions.
+ */
+#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	2000U
+#define ISP39_IMX296_TAIL_WAIT_US_MAX		10000U
 
-static unsigned int rkisp_imx296_tail_wait_us = 50000;
+static unsigned int rkisp_imx296_tail_wait_us = ISP39_IMX296_TAIL_WAIT_US_DEFAULT;
 module_param_named(imx296_tail_wait_us, rkisp_imx296_tail_wait_us, uint, 0644);
 MODULE_PARM_DESC(imx296_tail_wait_us,
 		 "V39 IMX296 fast-trigger tail DMA hrtimer delay before buffer done (us)");
@@ -2406,16 +2415,22 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 	 * buffer owned by the ISP for a short tail-DMA drain interval before
 	 * vb2_done. Free-run and other sensors retain the configured/default
 	 * wait_line behavior and have no added delay.
+	 *
+	 * Always re-seed wait_line from the module/DT default first: pipeline
+	 * open sets it once, but a previous fast-trigger session must not leave
+	 * is_done_early enabled across a free-run restart.
 	 */
 	dev->cap_dev.early_done_delay_us = 0;
 	rkisp_stream_cancel_early_done(dev);
+	dev->cap_dev.wait_line = rkisp_wait_line;
 	if (dev->isp_ver == ISP_V39 && height > 1 &&
 	    rkisp_imx296_fast_trigger_active(dev)) {
 		dev->cap_dev.wait_line =
 			height > ISP39_OUT_LINE_COUNTER_TAIL + 1 ?
 			height - ISP39_OUT_LINE_COUNTER_TAIL - 1 : 1;
 		dev->cap_dev.early_done_delay_us =
-			min_t(u32, rkisp_imx296_tail_wait_us, 100000U);
+			min_t(u32, rkisp_imx296_tail_wait_us,
+			      ISP39_IMX296_TAIL_WAIT_US_MAX);
 		v4l2_info(&dev->v4l2_dev,
 			  "IMX296 fast trigger: early buffer done at line %u/%u, tail wait %u us\n",
 			  dev->cap_dev.wait_line, height,
@@ -2441,6 +2456,10 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 			rkisp_unite_clear_bits(dev, CIF_ISP_IMSC, ISP2X_LSC_LUT_ERR, false);
 			dev->rawaf_irq_cnt = 0;
 		}
+	} else if (dev->isp_ver >= ISP_V32) {
+		/* Drop a stale OUT_FRM_HALF threshold left by the previous session. */
+		rkisp_write(dev, ISP32_ISP_IRQ_CFG0, 0, false);
+		rkisp_clear_bits(dev, CIF_ISP_IMSC, ISP3X_OUT_FRM_HALF, false);
 	}
 
 	/* Activate ISP */

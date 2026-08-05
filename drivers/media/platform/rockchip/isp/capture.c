@@ -604,8 +604,20 @@ static enum hrtimer_restart rkisp_early_done_timer(struct hrtimer *timer)
 {
 	struct rkisp_capture_device *cap_dev =
 		container_of(timer, struct rkisp_capture_device, early_done_timer);
+	struct rkisp_device *dev = cap_dev->ispdev;
+	u64 armed_sof = READ_ONCE(cap_dev->early_done_armed_sof_ns);
+	u64 cur_sof = dev->isp_sdev.frm_timestamp;
 
-	rkisp_stream_buf_done_early(cap_dev->ispdev);
+	/*
+	 * Only complete the frame that armed this timer. A late timer after the
+	 * next SOF would otherwise vb2_done the following buffer with an empty
+	 * tail (full/bottom green), which is the free-run↔trigger transition
+	 * failure mode observed on V39 + IMX296.
+	 */
+	if (!armed_sof || !cur_sof || armed_sof == cur_sof)
+		rkisp_stream_buf_done_early(dev);
+
+	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, 0);
 	atomic_set(&cap_dev->early_done_pending, 0);
 	return HRTIMER_NORESTART;
 }
@@ -614,6 +626,7 @@ void rkisp_stream_buf_done_early_delayed(struct rkisp_device *dev,
 					 u32 delay_us)
 {
 	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+	u64 sof_ns = dev->isp_sdev.frm_timestamp;
 
 	if (!delay_us) {
 		rkisp_stream_buf_done_early(dev);
@@ -624,6 +637,7 @@ void rkisp_stream_buf_done_early_delayed(struct rkisp_device *dev,
 	if (atomic_cmpxchg(&cap_dev->early_done_pending, 0, 1))
 		return;
 
+	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, sof_ns);
 	hrtimer_start(&cap_dev->early_done_timer,
 		      ns_to_ktime((u64)delay_us * NSEC_PER_USEC),
 		      HRTIMER_MODE_REL);
@@ -641,6 +655,7 @@ void rkisp_stream_cancel_early_done(struct rkisp_device *dev)
 	} else {
 		hrtimer_cancel(&cap_dev->early_done_timer);
 	}
+	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, 0);
 	atomic_set(&cap_dev->early_done_pending, 0);
 }
 
@@ -1956,6 +1971,7 @@ int rkisp_register_stream_vdevs(struct rkisp_device *dev)
 	cap_dev->ispdev = dev;
 	atomic_set(&cap_dev->refcnt, 0);
 	atomic_set(&cap_dev->early_done_pending, 0);
+	cap_dev->early_done_armed_sof_ns = 0;
 	hrtimer_init(&cap_dev->early_done_timer, CLOCK_MONOTONIC,
 		     HRTIMER_MODE_REL);
 	cap_dev->early_done_timer.function = rkisp_early_done_timer;
