@@ -151,20 +151,27 @@ cd /path/to/kernel   # 本仓库
 boot-rk3576-6.1.99-<YYYYMMDDNN>-<git短sha[.dirty]>.img
 ```
 
-5. **完整性 sidecar（无签名）**：为 `boot.img` 与交付镜像各生成：
+5. **完整性 sidecar（无签名，仅整包 hash）**：为 `boot.img` 与交付镜像各生成：
 
 ```text
-<镜像>.sha256         # 整包 SHA-256
-<镜像>.dlcvcam.json   # 整包哈希 + FIT 内嵌分量哈希清单 + 构建元数据
+<镜像>.sha256         # 整包 SHA-256（sha256sum 格式）
 ```
 
-FIT 镜像本身在打包时已写入各 image 的内嵌 `sha256`（见 `boot.its`）。  
-sidecar 用于上传后、烧录前做**损坏/截断/误传**检测；**不能替代签名**。
+交付物就是 **`.img` + `.sha256`**，不再生成 `.dlcvcam.json`。
+
+FIT 镜像本身在打包时已写入各 image 的内嵌 `sha256`（见 `boot.its`）。校验时两层分工：
+
+| 检查 | 依据 | 作用 |
+|------|------|------|
+| 整包 SHA-256 | `<img>.sha256` | 发现下载截断、拷贝损坏、**传错成另一份合法旧包** |
+| FIT 内嵌 hash | boot.img 内 fdt/kernel/resource 的 sha256 节点 | 发现 payload 被改；**不依赖 sidecar** 也能查内容损坏 |
+
+`.sha256` **不能替代签名**，只作运维防呆。
 
 ### 4.3 编译完成后
 
 ```bash
-ls -lh boot.img boot-rk3576-*.img boot-rk3576-*.img.sha256 boot-rk3576-*.img.dlcvcam.json
+ls -lh boot.img boot-rk3576-*.img boot-rk3576-*.img.sha256
 mkimage -l boot.img
 
 # 本地再验一次（打包脚本结束时已自检）
@@ -173,27 +180,25 @@ python3 scripts/dlcvcam_verify_bootimg.py verify boot-rk3576-*.img --require-sid
 
 ### 4.4 板卡上传后、烧录前校验（推荐）
 
-把**镜像 + `.sha256`（建议连同 `.dlcvcam.json` 与校验脚本）**一起拷到板子，例如 `/tmp`：
+把**镜像 + `.sha256`（建议连同校验脚本）**一起拷到板子，例如 `/tmp`：
 
 ```bash
 # 在板卡上（需 python3）
 python3 scripts/dlcvcam_verify_bootimg.py verify /tmp/boot-rk3576-....img \
   --require-sidecar
 # 退出码 0 才允许烧录；非 0 则重新传输，不要 wl/dd
+
+# 无 python 时也可用：
+# sha256sum -c /tmp/boot-rk3576-....img.sha256
 ```
 
-| 检查 | 依据 | 作用 |
-|------|------|------|
-| 整包 SHA-256 | `<img>.sha256` | 发现下载截断、拷贝损坏、传错文件 |
-| FIT 内嵌 hash | boot.img 内 fdt/kernel/resource 的 sha256 节点 | 发现 payload 被改；**不依赖 sidecar** 也能查内容损坏 |
-
-只带了镜像、没有 sidecar 时，仍可只验 FIT 内嵌 hash：
+只带了镜像、没有 `.sha256` 时，仍可只验 FIT 内嵌 hash：
 
 ```bash
 python3 scripts/dlcvcam_verify_bootimg.py verify /tmp/boot-rk3576-....img
 ```
 
-对已有镜像补生成 sidecar（开发机）：
+对已有镜像补生成 `.sha256`（开发机）：
 
 ```bash
 python3 scripts/dlcvcam_verify_bootimg.py gen-sidecar boot-rk3576-....img
