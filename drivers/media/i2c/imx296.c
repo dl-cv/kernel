@@ -1667,16 +1667,27 @@ static int imx296_mode_switch(struct imx296 *sensor,
 	/*
 	 * Datasheet: one invalid frame after ROI geometry change. If the crop
 	 * changed while we were still in FT (or ROI was pending across the
-	 * switch), drain it now that free-run is producing frames again. For a
-	 * switch into FT the free-run path in s_stream already drained it when
-	 * CamOS restarts in free-run first; keep a free-run drain here for the
-	 * hot streaming path used by sysfs without a full STREAMOFF.
+	 * switch), drain it now that free-run is producing frames again.
 	 */
 	if (sensor->roi_boundary_pending &&
 	    sensor->active_mode == IMX296_FREE_RUN) {
 		usleep_range(IMX296_ROI_INVALID_FRAME_WAIT_US,
 			     IMX296_ROI_INVALID_FRAME_WAIT_US + 5000U);
 		sensor->roi_boundary_pending = false;
+	}
+
+	/*
+	 * Entering FT from free-run (typical CamOS ROI→trigger path): the MIPI
+	 * link / ISP pipeline often publishes one half-open or green first frame
+	 * on the first XTRIG even when MI FE completes. Emit a light-free dummy
+	 * pulse so that invalid frame is closed and discarded before userspace
+	 * triggers. ISP skip_frame also drops the first completed buffers.
+	 */
+	if (old_mode != IMX296_XTRIG_ONE_SHOT &&
+	    new_mode == IMX296_XTRIG_ONE_SHOT) {
+		imx296_dummy_trigger_locked(sensor, "enter-fast-trigger");
+		/* Second pulse: first dummy often only closes the free-run tail. */
+		imx296_dummy_trigger_locked(sensor, "enter-fast-trigger-2");
 	}
 
 out_pm:

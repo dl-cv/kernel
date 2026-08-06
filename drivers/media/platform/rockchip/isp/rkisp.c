@@ -64,19 +64,61 @@
 #define IMX296_XTRIG_ONE_SHOT		1
 #define ISP39_OUT_LINE_COUNTER_TAIL	8
 /*
- * After the V39 last-usable-line IRQ the remaining ~8 output lines still need
- * to reach DRAM before vb2_done. At full-width 10-bit / ~74.25 MHz pixel clock
- * that is well under 1 ms; keep a small safety margin. A multi-frame delay
- * (e.g. 50 ms) lets the timer fire after the next SOF and green-out the wrong
- * buffer on free-run↔trigger transitions.
+ * Residual / MI-drain ceiling after wait_line. Completion is driven by MI
+ * plane progress + post-MI hold, not by this delay alone. Keep a generous
+ * ceiling so a slow first FT frame is not cut short; never force vb2_done
+ * on expiry without verified MI (see capture.c).
  */
-#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	2000U
-#define ISP39_IMX296_TAIL_WAIT_US_MAX		10000U
+#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	15000U
+#define ISP39_IMX296_TAIL_WAIT_US_MAX		40000U
+#define ISP39_IMX296_LINE_US_MIN		80U
+#define ISP39_IMX296_LINE_US_MAX		250U
+#define ISP39_IMX296_EARLY_DONE_POLL_US	50U
+#define ISP39_IMX296_POST_MI_US		6000U
+#define ISP39_IMX296_WARMUP_POST_MI_US	16000U
+#define ISP39_IMX296_WARMUP_FRAMES	4U
+/* SOFs that skip early-done (MI FE only) after free-run/ROI->FT. */
+#define ISP39_IMX296_SKIP_EARLY_FRAMES	3U
+/* Drop first completed MP buffers after FT start (invalid / half-open). */
+#define ISP39_IMX296_SKIP_BUF_FRAMES	3U
 
 static unsigned int rkisp_imx296_tail_wait_us = ISP39_IMX296_TAIL_WAIT_US_DEFAULT;
 module_param_named(imx296_tail_wait_us, rkisp_imx296_tail_wait_us, uint, 0644);
 MODULE_PARM_DESC(imx296_tail_wait_us,
-		 "V39 IMX296 fast-trigger tail DMA hrtimer delay before buffer done (us)");
+		 "V39 IMX296 FT MI-drain residual ceiling (us); completion prefers MI offs");
+
+static u32 rkisp_imx296_residual_ceiling_us(u32 width, u32 height,
+					    u32 wait_line)
+{
+	u32 remain, line_us, tail_us, param;
+
+	if (height <= wait_line)
+		remain = ISP39_OUT_LINE_COUNTER_TAIL;
+	else
+		remain = height - wait_line;
+
+	/*
+	 * Rough line time from width (10-bit / ~74.25 MHz class). Clamp so
+	 * small ROI does not under-estimate and huge width does not explode.
+	 */
+	line_us = width / 8;
+	if (line_us < ISP39_IMX296_LINE_US_MIN)
+		line_us = ISP39_IMX296_LINE_US_MIN;
+	if (line_us > ISP39_IMX296_LINE_US_MAX)
+		line_us = ISP39_IMX296_LINE_US_MAX;
+
+	/* Safety ceiling only — completion prefers MI offs. */
+	tail_us = (remain + ISP39_OUT_LINE_COUNTER_TAIL * 2) * line_us + 500;
+	if (tail_us < 10000)
+		tail_us = 10000;
+
+	param = rkisp_imx296_tail_wait_us;
+	if (param < tail_us)
+		param = tail_us;
+	if (param > ISP39_IMX296_TAIL_WAIT_US_MAX)
+		param = ISP39_IMX296_TAIL_WAIT_US_MAX;
+	return param;
+}
 /*
  * NOTE: MIPI controller and input MUX are also configured in this file,
  * because ISP Subdev is not only describe ISP submodule(input size,format, output size, format),
@@ -2409,32 +2451,60 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 	 * IMX296 Fast Trigger keeps the MIPI frame open until the next XTRIG.
 	 * Complete the current ISP buffer at the last observable V39 output line
 	 * so a trigger publishes its own frame instead of N-1.  The V39 output
-	 * line counter stops eight counts below the active height (for example,
-	 * 1080 for a 1088-line frame), so height - 1 can never assert the line
-	 * interrupt. Program one count before that terminal value, then keep the
-	 * buffer owned by the ISP for a short tail-DMA drain interval before
-	 * vb2_done. Free-run and other sensors retain the configured/default
-	 * wait_line behavior and have no added delay.
+	 * line counter stops eight counts below the active height, so height - 1
+	 * never asserts. Program one count before that terminal, then complete
+	 * when MI plane offsets finish (+ post-MI hold). Free-run clears early-done.
 	 *
-	 * Always re-seed wait_line from the module/DT default first: pipeline
-	 * open sets it once, but a previous fast-trigger session must not leave
-	 * is_done_early enabled across a free-run restart.
+	 * Always re-seed wait_line from the module/DT default first: a previous
+	 * fast-trigger session must not leave is_done_early across free-run.
 	 */
 	dev->cap_dev.early_done_delay_us = 0;
+	dev->cap_dev.early_done_poll_us = ISP39_IMX296_EARLY_DONE_POLL_US;
+	dev->cap_dev.early_done_terminal_line = 0;
+	dev->cap_dev.early_done_post_mi_us = 0;
+	dev->cap_dev.early_done_warmup_post_mi_us = 0;
+	dev->cap_dev.early_done_warmup_left = 0;
+	dev->cap_dev.early_done_skip_frames = 0;
+	dev->cap_dev.early_done_drop_left = 0;
 	rkisp_stream_cancel_early_done(dev);
 	dev->cap_dev.wait_line = rkisp_wait_line;
 	if (dev->isp_ver == ISP_V39 && height > 1 &&
 	    rkisp_imx296_fast_trigger_active(dev)) {
-		dev->cap_dev.wait_line =
-			height > ISP39_OUT_LINE_COUNTER_TAIL + 1 ?
-			height - ISP39_OUT_LINE_COUNTER_TAIL - 1 : 1;
+		struct rkisp_stream *mp = &dev->cap_dev.stream[RKISP_STREAM_MP];
+		u32 terminal = height > ISP39_OUT_LINE_COUNTER_TAIL ?
+			height - ISP39_OUT_LINE_COUNTER_TAIL : 1;
+
+		dev->cap_dev.early_done_terminal_line = terminal;
+		dev->cap_dev.wait_line = terminal > 1 ? terminal - 1 : 1;
 		dev->cap_dev.early_done_delay_us =
-			min_t(u32, rkisp_imx296_tail_wait_us,
-			      ISP39_IMX296_TAIL_WAIT_US_MAX);
+			rkisp_imx296_residual_ceiling_us(dev->isp_sdev.out_crop.width,
+							 height,
+							 dev->cap_dev.wait_line);
+		dev->cap_dev.early_done_post_mi_us = ISP39_IMX296_POST_MI_US;
+		dev->cap_dev.early_done_warmup_post_mi_us =
+			ISP39_IMX296_WARMUP_POST_MI_US;
+		dev->cap_dev.early_done_warmup_left = ISP39_IMX296_WARMUP_FRAMES;
+		dev->cap_dev.early_done_skip_frames = ISP39_IMX296_SKIP_EARLY_FRAMES;
+		/*
+		 * Drop the first FT-completed buffers entirely. After free-run/ROI
+		 * the first published frames are often half-open / invalid even when
+		 * MI FE fires. Use cap_dev.early_done_drop_left so it survives
+		 * stream->skip_frame being cleared in rkisp_start().
+		 */
+		dev->cap_dev.early_done_drop_left = ISP39_IMX296_SKIP_BUF_FRAMES;
+		if (mp->streaming)
+			mp->skip_frame = ISP39_IMX296_SKIP_BUF_FRAMES;
 		v4l2_info(&dev->v4l2_dev,
-			  "IMX296 fast trigger: early buffer done at line %u/%u, tail wait %u us\n",
+			  "IMX296 fast trigger: early buffer done at line %u/%u terminal %u, MI-drain ceiling %u us post-MI %u/%u us (warmup %u) skip %u drop %u poll %u us\n",
 			  dev->cap_dev.wait_line, height,
-			  dev->cap_dev.early_done_delay_us);
+			  dev->cap_dev.early_done_terminal_line,
+			  dev->cap_dev.early_done_delay_us,
+			  dev->cap_dev.early_done_post_mi_us,
+			  dev->cap_dev.early_done_warmup_post_mi_us,
+			  dev->cap_dev.early_done_warmup_left,
+			  dev->cap_dev.early_done_skip_frames,
+			  ISP39_IMX296_SKIP_BUF_FRAMES,
+			  dev->cap_dev.early_done_poll_us);
 	}
 
 	dev->cap_dev.is_done_early = false;

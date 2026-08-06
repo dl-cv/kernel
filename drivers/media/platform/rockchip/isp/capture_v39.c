@@ -1087,6 +1087,17 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		struct rkisp_stream *vir = &dev->cap_dev.stream[RKISP_STREAM_VIR];
 		u64 ns = 0;
 
+		if (stream->id == RKISP_STREAM_MP) {
+			u32 drop = READ_ONCE(dev->cap_dev.early_done_drop_left);
+
+			if (drop) {
+				WRITE_ONCE(dev->cap_dev.early_done_drop_left, drop - 1);
+				spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+				list_add_tail(&buf->queue, &stream->buf_queue);
+				spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+				goto end;
+			}
+		}
 		if (dev->skip_frame || stream->skip_frame) {
 			spin_lock_irqsave(&stream->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &stream->buf_queue);
