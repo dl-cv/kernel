@@ -342,10 +342,9 @@ struct rkisp_capture_device {
 	 * offsets have ramped live and reached the programmed plane sizes, then
 	 * hold post_mi_us so the last NV12 chroma beats land. ISP_OUT_LINE
 	 * saturates ~8 lines early and must not drive completion.
-	 * early_done_delay_us is only the residual safety ceiling (no force
-	 * vb2_done without verified MI). First early_done_skip_frames SOFs leave
-	 * completion to the real MI FE IRQ; stream->skip_frame may also drop
-	 * the first FT buffers after free-run/ROI→trigger.
+	 * residual ceiling may ceiling-force when MI OFFS stay 0 (N-1 fix) but
+	 * still applies force_post_mi hold. First skip_frames SOFs use MI FE;
+	 * drop_left discards dirty MP buffers after free-run/ROI→FT.
 	 */
 	u32 early_done_delay_us;
 	struct hrtimer early_done_timer;
@@ -358,12 +357,17 @@ struct rkisp_capture_device {
 	u32 early_done_deadline_ns_hi;
 	u32 early_done_mi_y_size;
 	u32 early_done_mi_cb_size;
-	/* Observed live MI ramp (y/cb offs below programmed size) this arm. */
+	/* SHD offs sampled when early-done was armed (live-decrease baseline). */
+	u32 early_done_mi_y_base;
+	u32 early_done_mi_cb_base;
+	/* Observed live MI activity (ramp / decrease / zero) this arm. */
 	u32 early_done_mi_saw_y;
 	u32 early_done_mi_saw_cb;
 	/* Y+CB live+full; then wait post_mi_us before vb2_done. */
 	u32 early_done_mi_ready;
 	u32 early_done_post_mi_us;
+	/* Floor hold after ceiling-force (unverified MI); >= post_mi_us. */
+	u32 early_done_force_post_mi_us;
 	u32 early_done_warmup_left;
 	u32 early_done_warmup_post_mi_us;
 	/*
@@ -373,6 +377,13 @@ struct rkisp_capture_device {
 	u32 early_done_skip_frames;
 	/* Drop next N completed MP buffers (survives stream->skip_frame=0). */
 	u32 early_done_drop_left;
+	/* N-1 phase diagnostics (FT only): counts published / dropped MP frames. */
+	u32 early_done_diag_pub;
+	u32 early_done_diag_drop;
+	u32 early_done_diag_skip_sof;
+	u32 early_done_diag_arm;
+	u32 early_done_diag_complete;
+	u32 early_done_diag_ceiling;
 	u32 wrap_width;
 	u32 wrap_line;
 	bool is_done_early;

@@ -1086,12 +1086,26 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		struct vb2_buffer *vb2_buf = &buf->vb.vb2_buf;
 		struct rkisp_stream *vir = &dev->cap_dev.stream[RKISP_STREAM_VIR];
 		u64 ns = 0;
+		bool ft_diag = dev->cap_dev.is_done_early &&
+			       stream->id == RKISP_STREAM_MP;
 
 		if (stream->id == RKISP_STREAM_MP) {
 			u32 drop = READ_ONCE(dev->cap_dev.early_done_drop_left);
 
 			if (drop) {
 				WRITE_ONCE(dev->cap_dev.early_done_drop_left, drop - 1);
+				if (ft_diag) {
+					WRITE_ONCE(dev->cap_dev.early_done_diag_drop,
+						   READ_ONCE(dev->cap_dev.early_done_diag_drop) + 1);
+					v4l2_info(&dev->v4l2_dev,
+						  "n1trace mi_drop state=%s left=%u cnt=%u early=%d sof=%llu t_ns=%llu\n",
+						  state == FRAME_WORK ? "WORK" :
+						  state == FRAME_IRQ ? "IRQ" : "OTH",
+						  drop - 1,
+						  READ_ONCE(dev->cap_dev.early_done_diag_drop),
+						  stream->frame_early, sof_ns,
+						  ktime_get_ns());
+				}
 				spin_lock_irqsave(&stream->vbq_lock, lock_flags);
 				list_add_tail(&buf->queue, &stream->buf_queue);
 				spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
@@ -1099,6 +1113,13 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 			}
 		}
 		if (dev->skip_frame || stream->skip_frame) {
+			if (ft_diag)
+				v4l2_info(&dev->v4l2_dev,
+					  "n1trace mi_skip_frame state=%s skip=%u dev_skip=%u sof=%llu t_ns=%llu\n",
+					  state == FRAME_WORK ? "WORK" :
+					  state == FRAME_IRQ ? "IRQ" : "OTH",
+					  stream->skip_frame, dev->skip_frame,
+					  sof_ns, ktime_get_ns());
 			spin_lock_irqsave(&stream->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &stream->buf_queue);
 			spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
@@ -1152,6 +1173,18 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		stream->dbg.delay = ns - dev->isp_sdev.frm_timestamp;
 		stream->dbg.timestamp = ns;
 		stream->dbg.id = seq;
+		if (ft_diag) {
+			WRITE_ONCE(dev->cap_dev.early_done_diag_pub,
+				   READ_ONCE(dev->cap_dev.early_done_diag_pub) + 1);
+			v4l2_info(&dev->v4l2_dev,
+				  "n1trace mi_pub state=%s vb_seq=%u early=%d drop_left=%u pub=%u sof=%llu t_ns=%llu\n",
+				  state == FRAME_WORK ? "WORK" :
+				  state == FRAME_IRQ ? "IRQ" : "OTH",
+				  seq, stream->frame_early,
+				  READ_ONCE(dev->cap_dev.early_done_drop_left),
+				  READ_ONCE(dev->cap_dev.early_done_diag_pub),
+				  sof_ns, ns);
+		}
 		if (vir->streaming && vir->conn_id == stream->id) {
 			spin_lock_irqsave(&vir->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &dev->cap_dev.vir_cpy.queue);

@@ -64,23 +64,35 @@
 #define IMX296_XTRIG_ONE_SHOT		1
 #define ISP39_OUT_LINE_COUNTER_TAIL	8
 /*
- * Residual / MI-drain ceiling after wait_line. Completion is driven by MI
- * plane progress + post-MI hold, not by this delay alone. Keep a generous
- * ceiling so a slow first FT frame is not cut short; never force vb2_done
- * on expiry without verified MI (see capture.c).
+ * Residual / MI-drain ceiling after wait_line. Prefer live MI offs; when
+ * OFFS stays 0 on this V39 silicon, capture.c ceiling-forces after this
+ * residual and still applies force_post_mi hold so N-1 stays aligned
+ * without publishing at bare wait_line. ROI stream-on re-seeds skip/drop.
  */
-#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	15000U
-#define ISP39_IMX296_TAIL_WAIT_US_MAX		40000U
+#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	35000U
+#define ISP39_IMX296_TAIL_WAIT_US_MAX		100000U
 #define ISP39_IMX296_LINE_US_MIN		80U
 #define ISP39_IMX296_LINE_US_MAX		250U
 #define ISP39_IMX296_EARLY_DONE_POLL_US	50U
-#define ISP39_IMX296_POST_MI_US		6000U
-#define ISP39_IMX296_WARMUP_POST_MI_US	16000U
-#define ISP39_IMX296_WARMUP_FRAMES	4U
+#define ISP39_IMX296_POST_MI_US		20000U
+/*
+ * Ceiling-force path floor: MI OFFS stay 0 so we never see live full.
+ * Green is held by residual + force_post, NOT by dropping user shots.
+ * Product 3–5 fps: CamOS already warms 6 frames before opening the
+ * external gate; kernel must not burn another ~10 user triggers.
+ */
+#define ISP39_IMX296_FORCE_POST_MI_US	45000U
+/* First FT frames after free-run/ROI stream-on (longer hold only). */
+#define ISP39_IMX296_WARMUP_POST_MI_US	55000U
+#define ISP39_IMX296_WARMUP_FRAMES	6U
 /* SOFs that skip early-done (MI FE only) after free-run/ROI->FT. */
-#define ISP39_IMX296_SKIP_EARLY_FRAMES	3U
-/* Drop first completed MP buffers after FT start (invalid / half-open). */
-#define ISP39_IMX296_SKIP_BUF_FRAMES	3U
+#define ISP39_IMX296_SKIP_EARLY_FRAMES	2U
+/*
+ * Drop only the first completed MP buffers after FT stream-on (half-open).
+ * Keep tiny: CamOS residual_discard/warmup covers mode-switch quarantine.
+ * Large drop was the "trigger but no photo" for the first 10–12 shots.
+ */
+#define ISP39_IMX296_SKIP_BUF_FRAMES	2U
 
 static unsigned int rkisp_imx296_tail_wait_us = ISP39_IMX296_TAIL_WAIT_US_DEFAULT;
 module_param_named(imx296_tail_wait_us, rkisp_imx296_tail_wait_us, uint, 0644);
@@ -107,10 +119,20 @@ static u32 rkisp_imx296_residual_ceiling_us(u32 width, u32 height,
 	if (line_us > ISP39_IMX296_LINE_US_MAX)
 		line_us = ISP39_IMX296_LINE_US_MAX;
 
-	/* Safety ceiling only — completion prefers MI offs. */
-	tail_us = (remain + ISP39_OUT_LINE_COUNTER_TAIL * 2) * line_us + 500;
-	if (tail_us < 10000)
-		tail_us = 10000;
+	/*
+	 * Residual after wait_line must cover remaining luma + chroma tail.
+	 * NV12 chroma trails the last Y rows — budget extra lines so
+	 * ceiling-force is not early on short ROI heights (green/tear).
+	 */
+	/*
+	 * Budget remaining ISP lines after wait_line PLUS a large chroma
+	 * tail. Observed green band is ~OUT_LINE tail (8–10 rows) of bad UV
+	 * when force completes too early — use ~half-frame chroma time.
+	 */
+	tail_us = (remain + ISP39_OUT_LINE_COUNTER_TAIL * 6) * line_us +
+		  (height / 2) * (line_us / 2) + 5000;
+	if (tail_us < 30000)
+		tail_us = 30000;
 
 	param = rkisp_imx296_tail_wait_us;
 	if (param < tail_us)
@@ -2462,10 +2484,17 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 	dev->cap_dev.early_done_poll_us = ISP39_IMX296_EARLY_DONE_POLL_US;
 	dev->cap_dev.early_done_terminal_line = 0;
 	dev->cap_dev.early_done_post_mi_us = 0;
+	dev->cap_dev.early_done_force_post_mi_us = 0;
 	dev->cap_dev.early_done_warmup_post_mi_us = 0;
 	dev->cap_dev.early_done_warmup_left = 0;
 	dev->cap_dev.early_done_skip_frames = 0;
 	dev->cap_dev.early_done_drop_left = 0;
+	dev->cap_dev.early_done_diag_pub = 0;
+	dev->cap_dev.early_done_diag_drop = 0;
+	dev->cap_dev.early_done_diag_skip_sof = 0;
+	dev->cap_dev.early_done_diag_arm = 0;
+	dev->cap_dev.early_done_diag_complete = 0;
+	dev->cap_dev.early_done_diag_ceiling = 0;
 	rkisp_stream_cancel_early_done(dev);
 	dev->cap_dev.wait_line = rkisp_wait_line;
 	if (dev->isp_ver == ISP_V39 && height > 1 &&
@@ -2481,6 +2510,8 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 							 height,
 							 dev->cap_dev.wait_line);
 		dev->cap_dev.early_done_post_mi_us = ISP39_IMX296_POST_MI_US;
+		dev->cap_dev.early_done_force_post_mi_us =
+			ISP39_IMX296_FORCE_POST_MI_US;
 		dev->cap_dev.early_done_warmup_post_mi_us =
 			ISP39_IMX296_WARMUP_POST_MI_US;
 		dev->cap_dev.early_done_warmup_left = ISP39_IMX296_WARMUP_FRAMES;
@@ -2495,16 +2526,26 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 		if (mp->streaming)
 			mp->skip_frame = ISP39_IMX296_SKIP_BUF_FRAMES;
 		v4l2_info(&dev->v4l2_dev,
-			  "IMX296 fast trigger: early buffer done at line %u/%u terminal %u, MI-drain ceiling %u us post-MI %u/%u us (warmup %u) skip %u drop %u poll %u us\n",
+			  "IMX296 fast trigger: early buffer done at line %u/%u terminal %u, MI-drain ceiling %u us post-MI %u/%u force %u us (warmup %u) skip %u drop %u poll %u us\n",
 			  dev->cap_dev.wait_line, height,
 			  dev->cap_dev.early_done_terminal_line,
 			  dev->cap_dev.early_done_delay_us,
 			  dev->cap_dev.early_done_post_mi_us,
 			  dev->cap_dev.early_done_warmup_post_mi_us,
+			  dev->cap_dev.early_done_force_post_mi_us,
 			  dev->cap_dev.early_done_warmup_left,
 			  dev->cap_dev.early_done_skip_frames,
 			  ISP39_IMX296_SKIP_BUF_FRAMES,
 			  dev->cap_dev.early_done_poll_us);
+		v4l2_info(&dev->v4l2_dev,
+			  "n1trace isp_ft_arm height=%u wait_line=%u skip=%u drop=%u warmup=%u ceiling_us=%u force_post=%u t_ns=%llu\n",
+			  height, dev->cap_dev.wait_line,
+			  dev->cap_dev.early_done_skip_frames,
+			  ISP39_IMX296_SKIP_BUF_FRAMES,
+			  dev->cap_dev.early_done_warmup_left,
+			  dev->cap_dev.early_done_delay_us,
+			  dev->cap_dev.early_done_force_post_mi_us,
+			  ktime_get_ns());
 	}
 
 	dev->cap_dev.is_done_early = false;
