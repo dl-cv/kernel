@@ -144,7 +144,15 @@ extern int rkisp_debug;
 extern bool rkisp_monitor;
 extern bool rkisp_irq_dbg;
 extern bool rkisp_buf_dbg;
+/* FT N-1 diagnostics; default off (see module_param n1trace in rkisp.c). */
+extern bool rkisp_n1trace;
 extern u64 rkisp_debug_reg;
+
+#define rkisp_n1trace_info(v4l2_dev, fmt, ...)				\
+	do {								\
+		if (rkisp_n1trace)					\
+			v4l2_info((v4l2_dev), fmt, ##__VA_ARGS__);	\
+	} while (0)
 extern unsigned int rkisp_wait_line;
 extern unsigned int rkisp_vicap_buf[DEV_MAX];
 extern unsigned int rkisp_hdr_wrap_line[DEV_MAX];

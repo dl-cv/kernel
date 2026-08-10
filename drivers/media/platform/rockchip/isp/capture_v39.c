@@ -1097,7 +1097,7 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 				if (ft_diag) {
 					WRITE_ONCE(dev->cap_dev.early_done_diag_drop,
 						   READ_ONCE(dev->cap_dev.early_done_diag_drop) + 1);
-					v4l2_info(&dev->v4l2_dev,
+					rkisp_n1trace_info(&dev->v4l2_dev,
 						  "n1trace mi_drop state=%s left=%u cnt=%u early=%d sof=%llu t_ns=%llu\n",
 						  state == FRAME_WORK ? "WORK" :
 						  state == FRAME_IRQ ? "IRQ" : "OTH",
@@ -1114,7 +1114,7 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		}
 		if (dev->skip_frame || stream->skip_frame) {
 			if (ft_diag)
-				v4l2_info(&dev->v4l2_dev,
+				rkisp_n1trace_info(&dev->v4l2_dev,
 					  "n1trace mi_skip_frame state=%s skip=%u dev_skip=%u sof=%llu t_ns=%llu\n",
 					  state == FRAME_WORK ? "WORK" :
 					  state == FRAME_IRQ ? "IRQ" : "OTH",
@@ -1176,7 +1176,7 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		if (ft_diag) {
 			WRITE_ONCE(dev->cap_dev.early_done_diag_pub,
 				   READ_ONCE(dev->cap_dev.early_done_diag_pub) + 1);
-			v4l2_info(&dev->v4l2_dev,
+			rkisp_n1trace_info(&dev->v4l2_dev,
 				  "n1trace mi_pub state=%s vb_seq=%u early=%d drop_left=%u pub=%u sof=%llu t_ns=%llu\n",
 				  state == FRAME_WORK ? "WORK" :
 				  state == FRAME_IRQ ? "IRQ" : "OTH",

@@ -181,3 +181,9 @@ extboot*
 *.img.sha256
 *.img.dlcvcam.json   # legacy; no longer generated
 /boot-rk3576-*.img
+
+# local worktree junk
+kernel_backup/
+scripts/__pycache__/
+trigger
+*.bak.*

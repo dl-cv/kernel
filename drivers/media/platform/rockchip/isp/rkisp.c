@@ -99,6 +99,18 @@ module_param_named(imx296_tail_wait_us, rkisp_imx296_tail_wait_us, uint, 0644);
 MODULE_PARM_DESC(imx296_tail_wait_us,
 		 "V39 IMX296 FT MI-drain residual ceiling (us); completion prefers MI offs");
 
+/*
+ * Per-frame FT n1trace (early arm/complete/ceiling, mi_pub/drop). Default off:
+ * bring-up logging filled rsyslog (kern+syslog) and exhausted rootfs.
+ * Enable: echo 1 > /sys/module/video_rkisp/parameters/n1trace
+ * (pair with imx296.n1trace=1 for full pulse↔mi correlation).
+ */
+bool rkisp_n1trace;
+module_param_named(n1trace, rkisp_n1trace, bool, 0644);
+MODULE_PARM_DESC(n1trace,
+		 "RKISP FT n1trace diagnostics (0=off default, 1=verbose)");
+EXPORT_SYMBOL_GPL(rkisp_n1trace);
+
 static u32 rkisp_imx296_residual_ceiling_us(u32 width, u32 height,
 					    u32 wait_line)
 {
@@ -2537,7 +2549,7 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 			  dev->cap_dev.early_done_skip_frames,
 			  ISP39_IMX296_SKIP_BUF_FRAMES,
 			  dev->cap_dev.early_done_poll_us);
-		v4l2_info(&dev->v4l2_dev,
+		rkisp_n1trace_info(&dev->v4l2_dev,
 			  "n1trace isp_ft_arm height=%u wait_line=%u skip=%u drop=%u warmup=%u ceiling_us=%u force_post=%u t_ns=%llu\n",
 			  height, dev->cap_dev.wait_line,
 			  dev->cap_dev.early_done_skip_frames,

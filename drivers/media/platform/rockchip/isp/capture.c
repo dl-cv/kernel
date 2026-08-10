@@ -838,7 +838,7 @@ static enum hrtimer_restart rkisp_early_done_timer(struct hrtimer *timer)
 				y_st = rkisp_read(dev, CIF_MI_MP_Y_OFFS_CNT_START, true);
 				cb_shd = rkisp_read(dev, CIF_MI_MP_CB_OFFS_CNT_SHD, true);
 				cb_st = rkisp_read(dev, CIF_MI_MP_CB_OFFS_CNT_START, true);
-				v4l2_info(&dev->v4l2_dev,
+				rkisp_n1trace_info(&dev->v4l2_dev,
 					  "n1trace early ceiling-force sof=%llu cnt=%u y=%u/%u base=%u saw=%u cb=%u/%u base=%u saw=%u y_shd=%u y_st=%u cb_shd=%u cb_st=%u t_ns=%llu\n",
 					  armed_sof,
 					  READ_ONCE(cap_dev->early_done_diag_ceiling),
@@ -869,7 +869,7 @@ static enum hrtimer_restart rkisp_early_done_timer(struct hrtimer *timer)
 
 	WRITE_ONCE(cap_dev->early_done_diag_complete,
 		   READ_ONCE(cap_dev->early_done_diag_complete) + 1);
-	v4l2_info(&dev->v4l2_dev,
+	rkisp_n1trace_info(&dev->v4l2_dev,
 		  "n1trace early complete sof=%llu warm_left=%u cnt=%u t_ns=%llu\n",
 		  armed_sof,
 		  READ_ONCE(cap_dev->early_done_warmup_left),
@@ -901,7 +901,7 @@ void rkisp_stream_buf_done_early_drain(struct rkisp_device *dev,
 		WRITE_ONCE(cap_dev->early_done_skip_frames, skip - 1);
 		WRITE_ONCE(cap_dev->early_done_diag_skip_sof,
 			   READ_ONCE(cap_dev->early_done_diag_skip_sof) + 1);
-		v4l2_info(&dev->v4l2_dev,
+		rkisp_n1trace_info(&dev->v4l2_dev,
 			  "n1trace early skip-sof left=%u cnt=%u sof=%llu t_ns=%llu\n",
 			  skip - 1,
 			  READ_ONCE(cap_dev->early_done_diag_skip_sof),
@@ -916,7 +916,7 @@ void rkisp_stream_buf_done_early_drain(struct rkisp_device *dev,
 	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, sof_ns);
 	WRITE_ONCE(cap_dev->early_done_diag_arm,
 		   READ_ONCE(cap_dev->early_done_diag_arm) + 1);
-	v4l2_info(&dev->v4l2_dev,
+	rkisp_n1trace_info(&dev->v4l2_dev,
 		  "n1trace early arm sof=%llu ceiling_us=%u cnt=%u t_ns=%llu\n",
 		  sof_ns,
 		  ceiling_us ? ceiling_us : READ_ONCE(cap_dev->early_done_delay_us),

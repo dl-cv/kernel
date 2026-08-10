@@ -211,6 +211,21 @@ enum imx296_op_mode {
 static atomic_t imx296_fast_trigger_mode = ATOMIC_INIT(0);
 /* Monotonic XTRIG counter for N-1 phase correlation (user + dummy pulses). */
 static atomic64_t imx296_xtrig_seq = ATOMIC64_INIT(0);
+/*
+ * Per-frame FT diagnostics (pulse / dummy / mode_switch / stream-state).
+ * Default off: left on during N-1 bring-up these flooded rsyslog and filled the rootfs.
+ * Enable: echo 1 > /sys/module/imx296/parameters/n1trace
+ */
+static bool imx296_n1trace;
+module_param_named(n1trace, imx296_n1trace, bool, 0644);
+MODULE_PARM_DESC(n1trace,
+		 "IMX296 FT n1trace/dev_info diagnostics (0=off default, 1=verbose)");
+
+#define imx296_n1trace_info(dev, fmt, ...)				\
+	do {								\
+		if (imx296_n1trace)					\
+			dev_info((dev), fmt, ##__VA_ARGS__);		\
+	} while (0)
 
 bool imx296_is_fast_trigger_active(void)
 {
@@ -615,14 +630,14 @@ static int imx296_trigger_once_locked(struct imx296 *sensor)
 			sensor->streaming ? sensor->active_mode :
 					    sensor->pending_mode);
 
-		dev_info(sensor->dev,
-			 "trigger pulse emitted: width=%u us idle=high active=low mode=%s streaming=%u\n",
-			 pulse_us, mode_name, sensor->streaming);
 		/* n1trace: correlate with ISP mi_fe / early-done lines */
-		dev_info(sensor->dev,
-			 "n1trace pulse seq=%llu width=%u mode=%s streaming=%u tag=%s t_ns=%llu\n",
-			 xseq, pulse_us, mode_name, sensor->streaming, tag,
-			 ktime_get_ns());
+		imx296_n1trace_info(sensor->dev,
+				 "trigger pulse emitted: width=%u us idle=high active=low mode=%s streaming=%u\n",
+				 pulse_us, mode_name, sensor->streaming);
+		imx296_n1trace_info(sensor->dev,
+				 "n1trace pulse seq=%llu width=%u mode=%s streaming=%u tag=%s t_ns=%llu\n",
+				 xseq, pulse_us, mode_name, sensor->streaming, tag,
+				 ktime_get_ns());
 	}
 
 out_light:
@@ -701,9 +716,9 @@ static int imx296_dummy_trigger_locked(struct imx296 *sensor, const char *reason
 	}
 
 	usleep_range(wait_us, wait_us + 5000U);
-	dev_info(sensor->dev,
-		 "n1trace dummy done reason=%s wait_us=%u pulse_us=%u t_ns=%llu\n",
-		 reason, wait_us, done_pulse_us, ktime_get_ns());
+	imx296_n1trace_info(sensor->dev,
+			    "n1trace dummy done reason=%s wait_us=%u pulse_us=%u t_ns=%llu\n",
+			    reason, wait_us, done_pulse_us, ktime_get_ns());
 	return 0;
 }
 
@@ -987,7 +1002,7 @@ static void imx296_log_stream_state_locked(struct imx296 *sensor, const char *ta
 
 #undef IMX296_READBACK
 
-	dev_info(sensor->dev,
+	imx296_n1trace_info(sensor->dev,
 		 "stream-state[%s]: pending=%s active=%s test_pattern=%u ctrl00=0x%02x standby=%u ctrl08=0x%02x reghold=%u ctrl0a=0x%02x xmsta=%u ctrl0b=0x%02x trigen=%u syncsel=0x%02x lowlag=0x%02x pgctrl=0x%02x regen=%u clken=%u pg_mode=%u\n",
 		 tag,
 		 imx296_op_mode_name(sensor->pending_mode),
@@ -1691,7 +1706,7 @@ static int imx296_mode_switch(struct imx296 *sensor,
 
 	old_mode = sensor->active_mode;
 
-	dev_info(sensor->dev,
+	imx296_n1trace_info(sensor->dev,
 		 "n1trace mode_switch begin %s->%s streaming=%u xtrig_seq=%llu t_ns=%llu\n",
 		 imx296_op_mode_name(old_mode),
 		 imx296_op_mode_name(new_mode),
@@ -1755,7 +1770,7 @@ static int imx296_mode_switch(struct imx296 *sensor,
 		imx296_dummy_trigger_locked(sensor, "enter-fast-trigger-3");
 	}
 
-	dev_info(sensor->dev,
+	imx296_n1trace_info(sensor->dev,
 		 "n1trace mode_switch end %s->%s active=%s streaming=%u ret=%d xtrig_seq=%llu t_ns=%llu\n",
 		 imx296_op_mode_name(old_mode),
 		 imx296_op_mode_name(new_mode),
