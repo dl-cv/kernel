@@ -69,30 +69,53 @@
  * residual and still applies force_post_mi hold so N-1 stays aligned
  * without publishing at bare wait_line. ROI stream-on re-seeds skip/drop.
  */
-#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	35000U
+#define ISP39_IMX296_TAIL_WAIT_US_DEFAULT	45000U
 #define ISP39_IMX296_TAIL_WAIT_US_MAX		100000U
 #define ISP39_IMX296_LINE_US_MIN		80U
 #define ISP39_IMX296_LINE_US_MAX		250U
 #define ISP39_IMX296_EARLY_DONE_POLL_US	50U
-#define ISP39_IMX296_POST_MI_US		20000U
+#define ISP39_IMX296_POST_MI_US		25000U
 /*
  * Ceiling-force path floor: MI OFFS stay 0 so we never see live full.
- * Green is held by residual + force_post, NOT by dropping user shots.
- * Product 3–5 fps: CamOS already warms 6 frames before opening the
- * external gate; kernel must not burn another ~10 user triggers.
+ * 2026-08-10 #1005: warm_left drop alone is NOT enough — first ~5
+ * mi_pub after warm_left==0 still classic green. Quarantine is
+ * PUB_GATE_FRAMES MP pubs after drop+warm (see capture_v39 #1009).
+ * CamOS SMARTCAM_TRIGGER_WARMUP must cover skip_sof + skip_buf
+ * + warm + pub_gate completes so user 1:1 starts after gate.
  */
-#define ISP39_IMX296_FORCE_POST_MI_US	45000U
-/* First FT frames after free-run/ROI stream-on (longer hold only). */
-#define ISP39_IMX296_WARMUP_POST_MI_US	55000U
-#define ISP39_IMX296_WARMUP_FRAMES	6U
+#define ISP39_IMX296_FORCE_POST_MI_US	70000U
+/* First FT frames after free-run/ROI stream-on (longer hold). */
+#define ISP39_IMX296_WARMUP_POST_MI_US	85000U
+#define ISP39_IMX296_WARMUP_FRAMES	2U
 /* SOFs that skip early-done (MI FE only) after free-run/ROI->FT. */
 #define ISP39_IMX296_SKIP_EARLY_FRAMES	2U
 /*
- * Drop only the first completed MP buffers after FT stream-on (half-open).
- * Keep tiny: CamOS residual_discard/warmup covers mode-switch quarantine.
- * Large drop was the "trigger but no photo" for the first 10–12 shots.
+ * Extra half-open drops at FT stream-on (IRQ path / residual).
+ * Keep tiny — green quarantine is early_done_pub_gate_left.
  */
 #define ISP39_IMX296_SKIP_BUF_FRAMES	2U
+/*
+ * Post drop+warm MP pub quarantine (IRQ and WORK). #1007/#1009: gate
+ * must NOT decrement while warm>0 (IRQ path burned gate in #1008).
+ * #1009 board (#1201): phase fixed but mon→sw still bot8 green on
+ * user head 1–5 after gate=6 (same #1005 residual). #1010 gate=12
+ * still green and blew CamOS default pulse max 22 → apply hang.
+ * #1011 gate=8: phase OK, but align n1trace shows first mi_pub at
+ * warm=0/gate=0 still followed by user head 1–5 classic bot8 green
+ * (CamOS success at ~20 pulses / appsink_seen≈4 discards only pub1–4;
+ * user head1=pub5 still dirty). Dirty window ≈5 pubs after quarantine.
+ * #1012: gate=13 → skip2+drop2+warm8+gate13=25 completes. CamOS
+ * SMARTCAM_TRIGGER_WARMUP_TOTAL_PULSE_MAX must be ≥28 (default 22
+ * is too small). Do not rely on CamOS post residual to erase green.
+ */
+/*
+ * #1013–#1016: UV-tail repair on FT pub (capture_v39) replaces long gate.
+ * #1016: neu-frac only if ref has chroma; mean thr=6; extend last-good.
+ * Keep tiny drop/warm/gate only for half-open FT entry buffers.
+ * Budget skip2+drop2+warm2+gate2 ≈ 8 completes → CamOS default pulses OK,
+ * mon→FT apply target 2–3s without raising TOTAL_PULSE_MAX.
+ */
+#define ISP39_IMX296_PUB_GATE_FRAMES	2U
 
 static unsigned int rkisp_imx296_tail_wait_us = ISP39_IMX296_TAIL_WAIT_US_DEFAULT;
 module_param_named(imx296_tail_wait_us, rkisp_imx296_tail_wait_us, uint, 0644);
@@ -141,10 +164,11 @@ static u32 rkisp_imx296_residual_ceiling_us(u32 width, u32 height,
 	 * tail. Observed green band is ~OUT_LINE tail (8–10 rows) of bad UV
 	 * when force completes too early — use ~half-frame chroma time.
 	 */
-	tail_us = (remain + ISP39_OUT_LINE_COUNTER_TAIL * 6) * line_us +
-		  (height / 2) * (line_us / 2) + 5000;
-	if (tail_us < 30000)
-		tail_us = 30000;
+	tail_us = (remain + ISP39_OUT_LINE_COUNTER_TAIL * 8) * line_us +
+		  (height / 2) * (line_us / 2) + 8000;
+	/* Full-height mon→FT green still needs a solid residual floor. */
+	if (tail_us < 40000)
+		tail_us = 40000;
 
 	param = rkisp_imx296_tail_wait_us;
 	if (param < tail_us)
@@ -2501,6 +2525,7 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 	dev->cap_dev.early_done_warmup_left = 0;
 	dev->cap_dev.early_done_skip_frames = 0;
 	dev->cap_dev.early_done_drop_left = 0;
+	dev->cap_dev.early_done_pub_gate_left = 0;
 	dev->cap_dev.early_done_diag_pub = 0;
 	dev->cap_dev.early_done_diag_drop = 0;
 	dev->cap_dev.early_done_diag_skip_sof = 0;
@@ -2535,10 +2560,11 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 		 * stream->skip_frame being cleared in rkisp_start().
 		 */
 		dev->cap_dev.early_done_drop_left = ISP39_IMX296_SKIP_BUF_FRAMES;
+		dev->cap_dev.early_done_pub_gate_left = ISP39_IMX296_PUB_GATE_FRAMES;
 		if (mp->streaming)
 			mp->skip_frame = ISP39_IMX296_SKIP_BUF_FRAMES;
 		v4l2_info(&dev->v4l2_dev,
-			  "IMX296 fast trigger: early buffer done at line %u/%u terminal %u, MI-drain ceiling %u us post-MI %u/%u force %u us (warmup %u) skip %u drop %u poll %u us\n",
+			  "IMX296 fast trigger: early buffer done at line %u/%u terminal %u, MI-drain ceiling %u us post-MI %u/%u force %u us (warmup %u) skip %u drop %u pub_gate %u poll %u us\n",
 			  dev->cap_dev.wait_line, height,
 			  dev->cap_dev.early_done_terminal_line,
 			  dev->cap_dev.early_done_delay_us,
@@ -2548,13 +2574,15 @@ static int rkisp_isp_start(struct rkisp_device *dev)
 			  dev->cap_dev.early_done_warmup_left,
 			  dev->cap_dev.early_done_skip_frames,
 			  ISP39_IMX296_SKIP_BUF_FRAMES,
+			  ISP39_IMX296_PUB_GATE_FRAMES,
 			  dev->cap_dev.early_done_poll_us);
 		rkisp_n1trace_info(&dev->v4l2_dev,
-			  "n1trace isp_ft_arm height=%u wait_line=%u skip=%u drop=%u warmup=%u ceiling_us=%u force_post=%u t_ns=%llu\n",
+			  "n1trace isp_ft_arm height=%u wait_line=%u skip=%u drop=%u warmup=%u pub_gate=%u ceiling_us=%u force_post=%u t_ns=%llu\n",
 			  height, dev->cap_dev.wait_line,
 			  dev->cap_dev.early_done_skip_frames,
 			  ISP39_IMX296_SKIP_BUF_FRAMES,
 			  dev->cap_dev.early_done_warmup_left,
+			  ISP39_IMX296_PUB_GATE_FRAMES,
 			  dev->cap_dev.early_done_delay_us,
 			  dev->cap_dev.early_done_force_post_mi_us,
 			  ktime_get_ns());

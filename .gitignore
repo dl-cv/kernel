@@ -187,3 +187,9 @@ kernel_backup/
 scripts/__pycache__/
 trigger
 *.bak.*
+
+# local IMX296 verification dumps / build logs (not sources)
+/IMX296_verify_*/
+/IMX296_2h_*/
+/IMX296_user_*/
+/IMX296_build_*.log

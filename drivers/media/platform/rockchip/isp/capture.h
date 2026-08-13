@@ -377,6 +377,12 @@ struct rkisp_capture_device {
 	u32 early_done_skip_frames;
 	/* Drop next N completed MP buffers (survives stream->skip_frame=0). */
 	u32 early_done_drop_left;
+	/*
+	 * Drop next N MP completes after drop+warm drain (IRQ and WORK).
+	 * 2026-08-10 #1005: warm alone still let ~5 green frames after warm=0.
+	 * 2026-08-12 #1009: must not decrement while warm>0 (IRQ hole in #1008).
+	 */
+	u32 early_done_pub_gate_left;
 	/* N-1 phase diagnostics (FT only): counts published / dropped MP frames. */
 	u32 early_done_diag_pub;
 	u32 early_done_diag_drop;

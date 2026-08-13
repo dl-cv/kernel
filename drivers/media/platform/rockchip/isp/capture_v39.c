@@ -2,6 +2,8 @@
 /* Copyright (c) 2023 Rockchip Electronics Co., Ltd. */
 
 #include <linux/delay.h>
+#include <linux/string.h>
+#include <linux/dma-mapping.h>
 #include <linux/pm_runtime.h>
 #include <media/v4l2-common.h>
 #include <media/v4l2-event.h>
@@ -1033,6 +1035,222 @@ static int isp_frame_end(struct rkisp_stream *stream, u32 irq)
  * is processing and we should set up buffer for next-next frame,
  * otherwise it will overflow.
  */
+
+/*
+ * V39+IMX296 FT: MI OFFS stay 0 → every frame is ceiling-force. Last NV12
+ * chroma rows can still be incomplete after force_post hold.
+ *
+ * #1013 unconditional 0x80 → permanent flat-grey seam (#1205 FAIL).
+ * #1014/#1015: conditional repair. #1016: neutral-fraction only when the
+ * reference line is *not* neutral (scene has chroma); always honor mean
+ * jump / stuck / classic-G. Extend last good UV line. Gate stays tiny.
+ */
+#define RKISP_FT_NV12_UV_TAIL_ROWS	8U
+/* |meanU-refU| / |meanV-refV| — dark colored scenes need a low bar. */
+#define RKISP_FT_UV_LINE_MEAN_THR	6U
+/* Sample counts as near-neutral chroma (buffer-clear / incomplete). */
+#define RKISP_FT_UV_NEU_LO		0x78U
+#define RKISP_FT_UV_NEU_HI		0x88U
+/* Bad if this fraction of UV pairs is near-neutral *and* ref has chroma. */
+#define RKISP_FT_UV_NEU_FRAC_NUM	1U
+#define RKISP_FT_UV_NEU_FRAC_DEN	2U
+/* ref |u-0x80| or |v-0x80| above this ⇒ scene chroma present. */
+#define RKISP_FT_UV_REF_CHROMA_MIN	10U
+#define RKISP_FT_UV_NEAR_FRAC_NUM	3U
+#define RKISP_FT_UV_NEAR_FRAC_DEN	4U
+
+static bool rkisp_ft_uv_line_bad(const u8 *line, u32 bpl, u8 ref_u, u8 ref_v)
+{
+	u32 i, n = bpl / 2;
+	u64 su = 0, sv = 0;
+	u32 near0 = 0, nearff = 0, neu = 0;
+	u32 mu, mv, du, dv, ref_du, ref_dv;
+	u8 u, v;
+	bool ref_has_chroma;
+
+	if (n < 4)
+		return false;
+
+	for (i = 0; i < n; i++) {
+		u = line[i * 2];
+		v = line[i * 2 + 1];
+		su += u;
+		sv += v;
+		if (u < 8 && v < 8)
+			near0++;
+		if (u > 248 && v > 248)
+			nearff++;
+		if (u >= RKISP_FT_UV_NEU_LO && u <= RKISP_FT_UV_NEU_HI &&
+		    v >= RKISP_FT_UV_NEU_LO && v <= RKISP_FT_UV_NEU_HI)
+			neu++;
+	}
+	mu = (u32)(su / n);
+	mv = (u32)(sv / n);
+	du = mu > ref_u ? mu - ref_u : ref_u - mu;
+	dv = mv > ref_v ? mv - ref_v : ref_v - mv;
+	ref_du = ref_u > 0x80 ? ref_u - 0x80 : 0x80 - ref_u;
+	ref_dv = ref_v > 0x80 ? ref_v - 0x80 : 0x80 - ref_v;
+	ref_has_chroma = (ref_du >= RKISP_FT_UV_REF_CHROMA_MIN ||
+			  ref_dv >= RKISP_FT_UV_REF_CHROMA_MIN);
+
+	/* Unwritten / stuck blocks. */
+	if (near0 * RKISP_FT_UV_NEAR_FRAC_DEN > n * RKISP_FT_UV_NEAR_FRAC_NUM)
+		return true;
+	if (nearff * RKISP_FT_UV_NEAR_FRAC_DEN > n * RKISP_FT_UV_NEAR_FRAC_NUM)
+		return true;
+	/*
+	 * Incomplete FT UV often stays buffer-clear ~0x80 while Y is done.
+	 * Only treat high neutral fraction as bad when the line above has
+	 * real scene chroma — avoids rewriting naturally neutral bottoms.
+	 */
+	if (ref_has_chroma &&
+	    neu * RKISP_FT_UV_NEU_FRAC_DEN > n * RKISP_FT_UV_NEU_FRAC_NUM)
+		return true;
+	/* Mean jump vs last good line (primary for dark colored scenes). */
+	if (du > RKISP_FT_UV_LINE_MEAN_THR || dv > RKISP_FT_UV_LINE_MEAN_THR)
+		return true;
+	/* Classic G band: both U/V depressed vs neutral while ref is higher. */
+	if (mu + 20 < 0x80 && mv + 20 < 0x80 &&
+	    (ref_u > mu + 10 || ref_v > mv + 10))
+		return true;
+
+	return false;
+}
+
+static void rkisp_ft_uv_line_mean(const u8 *line, u32 bpl, u8 *out_u, u8 *out_v)
+{
+	u32 i, n = bpl / 2;
+	u64 su = 0, sv = 0;
+
+	if (n == 0) {
+		*out_u = 0x80;
+		*out_v = 0x80;
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		su += line[i * 2];
+		sv += line[i * 2 + 1];
+	}
+	*out_u = (u8)(su / n);
+	*out_v = (u8)(sv / n);
+}
+
+static void rkisp_ft_sanitize_nv12_bot(struct rkisp_stream *stream,
+				       struct rkisp_buffer *buf)
+{
+	struct rkisp_device *dev = stream->ispdev;
+	struct v4l2_pix_format_mplane *pixm = &stream->out_fmt;
+	struct vb2_buffer *vb;
+	struct device *dma_dev;
+	struct sg_table *sgt;
+	u8 *base, *uv, *tail, *ref, *line;
+	u8 ref_u, ref_v;
+	u32 fourcc, bpl, h, y_size, uv_size, tail_rows, tail_bytes;
+	u32 uv_off, uv_rows, ref_off, i;
+	u32 sync_off, sync_len;
+	int uv_plane;
+	bool repaired = false;
+
+	if (!buf || stream->id != RKISP_STREAM_MP)
+		return;
+	if (!dev->cap_dev.is_done_early)
+		return;
+	if (!dev->hw_dev)
+		return;
+
+	fourcc = pixm->pixelformat;
+	if (fourcc != V4L2_PIX_FMT_NV12 && fourcc != V4L2_PIX_FMT_NV12M &&
+	    fourcc != V4L2_PIX_FMT_NV21 && fourcc != V4L2_PIX_FMT_NV21M)
+		return;
+
+	base = buf->vaddr[0];
+	if (!base)
+		base = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+	if (!base)
+		return;
+
+	bpl = pixm->plane_fmt[0].bytesperline;
+	h = pixm->height;
+	if (!bpl || h < 4)
+		return;
+
+	y_size = bpl * h;
+	tail_rows = RKISP_FT_NV12_UV_TAIL_ROWS;
+	uv_rows = h / 2;
+	if (tail_rows > uv_rows)
+		tail_rows = uv_rows;
+	if (tail_rows >= uv_rows || tail_rows == 0)
+		return;
+	tail_bytes = bpl * tail_rows;
+	if (!tail_bytes)
+		return;
+
+	if (pixm->num_planes >= 2) {
+		uv = buf->vaddr[1];
+		if (!uv)
+			uv = vb2_plane_vaddr(&buf->vb.vb2_buf, 1);
+		uv_size = pixm->plane_fmt[1].sizeimage;
+		uv_plane = 1;
+		uv_off = 0;
+	} else {
+		uv = base + y_size;
+		uv_size = y_size / 2;
+		uv_plane = 0;
+		uv_off = y_size;
+	}
+	if (!uv || uv_size < bpl * (tail_rows + 1))
+		return;
+	if (tail_bytes + bpl > uv_size)
+		return;
+
+	ref_off = uv_size - tail_bytes - bpl;
+	tail = uv + (uv_size - tail_bytes);
+	ref = uv + ref_off;
+	sync_off = ref_off;
+	sync_len = tail_bytes + bpl;
+	vb = &buf->vb.vb2_buf;
+	dma_dev = dev->hw_dev->dev;
+
+	if (dev->hw_dev->is_dma_sg_ops) {
+		sgt = vb2_dma_sg_plane_desc(vb, uv_plane);
+		if (sgt)
+			dma_sync_sgtable_for_cpu(dma_dev, sgt, DMA_BIDIRECTIONAL);
+	} else {
+		dma_addr_t da = vb2_dma_contig_plane_dma_addr(vb, uv_plane);
+
+		if (da)
+			dma_sync_single_for_cpu(dma_dev, da + uv_off + sync_off,
+						sync_len, DMA_BIDIRECTIONAL);
+	}
+
+	rkisp_ft_uv_line_mean(ref, bpl, &ref_u, &ref_v);
+
+	for (i = 0; i < tail_rows; i++) {
+		line = tail + i * bpl;
+		if (!rkisp_ft_uv_line_bad(line, bpl, ref_u, ref_v)) {
+			/* Advance reference through good tail lines. */
+			ref = line;
+			rkisp_ft_uv_line_mean(ref, bpl, &ref_u, &ref_v);
+			continue;
+		}
+		memcpy(line, ref, bpl);
+		repaired = true;
+	}
+
+	if (dev->hw_dev->is_dma_sg_ops) {
+		sgt = vb2_dma_sg_plane_desc(vb, uv_plane);
+		if (sgt)
+			dma_sync_sgtable_for_device(dma_dev, sgt, DMA_BIDIRECTIONAL);
+	} else {
+		dma_addr_t da = vb2_dma_contig_plane_dma_addr(vb, uv_plane);
+
+		if (da)
+			dma_sync_single_for_device(dma_dev, da + uv_off + sync_off,
+						   sync_len, DMA_BIDIRECTIONAL);
+	}
+	(void)repaired;
+}
+
 static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 {
 	struct rkisp_device *dev = stream->ispdev;
@@ -1091,17 +1309,58 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 
 		if (stream->id == RKISP_STREAM_MP) {
 			u32 drop = READ_ONCE(dev->cap_dev.early_done_drop_left);
+			/*
+			 * 2026-08-12 #1009 (fix #1008 IRQ hole, ceiling-force doc §11):
+			 * mon→FT is ~100% ceiling-force. Quarantine order must be
+			 * drop → warm → pub_gate on BOTH early WORK and MI FE IRQ.
+			 *
+			 * #1008 bug: warm_drop required frame_early, so IRQ (early=0)
+			 * with warm>0 fell into gate_drop and burned pub_gate while
+			 * warm was still high; first mi_pub then landed mid-warm with
+			 * gate already 0 (line0 green). CamOS post residual cannot fix.
+			 *
+			 * #1009:
+			 *  - warm_drop: any MP complete while warm>0 (IRQ+WORK)
+			 *  - gate_drop: only after drop==0 && warm==0 (still covers IRQ)
+			 * CamOS SMARTCAM_TRIGGER_WARMUP must cover skip+drop+warm+gate.
+			 */
+			u32 warm = READ_ONCE(dev->cap_dev.early_done_warmup_left);
+			u32 gate = READ_ONCE(dev->cap_dev.early_done_pub_gate_left);
+			/* Warm quarantine is path-agnostic (IRQ and early WORK). */
+			bool warm_drop = ft_diag && warm;
+			/*
+			 * Gate starts only after drop+warm are exhausted. IRQ pubs
+			 * after warm still consume gate (#1006 r1); they must NOT
+			 * steal gate during warm (#1007 intent, restored for IRQ).
+			 */
+			bool gate_drop = ft_diag && gate && !drop && !warm;
 
-			if (drop) {
-				WRITE_ONCE(dev->cap_dev.early_done_drop_left, drop - 1);
+			if (drop || warm_drop || gate_drop) {
+				if (drop)
+					WRITE_ONCE(dev->cap_dev.early_done_drop_left,
+						   drop - 1);
+				/*
+				 * Consume warm on the publish path when early-done did
+				 * not already decrement it (IRQ / non-early completes).
+				 * early complete already did warm-- before mi_frame_end;
+				 * do not double-count those.
+				 */
+				if (warm_drop && !stream->frame_early)
+					WRITE_ONCE(dev->cap_dev.early_done_warmup_left,
+						   warm - 1);
+				if (gate_drop)
+					WRITE_ONCE(dev->cap_dev.early_done_pub_gate_left,
+						   gate - 1);
 				if (ft_diag) {
 					WRITE_ONCE(dev->cap_dev.early_done_diag_drop,
 						   READ_ONCE(dev->cap_dev.early_done_diag_drop) + 1);
 					rkisp_n1trace_info(&dev->v4l2_dev,
-						  "n1trace mi_drop state=%s left=%u cnt=%u early=%d sof=%llu t_ns=%llu\n",
+						  "n1trace mi_drop state=%s left=%u warm=%u gate=%u cnt=%u early=%d sof=%llu t_ns=%llu\n",
 						  state == FRAME_WORK ? "WORK" :
 						  state == FRAME_IRQ ? "IRQ" : "OTH",
-						  drop - 1,
+						  READ_ONCE(dev->cap_dev.early_done_drop_left),
+						  READ_ONCE(dev->cap_dev.early_done_warmup_left),
+						  READ_ONCE(dev->cap_dev.early_done_pub_gate_left),
 						  READ_ONCE(dev->cap_dev.early_done_diag_drop),
 						  stream->frame_early, sof_ns,
 						  ktime_get_ns());
@@ -1177,14 +1436,21 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 			WRITE_ONCE(dev->cap_dev.early_done_diag_pub,
 				   READ_ONCE(dev->cap_dev.early_done_diag_pub) + 1);
 			rkisp_n1trace_info(&dev->v4l2_dev,
-				  "n1trace mi_pub state=%s vb_seq=%u early=%d drop_left=%u pub=%u sof=%llu t_ns=%llu\n",
+				  "n1trace mi_pub state=%s vb_seq=%u early=%d drop_left=%u warm=%u gate=%u pub=%u sof=%llu t_ns=%llu\n",
 				  state == FRAME_WORK ? "WORK" :
 				  state == FRAME_IRQ ? "IRQ" : "OTH",
 				  seq, stream->frame_early,
 				  READ_ONCE(dev->cap_dev.early_done_drop_left),
+				  READ_ONCE(dev->cap_dev.early_done_warmup_left),
+				  READ_ONCE(dev->cap_dev.early_done_pub_gate_left),
 				  READ_ONCE(dev->cap_dev.early_done_diag_pub),
 				  sof_ns, ns);
 		}
+		/*
+		 * #1016: conditional UV-tail repair (ref-chroma-gated neu + mean).
+		 * #1013 0x80 seam FAIL; #1014/#1015 thr/neu iterations.
+		 */
+		rkisp_ft_sanitize_nv12_bot(stream, buf);
 		if (vir->streaming && vir->conn_id == stream->id) {
 			spin_lock_irqsave(&vir->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &dev->cap_dev.vir_cpy.queue);

@@ -742,13 +742,15 @@ static u32 rkisp_early_done_post_hold_us(struct rkisp_capture_device *cap_dev,
 		hold = steady;
 
 	/*
-	 * Ceiling-force means MI offs never verified. Board evidence
-	 * (1456x592 green bot~8): residual+16ms still UV-incomplete.
-	 * Floor at force_post, and add a slice of residual again so short
-	 * ROI cannot under-hold after wait_line.
+	 * Ceiling-force means MI offs never verified. Board evidence:
+	 * - 1456x592 green bot~8 with residual+16ms
+	 * - 1456x1088 mon→FT head frames still green with force=45ms (2026-08-10)
+	 * Floor at force_post; add most of residual again so short ROI and
+	 * full-height mode-switch cannot under-hold after wait_line. Warmup
+	 * frames already prefer warm post; still raise force floor over them.
 	 */
 	if (force_path) {
-		u32 extra = residual / 2;
+		u32 extra = residual - (residual / 4); /* ~3/4 residual */
 
 		if (force > hold)
 			hold = force;
