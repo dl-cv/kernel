@@ -193,3 +193,4 @@ trigger
 /IMX296_2h_*/
 /IMX296_user_*/
 /IMX296_build_*.log
+/dist/
