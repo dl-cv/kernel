@@ -1038,14 +1038,24 @@ static int isp_frame_end(struct rkisp_stream *stream, u32 irq)
 
 /*
  * V39+IMX296 FT: MI OFFS stay 0 → every frame is ceiling-force. Last NV12
- * chroma rows can still be incomplete after force_post hold.
+ * chroma rows can still be incomplete after force_post hold. After a large
+ * exposure / PWM-pulse jump the last ~8 Y rows can still be the previous
+ * exposure (board 84, gain=240, 1500→15000): a luma tear, not classic UV.
  *
  * #1013 unconditional 0x80 → permanent flat-grey seam (#1205 FAIL).
  * #1014/#1015: conditional repair. #1016: neutral-fraction only when the
  * reference line is *not* neutral (scene has chroma); always honor mean
- * jump / stuck / classic-G. Extend last good UV line. Gate stays tiny.
+ * jump / stuck / classic-G. Extend last good UV line.
+ * #1017: same idea for Y — only rewrite the last 8 luma rows when the
+ * whole-line mean jumps; majority-bad copies the entire band from the
+ * line above so a 1-row blend cannot poison the reference. Gate stays tiny.
  */
 #define RKISP_FT_NV12_UV_TAIL_ROWS	8U
+#define RKISP_FT_NV12_Y_TAIL_ROWS	8U
+/* Whole-line |meanY-refY|. Userspace tear uses 12; splice samples were 14–74. */
+#define RKISP_FT_Y_LINE_MEAN_THR	12U
+/* If this many tail Y rows jump vs the pre-tail line, treat as a splice band. */
+#define RKISP_FT_Y_BAND_BAD_MIN		4U
 /* |meanU-refU| / |meanV-refV| — dark colored scenes need a low bar. */
 #define RKISP_FT_UV_LINE_MEAN_THR	6U
 /* Sample counts as near-neutral chroma (buffer-clear / incomplete). */
@@ -1135,6 +1145,25 @@ static void rkisp_ft_uv_line_mean(const u8 *line, u32 bpl, u8 *out_u, u8 *out_v)
 	*out_v = (u8)(sv / n);
 }
 
+static u32 rkisp_ft_y_line_mean(const u8 *line, u32 bpl)
+{
+	u32 i;
+	u64 s = 0;
+
+	if (!bpl)
+		return 0;
+	for (i = 0; i < bpl; i++)
+		s += line[i];
+	return (u32)(s / bpl);
+}
+
+static bool rkisp_ft_y_mean_jump(u32 mean, u32 ref)
+{
+	u32 d = mean > ref ? mean - ref : ref - mean;
+
+	return d > RKISP_FT_Y_LINE_MEAN_THR;
+}
+
 static void rkisp_ft_sanitize_nv12_bot(struct rkisp_stream *stream,
 				       struct rkisp_buffer *buf)
 {
@@ -1143,12 +1172,15 @@ static void rkisp_ft_sanitize_nv12_bot(struct rkisp_stream *stream,
 	struct vb2_buffer *vb;
 	struct device *dma_dev;
 	struct sg_table *sgt;
-	u8 *base, *uv, *tail, *ref, *line;
+	u8 *base, *uv = NULL, *tail = NULL, *ref = NULL, *line;
+	u8 *y_tail, *y_ref, *y_line;
 	u8 ref_u, ref_v;
 	u32 fourcc, bpl, h, y_size, uv_size, tail_rows, tail_bytes;
-	u32 uv_off, uv_rows, ref_off, i;
+	u32 y_tail_rows, y_sync_off, y_sync_len, y_init, y_refm, y_mean, y_bad;
+	u32 uv_off, uv_rows, ref_off = 0, i;
 	u32 sync_off, sync_len;
 	int uv_plane;
+	bool have_uv = false;
 	bool repaired = false;
 
 	if (!buf || stream->id != RKISP_STREAM_MP)
@@ -1175,78 +1207,168 @@ static void rkisp_ft_sanitize_nv12_bot(struct rkisp_stream *stream,
 		return;
 
 	y_size = bpl * h;
+	y_tail_rows = RKISP_FT_NV12_Y_TAIL_ROWS;
+	if (y_tail_rows + 1 > h)
+		y_tail_rows = h > 1 ? h - 1 : 0;
+	y_tail = NULL;
+	y_ref = NULL;
+	y_sync_off = 0;
+	y_sync_len = 0;
+	if (y_tail_rows) {
+		y_sync_off = (h - y_tail_rows - 1) * bpl;
+		y_sync_len = (y_tail_rows + 1) * bpl;
+		if (y_sync_off + y_sync_len <= y_size) {
+			y_ref = base + y_sync_off;
+			y_tail = y_ref + bpl;
+		} else {
+			y_tail_rows = 0;
+		}
+	}
+
 	tail_rows = RKISP_FT_NV12_UV_TAIL_ROWS;
 	uv_rows = h / 2;
 	if (tail_rows > uv_rows)
 		tail_rows = uv_rows;
-	if (tail_rows >= uv_rows || tail_rows == 0)
-		return;
 	tail_bytes = bpl * tail_rows;
-	if (!tail_bytes)
-		return;
-
-	if (pixm->num_planes >= 2) {
-		uv = buf->vaddr[1];
-		if (!uv)
-			uv = vb2_plane_vaddr(&buf->vb.vb2_buf, 1);
-		uv_size = pixm->plane_fmt[1].sizeimage;
-		uv_plane = 1;
-		uv_off = 0;
-	} else {
-		uv = base + y_size;
-		uv_size = y_size / 2;
-		uv_plane = 0;
-		uv_off = y_size;
+	uv = NULL;
+	uv_size = 0;
+	uv_plane = 0;
+	uv_off = 0;
+	sync_off = 0;
+	sync_len = 0;
+	if (tail_rows && tail_rows < uv_rows && tail_bytes) {
+		if (pixm->num_planes >= 2) {
+			uv = buf->vaddr[1];
+			if (!uv)
+				uv = vb2_plane_vaddr(&buf->vb.vb2_buf, 1);
+			uv_size = pixm->plane_fmt[1].sizeimage;
+			uv_plane = 1;
+			uv_off = 0;
+		} else {
+			uv = base + y_size;
+			uv_size = y_size / 2;
+			uv_plane = 0;
+			uv_off = y_size;
+		}
+		if (uv && uv_size >= bpl * (tail_rows + 1) &&
+		    tail_bytes + bpl <= uv_size) {
+			ref_off = uv_size - tail_bytes - bpl;
+			tail = uv + (uv_size - tail_bytes);
+			ref = uv + ref_off;
+			sync_off = ref_off;
+			sync_len = tail_bytes + bpl;
+			have_uv = true;
+		}
 	}
-	if (!uv || uv_size < bpl * (tail_rows + 1))
-		return;
-	if (tail_bytes + bpl > uv_size)
+	if (!y_tail_rows && !have_uv)
 		return;
 
-	ref_off = uv_size - tail_bytes - bpl;
-	tail = uv + (uv_size - tail_bytes);
-	ref = uv + ref_off;
-	sync_off = ref_off;
-	sync_len = tail_bytes + bpl;
 	vb = &buf->vb.vb2_buf;
 	dma_dev = dev->hw_dev->dev;
 
 	if (dev->hw_dev->is_dma_sg_ops) {
-		sgt = vb2_dma_sg_plane_desc(vb, uv_plane);
+		sgt = vb2_dma_sg_plane_desc(vb, 0);
 		if (sgt)
 			dma_sync_sgtable_for_cpu(dma_dev, sgt, DMA_BIDIRECTIONAL);
+		if (have_uv && uv_plane != 0) {
+			sgt = vb2_dma_sg_plane_desc(vb, uv_plane);
+			if (sgt)
+				dma_sync_sgtable_for_cpu(dma_dev, sgt,
+							 DMA_BIDIRECTIONAL);
+		}
 	} else {
-		dma_addr_t da = vb2_dma_contig_plane_dma_addr(vb, uv_plane);
+		dma_addr_t da0 = vb2_dma_contig_plane_dma_addr(vb, 0);
 
-		if (da)
-			dma_sync_single_for_cpu(dma_dev, da + uv_off + sync_off,
-						sync_len, DMA_BIDIRECTIONAL);
+		if (da0 && y_sync_len)
+			dma_sync_single_for_cpu(dma_dev, da0 + y_sync_off,
+						y_sync_len, DMA_BIDIRECTIONAL);
+		if (have_uv) {
+			dma_addr_t da = vb2_dma_contig_plane_dma_addr(vb,
+								      uv_plane);
+
+			if (da)
+				dma_sync_single_for_cpu(dma_dev,
+							da + uv_off + sync_off,
+							sync_len,
+							DMA_BIDIRECTIONAL);
+		}
 	}
 
-	rkisp_ft_uv_line_mean(ref, bpl, &ref_u, &ref_v);
-
-	for (i = 0; i < tail_rows; i++) {
-		line = tail + i * bpl;
-		if (!rkisp_ft_uv_line_bad(line, bpl, ref_u, ref_v)) {
-			/* Advance reference through good tail lines. */
-			ref = line;
-			rkisp_ft_uv_line_mean(ref, bpl, &ref_u, &ref_v);
-			continue;
+	if (y_tail && y_ref && y_tail_rows) {
+		y_init = rkisp_ft_y_line_mean(y_ref, bpl);
+		y_bad = 0;
+		for (i = 0; i < y_tail_rows; i++) {
+			y_mean = rkisp_ft_y_line_mean(y_tail + i * bpl, bpl);
+			if (rkisp_ft_y_mean_jump(y_mean, y_init))
+				y_bad++;
 		}
-		memcpy(line, ref, bpl);
-		repaired = true;
+		if (y_bad >= RKISP_FT_Y_BAND_BAD_MIN) {
+			for (i = 0; i < y_tail_rows; i++)
+				memcpy(y_tail + i * bpl, y_ref, bpl);
+			repaired = true;
+		} else if (y_bad) {
+			u8 *y_good = y_ref;
+
+			y_refm = y_init;
+			for (i = 0; i < y_tail_rows; i++) {
+				y_line = y_tail + i * bpl;
+				y_mean = rkisp_ft_y_line_mean(y_line, bpl);
+				if (rkisp_ft_y_mean_jump(y_mean, y_refm) ||
+				    rkisp_ft_y_mean_jump(y_mean, y_init)) {
+					memcpy(y_line, y_good, bpl);
+					repaired = true;
+					continue;
+				}
+				y_good = y_line;
+				y_refm = y_mean;
+			}
+		}
+	}
+
+	if (have_uv) {
+		rkisp_ft_uv_line_mean(ref, bpl, &ref_u, &ref_v);
+
+		for (i = 0; i < tail_rows; i++) {
+			line = tail + i * bpl;
+			if (!rkisp_ft_uv_line_bad(line, bpl, ref_u, ref_v)) {
+				/* Advance reference through good tail lines. */
+				ref = line;
+				rkisp_ft_uv_line_mean(ref, bpl, &ref_u, &ref_v);
+				continue;
+			}
+			memcpy(line, ref, bpl);
+			repaired = true;
+		}
 	}
 
 	if (dev->hw_dev->is_dma_sg_ops) {
-		sgt = vb2_dma_sg_plane_desc(vb, uv_plane);
+		sgt = vb2_dma_sg_plane_desc(vb, 0);
 		if (sgt)
-			dma_sync_sgtable_for_device(dma_dev, sgt, DMA_BIDIRECTIONAL);
+			dma_sync_sgtable_for_device(dma_dev, sgt,
+						    DMA_BIDIRECTIONAL);
+		if (have_uv && uv_plane != 0) {
+			sgt = vb2_dma_sg_plane_desc(vb, uv_plane);
+			if (sgt)
+				dma_sync_sgtable_for_device(dma_dev, sgt,
+							    DMA_BIDIRECTIONAL);
+		}
 	} else {
-		dma_addr_t da = vb2_dma_contig_plane_dma_addr(vb, uv_plane);
+		dma_addr_t da0 = vb2_dma_contig_plane_dma_addr(vb, 0);
 
-		if (da)
-			dma_sync_single_for_device(dma_dev, da + uv_off + sync_off,
-						   sync_len, DMA_BIDIRECTIONAL);
+		if (da0 && y_sync_len)
+			dma_sync_single_for_device(dma_dev, da0 + y_sync_off,
+						   y_sync_len,
+						   DMA_BIDIRECTIONAL);
+		if (have_uv) {
+			dma_addr_t da = vb2_dma_contig_plane_dma_addr(vb,
+								      uv_plane);
+
+			if (da)
+				dma_sync_single_for_device(dma_dev,
+							   da + uv_off + sync_off,
+							   sync_len,
+							   DMA_BIDIRECTIONAL);
+		}
 	}
 	(void)repaired;
 }
