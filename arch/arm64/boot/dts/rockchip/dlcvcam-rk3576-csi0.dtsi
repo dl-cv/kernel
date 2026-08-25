@@ -31,9 +31,9 @@
 	status = "okay";
 	pinctrl-0 = <&i2c4m3_xfer>;
 
-	imx296_mipi0: imx296@1a {
+	imx334_mipi0: imx334@1a {
 		status = "okay";
-		compatible = "sony,imx296lq";
+		compatible = "sony,imx334";
 		reg = <0x1a>;
 		/* Module has on-board 37.125MHz oscillator, disable board MCLK */
 		/* clocks = <&cru CLK_MIPI_CAMERAOUT_M0>; */
@@ -46,14 +46,18 @@
 
 		avdd-supply = <&vcc_mipicsi0_avdd>;
 		dvdd-supply = <&vcc_mipicsi0_dvdd>;
-		ovdd-supply = <&vcc_mipicsi0_dovdd>;
+		dovdd-supply = <&vcc_mipicsi0_dovdd>;
 
 		reset-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_LOW>;
 
-		/* External trigger: PWM output on GPIO0_B5 (pwm1_ch1_m0) */
-		pwm-names = "trigger";
-		pwms = <&pwm1_6ch_1 0 10000000 PWM_POLARITY_INVERTED>;
-		rockchip,trigger-pulse-us = <800>;
+		/* IMX334 slave sync: XVS=GPIO0_B5, XHS=GPIO2_C7. */
+		pwm-names = "xvs", "xhs";
+		pwms = <&pwm1_6ch_1 0 33333333 0>,
+		       <&pwm0_2ch_1 0 14815 0>;
+		rockchip,xvs-pulse-us = <15>;
+		rockchip,xvs-period-ns = <33333333>;
+		rockchip,xhs-period-ns = <14815>;
+		rockchip,xhs-duty-ns = <200>;
 
 		/* Light source control on GPIO1/OUTPUT1 = GPIO0_C7 */
 		light-source-gpios = <&gpio0 RK_PC7 GPIO_ACTIVE_HIGH>;
@@ -62,22 +66,23 @@
 		light-source-exposure-off-delay-us = <0>;
 
 		pinctrl-names = "default", "active-high";
-		pinctrl-0 = <&imx296_light_source_pin>;
-		pinctrl-1 = <&imx296_light_source_active_high_pin>;
+		pinctrl-0 = <&imx334_light_source_pin>;
+		pinctrl-1 = <&imx334_light_source_active_high_pin>;
 
 		rockchip,camera-module-index = <0>;
 		rockchip,camera-module-facing = "back";
-		rockchip,camera-module-name = "IMX296-MIPI";
+		rockchip,camera-module-name = "IMX334-MIPI";
 		rockchip,camera-module-lens-name = "default";
 
-		/* 0 = FREE_RUN, 1 = XTRIG_ONE_SHOT */
+		/* 0 = FREE_RUN, 1 = XVS_XHS_ONE_SHOT */
 		trigger-mode = <1>;
 
 		port {
-			imx296_dcphy0_out: endpoint {
-				remote-endpoint = <&dcphy0_in_imx296>;
+			imx334_dcphy0_out: endpoint {
+				remote-endpoint = <&dcphy0_in_imx334>;
 				clock-lanes = <0>;
-				data-lanes = <1>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <445500000>;
 			};
 		};
 	};
@@ -95,10 +100,10 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			dcphy0_in_imx296: endpoint@1 {
+			dcphy0_in_imx334: endpoint@1 {
 				reg = <1>;
-				remote-endpoint = <&imx296_dcphy0_out>;
-				data-lanes = <1>;
+				remote-endpoint = <&imx334_dcphy0_out>;
+				data-lanes = <1 2 3 4>;
 			};
 		};
 		port@1 {
@@ -221,8 +226,15 @@
 };
 
 /*-----------------------------------------------------------
- * PWM1 CH1 for IMX296 external trigger output on GPIO0_B5
+ * IMX334 XVS on PWM1 CH1 M0 / GPIO0_B5
  *----------------------------------------------------------*/
 &pwm1_6ch_1 {
 	status = "okay";
+};
+
+/* IMX334 XHS on PWM0 CH1 M2 / GPIO2_C7. */
+&pwm0_2ch_1 {
+	status = "okay";
+	pinctrl-names = "active";
+	pinctrl-0 = <&pwm0m2_ch1>;
 };

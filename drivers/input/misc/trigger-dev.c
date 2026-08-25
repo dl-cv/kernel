@@ -53,6 +53,12 @@ enum trigger_dev_result_led {
 	TRIGGER_DEV_RESULT_NG,
 };
 
+enum trigger_dev_action_mode {
+	TRIGGER_DEV_ACTION_SYSFS = 0,
+	TRIGGER_DEV_ACTION_GPIO,
+	TRIGGER_DEV_ACTION_NOTIFY,
+};
+
 struct trigger_dev {
 	struct device		*dev;
 	struct gpio_desc	*input_gpiod;
@@ -83,8 +89,8 @@ struct trigger_dev {
 	char			*trigger_payload;
 	size_t			trigger_payload_len;
 
-	/* 运行时模式：true=GPIO 直连(Mode A)，false=sysfs(Mode B)；两者都配置时优先 GPIO */
-	bool			mode_use_gpio;
+	/* Runtime action mode; notify keeps IRQ/input events but skips camera action. */
+	enum trigger_dev_action_mode action_mode;
 	struct mutex		mode_mutex;
 
 	/* 结果指示灯：DT ok-led-gpios / ng-led-gpios；逻辑 0=inactive(灭) 1=active(亮) */
@@ -95,12 +101,14 @@ struct trigger_dev {
 	struct mutex		led_mutex;
 
 	atomic_t		trigger_pending;
+	atomic_t		trigger_active;
 	struct work_struct	trigger_work;
 
 	/* Debug stats */
 	atomic64_t		irq_count;
 	atomic64_t		trigger_ok_count;
 	atomic64_t		trigger_fail_count;
+	atomic64_t		trigger_drop_count;
 	u32			max_pending;
 	u64			last_irq_ns;
 };
@@ -271,18 +279,32 @@ static void trigger_dev_leds_set_ng_locked(struct trigger_dev *tdev)
 	tdev->result_led = TRIGGER_DEV_RESULT_NG;
 }
 
+static const char *trigger_dev_action_mode_name(enum trigger_dev_action_mode mode)
+{
+	switch (mode) {
+	case TRIGGER_DEV_ACTION_GPIO:
+		return "gpio";
+	case TRIGGER_DEV_ACTION_NOTIFY:
+		return "notify";
+	case TRIGGER_DEV_ACTION_SYSFS:
+	default:
+		return "sysfs";
+	}
+}
+
 static void trigger_dev_trigger_work(struct work_struct *work)
 {
 	struct trigger_dev *tdev =
 		container_of(work, struct trigger_dev, trigger_work);
-	bool use_gpio;
+	enum trigger_dev_action_mode action_mode;
 	int pending_left;
 	u64 t0, dt_us;
 	s64 seq;
 	int ret;
 
-	/* Drain pending triggers (presses) */
+	/* Drain the single bounded pending request. */
 	while (atomic_dec_if_positive(&tdev->trigger_pending) >= 0) {
+		atomic_set(&tdev->trigger_active, 1);
 		mutex_lock(&tdev->led_mutex);
 		if (tdev->result_led_enable)
 			trigger_dev_leds_off_locked(tdev);
@@ -290,10 +312,12 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 
 		t0 = ktime_get_ns();
 		mutex_lock(&tdev->mode_mutex);
-		use_gpio = tdev->mode_use_gpio && tdev->output_gpiod;
+		action_mode = tdev->action_mode;
 		mutex_unlock(&tdev->mode_mutex);
 
-		if (use_gpio)
+		if (action_mode == TRIGGER_DEV_ACTION_NOTIFY)
+			ret = 0;
+		else if (action_mode == TRIGGER_DEV_ACTION_GPIO && tdev->output_gpiod)
 			ret = trigger_dev_pulse_output(tdev);
 		else if (tdev->trigger_path)
 			ret = trigger_dev_write_once(tdev);
@@ -303,7 +327,7 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 		if (ret) {
 			atomic64_inc(&tdev->trigger_fail_count);
 			dev_err(tdev->dev, "trigger failed: %s ret=%d\n",
-				use_gpio ? "gpio" : "sysfs", ret);
+				trigger_dev_action_mode_name(action_mode), ret);
 		} else {
 			atomic64_inc(&tdev->trigger_ok_count);
 		}
@@ -315,7 +339,7 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 		dev_info(tdev->dev,
 			 "触发处理 seq=%lld mode=%s ret=%d cost=%lluus pending=%d irq_total=%lld ok=%lld fail=%lld\n",
 			 seq,
-			 use_gpio ? "gpio" : "sysfs",
+			 trigger_dev_action_mode_name(action_mode),
 			 ret,
 			 dt_us,
 			 pending_left,
@@ -323,6 +347,21 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 			 atomic64_read(&tdev->trigger_ok_count),
 			 atomic64_read(&tdev->trigger_fail_count));
 	}
+	atomic_set(&tdev->trigger_active, 0);
+}
+
+static bool trigger_dev_queue_request(struct trigger_dev *tdev)
+{
+	if (atomic_read(&tdev->trigger_active) ||
+	    atomic_cmpxchg(&tdev->trigger_pending, 0, 1) != 0) {
+		atomic64_inc(&tdev->trigger_drop_count);
+		return false;
+	}
+
+	if (tdev->max_pending < 1)
+		tdev->max_pending = 1;
+	schedule_work(&tdev->trigger_work);
+	return true;
 }
 
 static void trigger_dev_handle_state(struct trigger_dev *tdev, bool pressed_now)
@@ -337,14 +376,9 @@ static void trigger_dev_handle_state(struct trigger_dev *tdev, bool pressed_now)
 		input_report_key(tdev->input, tdev->key_code, 1);
 		input_sync(tdev->input);
 
-		/*
-		 * Only one trigger per press. Pending counter ensures we don't
-		 * lose fast repeated press cycles even if trigger_work is busy.
-		 */
-		atomic_inc(&tdev->trigger_pending);
-		if ((u32)atomic_read(&tdev->trigger_pending) > tdev->max_pending)
-			tdev->max_pending = atomic_read(&tdev->trigger_pending);
-		schedule_work(&tdev->trigger_work);
+		/* Keep at most one request pending; never replay stale presses later. */
+		if (!trigger_dev_queue_request(tdev))
+			dev_warn(tdev->dev, "触发忙，丢弃本次按下\n");
 	} else {
 		dev_info(tdev->dev, "up\n");
 		input_report_key(tdev->input, tdev->key_code, 0);
@@ -367,11 +401,18 @@ static void trigger_dev_debounce_work(struct work_struct *work)
 	trigger_dev_handle_state(tdev, !!val);
 }
 
+static void trigger_dev_report_pulse(struct trigger_dev *tdev)
+{
+	input_event(tdev->input, EV_KEY, tdev->key_code, 1);
+	input_sync(tdev->input);
+	input_event(tdev->input, EV_KEY, tdev->key_code, 0);
+	input_sync(tdev->input);
+}
+
 static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 {
 	struct trigger_dev *tdev = dev_id;
 	enum trigger_dev_input_mode input_mode = READ_ONCE(tdev->input_mode);
-	int pending;
 
 	tdev->last_irq_ns = ktime_get_ns();
 	atomic64_inc(&tdev->irq_count);
@@ -383,12 +424,9 @@ static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 	 * may already bounce back before deferred work runs.
 	 */
 	if (input_mode == TRIGGER_DEV_INPUT_MODE_EDGE) {
-		pending = atomic_inc_return(&tdev->trigger_pending);
-		if ((u32)pending > tdev->max_pending)
-			tdev->max_pending = pending;
-		schedule_work(&tdev->trigger_work);
-		if (pending > 1)
-			dev_warn(tdev->dev, "触发排队中 pending=%d\n", pending);
+		trigger_dev_report_pulse(tdev);
+		if (!trigger_dev_queue_request(tdev))
+			dev_warn(tdev->dev, "触发忙，丢弃本次边沿\n");
 		return IRQ_HANDLED;
 	}
 
@@ -487,7 +525,8 @@ static int trigger_dev_parse_dt(struct device *dev, struct trigger_dev *tdev)
 		return -EINVAL;
 
 	/* Default mode: prefer gpio when both configured */
-	tdev->mode_use_gpio = tdev->output_gpiod;
+	tdev->action_mode = tdev->output_gpiod ?
+		TRIGGER_DEV_ACTION_GPIO : TRIGGER_DEV_ACTION_SYSFS;
 
 	/* Try hardware debounce if available, else keep software debounce. */
 	if (tdev->debounce_ms) {
@@ -552,9 +591,11 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&tdev->debounce_work, trigger_dev_debounce_work);
 	INIT_WORK(&tdev->trigger_work, trigger_dev_trigger_work);
 	atomic_set(&tdev->trigger_pending, 0);
+	atomic_set(&tdev->trigger_active, 0);
 	atomic64_set(&tdev->irq_count, 0);
 	atomic64_set(&tdev->trigger_ok_count, 0);
 	atomic64_set(&tdev->trigger_fail_count, 0);
+	atomic64_set(&tdev->trigger_drop_count, 0);
 	tdev->max_pending = 0;
 	tdev->last_irq_ns = 0;
 
@@ -597,8 +638,7 @@ static int trigger_dev_probe(struct platform_device *pdev)
 		 trigger_dev_input_mode_name(tdev->input_mode),
 		 tdev->debounce_ms,
 		 tdev->key_code,
-		 tdev->output_gpiod ?
-		 "direct-gpio-pulse" : "sysfs-write");
+		 trigger_dev_action_mode_name(tdev->action_mode));
 	if (tdev->input_mode == TRIGGER_DEV_INPUT_MODE_BUTTON &&
 	    !tdev->debounce_ms)
 		dev_warn(dev, "button input mode is selected with debounce-ms=0; mechanical keys may still bounce\n");
@@ -666,33 +706,44 @@ static ssize_t input_mode_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(input_mode);
 
-/* Sysfs: mode (gpio|sysfs) */
-static ssize_t mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+/* Sysfs: mode (gpio|sysfs|notify) */
+static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
 {
 	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	enum trigger_dev_action_mode mode;
 
-	return sysfs_emit(buf, "%s\n", tdev->mode_use_gpio ? "gpio" : "sysfs");
+	mutex_lock(&tdev->mode_mutex);
+	mode = tdev->action_mode;
+	mutex_unlock(&tdev->mode_mutex);
+	return sysfs_emit(buf, "%s\n", trigger_dev_action_mode_name(mode));
 }
 
 static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
 			  const char *buf, size_t count)
 {
 	struct trigger_dev *tdev = dev_get_drvdata(dev);
-	bool use_gpio;
-	bool can_switch = tdev->output_gpiod && tdev->trigger_path;
+	enum trigger_dev_action_mode mode;
 
-	if (!can_switch)
-		return -EOPNOTSUPP;
-
-	if (sysfs_streq(buf, "gpio"))
-		use_gpio = true;
-	else if (sysfs_streq(buf, "sysfs"))
-		use_gpio = false;
-	else
+	if (sysfs_streq(buf, "notify") || sysfs_streq(buf, "listen-only"))
+		mode = TRIGGER_DEV_ACTION_NOTIFY;
+	else if (sysfs_streq(buf, "gpio")) {
+		if (!tdev->output_gpiod)
+			return -ENODEV;
+		mode = TRIGGER_DEV_ACTION_GPIO;
+	} else if (sysfs_streq(buf, "sysfs")) {
+		if (!tdev->trigger_path)
+			return -ENODEV;
+		mode = TRIGGER_DEV_ACTION_SYSFS;
+	} else {
 		return -EINVAL;
+	}
 
+	cancel_work_sync(&tdev->trigger_work);
+	atomic_set(&tdev->trigger_pending, 0);
+	atomic_set(&tdev->trigger_active, 0);
 	mutex_lock(&tdev->mode_mutex);
-	tdev->mode_use_gpio = use_gpio;
+	tdev->action_mode = mode;
 	mutex_unlock(&tdev->mode_mutex);
 
 	return count;
@@ -874,10 +925,12 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 	u64 ago_us = tdev->last_irq_ns ? div_u64(now - tdev->last_irq_ns, 1000) : 0;
 
 	return sysfs_emit(buf,
-			  "irq=%lld ok=%lld fail=%lld pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u\n",
+			  "irq=%lld ok=%lld fail=%lld dropped=%lld active=%d pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u\n",
 			  atomic64_read(&tdev->irq_count),
 			  atomic64_read(&tdev->trigger_ok_count),
 			  atomic64_read(&tdev->trigger_fail_count),
+			  atomic64_read(&tdev->trigger_drop_count),
+			  atomic_read(&tdev->trigger_active),
 			  atomic_read(&tdev->trigger_pending),
 			  tdev->max_pending,
 			  ago_us,

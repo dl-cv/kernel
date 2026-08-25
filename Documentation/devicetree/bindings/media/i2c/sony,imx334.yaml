@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
-# Copyright (C) 2021 Intel Corporation
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/media/i2c/sony,imx334.yaml#
@@ -12,77 +11,156 @@ maintainers:
   - Daniele Alessandrelli <daniele.alessandrelli@intel.com>
 
 description:
-  IMX334 sensor is a Sony CMOS active pixel digital image sensor with an active
-  array size of 3864H x 2202V. It is programmable through I2C interface. The
-  I2C client address is fixed to 0x1a as per sensor data sheet. Image data is
-  sent through MIPI CSI-2.
+  Sony IMX334 CMOS image sensor connected through a four-lane MIPI CSI-2
+  interface. The input clock may be supplied by the host or by an oscillator
+  on the camera module. In slave operation XVS and XHS are supplied by two PWM
+  outputs.
 
 properties:
   compatible:
     const: sony,imx334
+
   reg:
-    description: I2C address
     maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    items:
+      - enum: [inck, xvclk]
 
   assigned-clocks: true
   assigned-clock-parents: true
   assigned-clock-rates: true
 
-  clocks:
-    description: Clock frequency from 6 to 27 MHz, 37.125MHz, 74.25MHz
+  power-domains:
     maxItems: 1
 
+  avdd-supply: true
+  dvdd-supply: true
+  dovdd-supply: true
+  ovdd-supply: true
+
   reset-gpios:
-    description: Reference to the GPIO connected to the XCLR pin, if any.
+    description: GPIO connected to the active-low XCLR input.
+    maxItems: 1
+
+  pwdn-gpios:
+    maxItems: 1
+
+  pwms:
+    minItems: 2
+    maxItems: 2
+
+  pwm-names:
+    items:
+      - const: xvs
+      - const: xhs
+
+  trigger-mode:
+    description: Default mode, 0 for continuous synchronization and 1 for one-shot XVS.
+    enum: [0, 1]
+    default: 0
+
+  rockchip,xvs-pulse-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 1000
+
+  rockchip,xvs-period-ns:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  rockchip,xhs-period-ns:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  rockchip,xhs-duty-ns:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  light-source-gpios:
+    maxItems: 1
+
+  light-source-active-level:
+    enum: [low, high]
+
+  light-source-exposure-advance-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 100000
+
+  light-source-exposure-off-delay-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 1000000
+
+  rockchip,camera-module-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  rockchip,camera-module-facing:
+    enum: [back, front]
+
+  rockchip,camera-module-name:
+    $ref: /schemas/types.yaml#/definitions/string
+
+  rockchip,camera-module-lens-name:
+    $ref: /schemas/types.yaml#/definitions/string
 
   port:
     additionalProperties: false
     $ref: /schemas/graph.yaml#/$defs/port-base
-
     properties:
       endpoint:
         $ref: /schemas/media/video-interfaces.yaml#
         unevaluatedProperties: false
-
         properties:
-          data-lanes: true
-          link-frequencies: true
-
+          data-lanes:
+            minItems: 4
+            maxItems: 4
+          link-frequencies:
+            minItems: 1
+            maxItems: 1
         required:
           - data-lanes
           - link-frequencies
-
     required:
       - endpoint
 
 required:
   - compatible
   - reg
-  - clocks
+  - avdd-supply
+  - dvdd-supply
   - port
 
 additionalProperties: false
 
 examples:
   - |
-    i2c0 {
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/pwm/pwm.h>
+
+    i2c {
         #address-cells = <1>;
         #size-cells = <0>;
 
         camera@1a {
             compatible = "sony,imx334";
             reg = <0x1a>;
-            clocks = <&imx334_clk>;
-
-            assigned-clocks = <&imx334_clk>;
-            assigned-clock-parents = <&imx334_clk_parent>;
-            assigned-clock-rates = <24000000>;
+            avdd-supply = <&camera_avdd>;
+            dvdd-supply = <&camera_dvdd>;
+            reset-gpios = <&gpio3 28 GPIO_ACTIVE_LOW>;
+            pwm-names = "xvs", "xhs";
+            pwms = <&pwm1 1 33333333 PWM_POLARITY_NORMAL>,
+                   <&pwm0 1 14815 PWM_POLARITY_NORMAL>;
+            trigger-mode = <1>;
+            rockchip,xvs-pulse-us = <15>;
+            rockchip,xvs-period-ns = <33333333>;
+            rockchip,xhs-period-ns = <14815>;
+            rockchip,xhs-duty-ns = <200>;
 
             port {
                 imx334: endpoint {
                     remote-endpoint = <&cam>;
                     data-lanes = <1 2 3 4>;
-                    link-frequencies = /bits/ 64 <891000000>;
+                    link-frequencies = /bits/ 64 <445500000>;
                 };
             };
         };

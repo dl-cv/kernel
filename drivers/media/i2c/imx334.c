@@ -17,6 +17,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/pwm.h>
 #include <linux/regulator/consumer.h>
 #include <linux/sysfs.h>
 #include <linux/slab.h>
@@ -60,6 +61,9 @@
 #define IMX334_REG_CHIP_ID		0x302c
 
 #define IMX334_REG_CTRL_MODE		0x3000
+#define IMX334_REG_GROUP_HOLD		0x3001
+#define IMX334_GROUP_HOLD_START		0x01
+#define IMX334_GROUP_HOLD_END		0x00
 #define IMX334_MODE_SW_STANDBY		0x1
 #define IMX334_MODE_STREAMING		0x0
 
@@ -122,6 +126,35 @@
 #define OF_CAMERA_HDR_MODE		"rockchip,camera-hdr-mode"
 #define OF_CAMERA_PINCTRL_STATE_DEFAULT	"rockchip,camera_default"
 #define OF_CAMERA_PINCTRL_STATE_SLEEP	"rockchip,camera_sleep"
+#define OF_IMX334_TRIGGER_MODE		"trigger-mode"
+#define OF_IMX334_XVS_PULSE_US		"rockchip,xvs-pulse-us"
+#define OF_IMX334_XHS_DUTY_NS		"rockchip,xhs-duty-ns"
+#define OF_IMX334_XHS_PERIOD_NS		"rockchip,xhs-period-ns"
+#define OF_IMX334_XVS_PERIOD_NS		"rockchip,xvs-period-ns"
+
+#define IMX334_XHS_PERIOD_NS_DEFAULT	14815U
+#define IMX334_XHS_DUTY_NS_DEFAULT	200U
+#define IMX334_XVS_PERIOD_NS_DEFAULT	33333333U
+#define IMX334_XVS_PULSE_US_DEFAULT	15U
+#define IMX334_XVS_PULSE_US_MIN		1U
+#define IMX334_XVS_PULSE_US_MAX		1000U
+#define IMX334_TRIGGER_BURST_COUNT_DEFAULT	3U
+#define IMX334_TRIGGER_BURST_COUNT_MAX	8U
+#define IMX334_STANDBY_EXIT_US		18000U
+#define IMX334_EXPOSURE_OFFSET_NS	1468ULL
+
+#ifndef V4L2_CID_USER_IMX334_BASE
+#define V4L2_CID_USER_IMX334_BASE	(V4L2_CID_USER_BASE + 0x10d0)
+#endif
+#define V4L2_CID_IMX334_OP_MODE		(V4L2_CID_USER_IMX334_BASE + 0x1)
+#define V4L2_CID_IMX334_LIGHT_SOURCE_ENABLE \
+	(V4L2_CID_USER_IMX334_BASE + 0x2)
+#define V4L2_CID_IMX334_LIGHT_SOURCE_ACTIVE_LEVEL \
+	(V4L2_CID_USER_IMX334_BASE + 0x3)
+#define V4L2_CID_IMX334_LIGHT_SOURCE_ADVANCE_US \
+	(V4L2_CID_USER_IMX334_BASE + 0x4)
+#define V4L2_CID_IMX334_LIGHT_SOURCE_OFF_DELAY_US \
+	(V4L2_CID_USER_IMX334_BASE + 0x5)
 
 #define IMX334_NAME			"imx334"
 
@@ -136,6 +169,11 @@ static const char * const imx334_supply_names[] = {
 };
 
 #define IMX334_NUM_SUPPLIES ARRAY_SIZE(imx334_supply_names)
+
+enum imx334_op_mode {
+	IMX334_FREE_RUN = 0,
+	IMX334_XVS_XHS_ONE_SHOT = 1,
+};
 
 struct regval {
 	u16 addr;
@@ -164,6 +202,9 @@ struct imx334 {
 	struct clk		*xvclk;
 	struct gpio_desc	*reset_gpio;
 	struct gpio_desc	*pwdn_gpio;
+	struct gpio_desc	*light_source_gpio;
+	struct pwm_device	*xvs_pwm;
+	struct pwm_device	*xhs_pwm;
 	struct regulator_bulk_data supplies[IMX334_NUM_SUPPLIES];
 
 	struct pinctrl		*pinctrl;
@@ -181,6 +222,11 @@ struct imx334 {
 	struct v4l2_ctrl	*test_pattern;
 	struct v4l2_ctrl	*pixel_rate;
 	struct v4l2_ctrl	*link_freq;
+	struct v4l2_ctrl	*op_mode_ctrl;
+	struct v4l2_ctrl	*light_source_enable_ctrl;
+	struct v4l2_ctrl	*light_source_active_level_ctrl;
+	struct v4l2_ctrl	*light_source_advance_us_ctrl;
+	struct v4l2_ctrl	*light_source_off_delay_us_ctrl;
 	struct mutex		mutex;
 	bool			streaming;
 	bool			power_on;
@@ -190,10 +236,29 @@ struct imx334 {
 	const char		*module_name;
 	const char		*len_name;
 	u32			cur_vts;
-	bool			has_init_exp;
-	struct preisp_hdrae_exp_s init_hdrae_exp;
 	u32			cur_vclk_freq;
 	u32			cur_mipi_freq_idx;
+	enum rkmodule_sync_mode sync_mode;
+	enum imx334_op_mode active_mode;
+	enum imx334_op_mode pending_mode;
+	u32 xvs_pulse_us;
+	u32 xvs_period_ns;
+	u32 xhs_period_ns;
+	u32 xhs_duty_ns;
+	bool xhs_enabled;
+	bool trigger_busy;
+	u32 trigger_burst_count;
+	u64 trigger_request_count;
+	u64 trigger_complete_count;
+	u64 trigger_fail_count;
+	u64 trigger_busy_count;
+	u64 trigger_start_ns;
+	u64 trigger_end_ns;
+	u64 last_trigger_ns;
+	bool light_source_enabled;
+	bool light_source_active_level;
+	u32 light_source_advance_us;
+	u32 light_source_off_delay_us;
 };
 
 #define to_imx334(sd) container_of(sd, struct imx334, subdev)
@@ -206,7 +271,7 @@ static const struct regval imx334_10_3840x2160_global_regs[] = {
 	{0x3050, 0x00},// ADBIT[0]
 	{0x316A, 0x7E},// INCKSEL4[1:0]
 	{0x319D, 0x00},// MDBIT
-	{0x31A1, 0x00},// XVS_DRV[1:0]
+	{0x31A1, 0x0F},// XVS/XHS input Hi-Z in slave mode
 	{0x3288, 0x21},// -
 	{0x328A, 0x02},// -
 	{0x3414, 0x05},// -
@@ -323,199 +388,22 @@ static const struct regval imx334_linear_10_3840x2160_regs[] = {
  *AD:10bit Output:10bit 1782Mbps Master Mode DOL HDR 2frame VC
  *Tool ver : Ver3.0
  */
-static const struct regval imx334_hdr_10_3840x2160_regs[] = {
-	{0x302E, 0x18},
-	{0x302F, 0x0f},
-	{0x3030, 0xC4},// VMAX[19:0]
-	{0x3031, 0x09},//
-	{0x3034, 0xEF},// HMAX[15:0]
-	{0x3035, 0x01},//
-	{0x3048, 0x01},// WDMODE[0]
-	{0x3049, 0x01},// WDSEL[1:0]
-	{0x304A, 0x01},// WD_SET1[2:0]
-	{0x304B, 0x02},// WD_SET2[3:0]
-	{0x304C, 0x13},// OPB_SIZE_V[5:0]
-	{0x3058, 0xD0},// SHR0[19:0]
-	{0x3059, 0x07},//
-	{0x3068, 0x51},// RHS1[19:0]
-	{0x3069, 0x05},//{
-	{0x3076, 0x84},
-	{0x3077, 0x08},
-	{0x315A, 0x02},// INCKSEL2[1:0]
-	{0x319E, 0x00},
-	{0x31D7, 0x01},// XVSMSKCNT_INT[1:0]
-	{0x3200, 0x10},// FGAINEN[0]
-	{0x341C, 0xFF},// ADBIT1[8:0]
-	{0x3a18, 0xB7},
-	{0x3a1a, 0x67},
-	{0x3a1c, 0x6F},
-	{0x3a1e, 0xf7},
-	{0x3a1f, 0xDF},
-	{0x3a20, 0x6F},
-	{0x3a22, 0xCF},
-	{0x3a24, 0x6F},
-	{0x3a26, 0xB7},
-	{0x3a28, 0x5F},
-	{REG_NULL, 0x00},
-};
 
-static const struct regval imx334_12_3840x2160_global_regs[] = {
-	{0x3001, 0x00},
-	{0x3002, 0x00},
-	{0x31A1, 0x00},// XVS_DRV[1:0]
-	{0x3288, 0x21},// -
-	{0x328A, 0x02},// -
-	{0x3414, 0x05},// -
-	{0x3416, 0x18},// -
-	{0x35AC, 0x0E},// -
-	{0x3648, 0x01},// -
-	{0x364A, 0x04},// -
-	{0x364C, 0x04},// -
-	{0x3678, 0x01},// -
-	{0x367C, 0x31},// -
-	{0x367E, 0x31},// -
-	{0x3708, 0x02},// -
-	{0x3714, 0x01},// -
-	{0x3715, 0x02},// -
-	{0x3716, 0x02},// -
-	{0x3717, 0x02},// -
-	{0x371C, 0x3D},// -
-	{0x371D, 0x3F},// -
-	{0x372C, 0x00},// -
-	{0x372D, 0x00},// -
-	{0x372E, 0x46},// -
-	{0x372F, 0x00},// -
-	{0x3730, 0x89},// -
-	{0x3731, 0x00},// -
-	{0x3732, 0x08},// -
-	{0x3733, 0x01},// -
-	{0x3734, 0xFE},// -
-	{0x3735, 0x05},// -
-	{0x375D, 0x00},// -
-	{0x375E, 0x00},// -
-	{0x375F, 0x61},// -
-	{0x3760, 0x06},// -
-	{0x3768, 0x1B},// -
-	{0x3769, 0x1B},// -
-	{0x376A, 0x1A},// -
-	{0x376B, 0x19},// -
-	{0x376C, 0x18},// -
-	{0x376D, 0x14},// -
-	{0x376E, 0x0F},// -
-	{0x3776, 0x00},// -
-	{0x3777, 0x00},// -
-	{0x3778, 0x46},// -
-	{0x3779, 0x00},// -
-	{0x377A, 0x08},// -
-	{0x377B, 0x01},// -
-	{0x377C, 0x45},// -
-	{0x377D, 0x01},// -
-	{0x377E, 0x23},// -
-	{0x377F, 0x02},// -
-	{0x3780, 0xD9},// -
-	{0x3781, 0x03},// -
-	{0x3782, 0xF5},// -
-	{0x3783, 0x06},// -
-	{0x3784, 0xA5},// -
-	{0x3788, 0x0F},// -
-	{0x378A, 0xD9},// -
-	{0x378B, 0x03},// -
-	{0x378C, 0xEB},// -
-	{0x378D, 0x05},// -
-	{0x378E, 0x87},// -
-	{0x378F, 0x06},// -
-	{0x3790, 0xF5},// -
-	{0x3792, 0x43},// -
-	{0x3794, 0x7A},// -
-	{0x3796, 0xA1},// -
-	{0x3E04, 0x0E},// -
-	{REG_NULL, 0x00},
-};
+
+
 /*
  *IMX334LQR All-pixel scan CSI-2_4lane 37.125Mhz
  *AD:12bit Output:12bit 1188Mbps Master Mode 30fps
  *Tool ver : Ver4.0
  */
-static const struct regval imx334_linear_12_3840x2160_regs[] = {
-	{0x302E, 0x18},
-	{0x302F, 0x0f},
-	{0x3030, 0xCA},// VMAX[19:0]
-	{0x3031, 0x08},//
-	{0x300C, 0x5B},// BCWAIT_TIME[7:0]
-	{0x300D, 0x40},// CPWAIT_TIME[7:0]
-	{0x3034, 0x4C},// HMAX[15:0]
-	{0x3035, 0x04},//
-	{0x3048, 0x00},// WDMODE[0]
-	{0x3049, 0x00},// WDSEL[1:0]
-	{0x304A, 0x00},// WD_SET1[2:0]
-	{0x304B, 0x01},// WD_SET2[3:0]
-	{0x304C, 0x14},// OPB_SIZE_V[5:0]
-	{0x3058, 0x17},// SHR0[19:0]
-	{0x3059, 0x00},//
-	{0x3068, 0x8B},// RHS1[19:0]
-	{0x3069, 0x00},//
-	{0x3076, 0x84},
-	{0x3077, 0x08},
-	{0x314C, 0x80},// INCKSEL 1[8:0]
-	{0x315A, 0x02},// INCKSEL2[1:0]
-	{0x316A, 0x7E},// INCKSEL4[1:0]
-	{0x319E, 0x01},// SYS_MODE
-	{0x31D7, 0x00},// XVSMSKCNT_INT[1:0]
-	{0x3200, 0x11},// FGAINEN[0]
-	{0x3A18, 0x8F},// TCLKPOST[15:0]
-	{0x3A1A, 0x4F},// TCLKPREPARE[15:0]
-	{0x3A1C, 0x47},// TCLKTRAIL[15:0]
-	{0x3A1E, 0x37},// TCLKZERO[15:0]
-	{0x3A20, 0x4F},// THSPREPARE[15:0]
-	{0x3A22, 0x87},// THSZERO[15:0]
-	{0x3A24, 0x4F},// THSTRAIL[15:0]
-	{0x3A26, 0x7F},// THSEXIT[15:0]
-	{0x3A28, 0x3F},// TLPX[15:0]
-	{REG_NULL, 0x00},
-};
+
 
 /*
  *All-pixel scan CSI-2_4lane 74.25Mhz
  *AD:12bit Output:12bit 1782Mbps Master Mode DOL HDR 2frame VC
  *Tool ver : Ver3.0
  */
-static const struct regval imx334_hdr_12_74M_3840x2160_regs[] = {
-	{0x302E, 0x18},
-	{0x302F, 0x0f},
-	{0x3030, 0xC8},// VMAX[19:0]
-	{0x3031, 0x08},//
-	{0x300C, 0xB6},// BCWAIT_TIME[7:0]
-	{0x300D, 0x7F},// CPWAIT_TIME[7:0]
-	{0x3034, 0x26},// HMAX[15:0]
-	{0x3035, 0x02},//
-	{0x3048, 0x01},// WDMODE[0]
-	{0x3049, 0x01},// WDSEL[1:0]
-	{0x304A, 0x01},// WD_SET1[2:0]
-	{0x304B, 0x02},// WD_SET2[3:0]
-	{0x304C, 0x13},// OPB_SIZE_V[5:0]
-	{0x3058, 0xC2},// SHR0[19:0]
-	{0x3059, 0x01},//
-	{0x3068, 0x19},// RHS1[19:0]
-	{0x3069, 0x01},//
-	{0x3076, 0x84},
-	{0x3077, 0x08},
-	{0x314C, 0xC0},// INCKSEL 1[8:0]
-	{0x315A, 0x03},// INCKSEL2[1:0]
-	{0x316A, 0x7F},// INCKSEL4[1:0]
-	{0x319E, 0x00},// SYS_MODE
-	{0x31D7, 0x01},// XVSMSKCNT_INT[1:0]
-	{0x3200, 0x10},// FGAINEN[0]
-	{0x3A18, 0xB7},// TCLKPOST[15:0]
-	{0x3A1A, 0x67},// TCLKPREPARE[15:0]
-	{0x3A1C, 0x6F},// TCLKTRAIL[15:0]
-	{0x3A1E, 0xDF},// TCLKZERO[15:0]
-	{0x3A20, 0x6F},// THSPREPARE[15:0]
-	{0x3A22, 0xCF},// THSZERO[15:0]
-	{0x3A24, 0x6F},// THSTRAIL[15:0]
-	{0x3A26, 0xB7},// THSEXIT[15:0]
-	{0x3A28, 0x5F},// TLPX[15:0]
-	{REG_NULL, 0x00},
-};
+
 
 static const struct imx334_mode supported_modes[] = {
 	{
@@ -536,66 +424,6 @@ static const struct imx334_mode supported_modes[] = {
 		.bpp = 10,
 		.mipi_freq_idx = 0,
 		.vc[PAD0] = 0,
-	}, {
-		.width = 3864,
-		.height = 2180,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.exp_def = 0x0080,
-		.hts_def = 0x01EF * 8,
-		.vts_def = 0x09C4 * 2,
-		.global_reg_list = imx334_10_3840x2160_global_regs,
-		.reg_list = imx334_hdr_10_3840x2160_regs,
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
-		.hdr_mode = HDR_X2,
-		.vclk_freq = IMX334_XVCLK_FREQ_37,
-		.bpp = 10,
-		.mipi_freq_idx = 2,
-		.vc[PAD0] = 1,
-		.vc[PAD1] = 0,//L->csi wr0
-		.vc[PAD2] = 1,
-		.vc[PAD3] = 1,//M->csi wr2
-	}, {
-		.width = 3864,
-		.height = 2180,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.exp_def = 0x0600,
-		.hts_def = 0x044C * 4,
-		.vts_def = 0x08CA,
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB12_1X12,
-		.global_reg_list = imx334_12_3840x2160_global_regs,
-		.reg_list = imx334_linear_12_3840x2160_regs,
-		.hdr_mode = NO_HDR,
-		.vclk_freq = IMX334_XVCLK_FREQ_37,
-		.bpp = 12,
-		.mipi_freq_idx = 1,
-		.vc[PAD0] = 0,
-	}, {
-		.width = 3864,
-		.height = 2180,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.exp_def = 0x0080,
-		.hts_def = 0x0226 * 8,
-		.vts_def = 0x08C8 * 2,
-		.global_reg_list = imx334_12_3840x2160_global_regs,
-		.reg_list = imx334_hdr_12_74M_3840x2160_regs,
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB12_1X12,
-		.hdr_mode = HDR_X2,
-		.vclk_freq = IMX334_XVCLK_FREQ_74,
-		.bpp = 12,
-		.mipi_freq_idx = 2,
-		.vc[PAD0] = 1,
-		.vc[PAD1] = 0,//L->csi wr0
-		.vc[PAD2] = 1,
-		.vc[PAD3] = 1,//M->csi wr2
 	},
 };
 
@@ -698,6 +526,420 @@ static int imx334_read_reg(struct i2c_client *client, u16 reg, unsigned int len,
 	return 0;
 }
 
+static int imx334_mode_switch(struct imx334 *imx334,
+			      enum imx334_op_mode new_mode);
+static int __imx334_start_stream(struct imx334 *imx334, bool setup_controls);
+static int __imx334_stop_stream(struct imx334 *imx334);
+static u32 imx334_exposure_us_to_lines(struct imx334 *imx334,
+					u32 exposure_us);
+static u32 imx334_lines_to_exposure_us(struct imx334 *imx334, u32 lines);
+
+static const char *imx334_op_mode_name(enum imx334_op_mode mode)
+{
+	switch (mode) {
+	case IMX334_FREE_RUN:
+		return "free_run";
+	case IMX334_XVS_XHS_ONE_SHOT:
+		return "xvs_xhs_one_shot";
+	default:
+		return "unknown";
+	}
+}
+
+static int imx334_parse_run_mode(const char *buf, enum imx334_op_mode *mode)
+{
+	if (sysfs_streq(buf, "free_run") || sysfs_streq(buf, "normal") ||
+	    sysfs_streq(buf, "continuous") || sysfs_streq(buf, "0")) {
+		*mode = IMX334_FREE_RUN;
+		return 0;
+	}
+
+	if (sysfs_streq(buf, "xvs_xhs_one_shot") ||
+	    sysfs_streq(buf, "master_fast_trigger") ||
+	    sysfs_streq(buf, "fast_trigger") || sysfs_streq(buf, "trigger") ||
+	    sysfs_streq(buf, "1")) {
+		*mode = IMX334_XVS_XHS_ONE_SHOT;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static struct pwm_device *imx334_devm_pwm_get_optional(struct device *dev,
+						       const char *con_id)
+{
+	struct pwm_device *pwm;
+	int ret;
+
+	pwm = devm_pwm_get(dev, con_id);
+	if (IS_ERR(pwm)) {
+		ret = PTR_ERR(pwm);
+		if (ret == -ENOENT || ret == -ENODEV || ret == -EINVAL)
+			return NULL;
+	}
+
+	return pwm;
+}
+
+static int imx334_apply_pwm(struct pwm_device *pwm, u64 period_ns,
+			    u64 duty_ns, bool enable)
+{
+	struct pwm_state state;
+	struct pwm_args args;
+
+	if (!pwm)
+		return -ENODEV;
+	if (!period_ns || duty_ns >= period_ns)
+		return -EINVAL;
+
+	pwm_get_state(pwm, &state);
+	pwm_get_args(pwm, &args);
+	state.period = period_ns;
+	state.duty_cycle = enable ? duty_ns : 0;
+	state.polarity = args.polarity;
+	state.enabled = enable;
+	return pwm_apply_state(pwm, &state);
+}
+
+static int imx334_set_xhs_locked(struct imx334 *imx334, bool enable)
+{
+	int ret;
+
+	ret = imx334_apply_pwm(imx334->xhs_pwm, imx334->xhs_period_ns,
+			       imx334->xhs_duty_ns, enable);
+	if (!ret)
+		imx334->xhs_enabled = enable;
+	return ret;
+}
+
+static int imx334_set_continuous_xvs_locked(struct imx334 *imx334, bool enable)
+{
+	return imx334_apply_pwm(imx334->xvs_pwm, imx334->xvs_period_ns,
+				(u64)imx334->xvs_pulse_us * 1000ULL, enable);
+}
+
+static int imx334_stop_sync_locked(struct imx334 *imx334)
+{
+	int ret = 0;
+	int tmp;
+
+	if (imx334->xvs_pwm) {
+		tmp = imx334_set_continuous_xvs_locked(imx334, false);
+		if (tmp && !ret)
+			ret = tmp;
+	}
+	if (imx334->xhs_pwm) {
+		tmp = imx334_set_xhs_locked(imx334, false);
+		if (tmp && !ret)
+			ret = tmp;
+	}
+	return ret;
+}
+
+static int imx334_light_source_value_locked(struct imx334 *imx334, bool on)
+{
+	return on ? imx334->light_source_active_level :
+		    !imx334->light_source_active_level;
+}
+
+static void imx334_light_source_set_locked(struct imx334 *imx334, bool on)
+{
+	if (imx334->light_source_gpio)
+		gpiod_set_value_cansleep(imx334->light_source_gpio,
+			imx334_light_source_value_locked(imx334, on));
+}
+
+static int imx334_light_source_init_locked(struct imx334 *imx334)
+{
+	if (!imx334->light_source_gpio)
+		return 0;
+
+	return gpiod_direction_output(imx334->light_source_gpio,
+		imx334_light_source_value_locked(imx334, false));
+}
+
+static int imx334_trigger_once_locked(struct imx334 *imx334)
+{
+	u64 frame_ns;
+	u64 request_seq;
+	u32 frame_wait_us;
+	u32 pulse_wait_us;
+	u32 light_hold_us = 0;
+	u32 i;
+	int ret = 0;
+
+	if (!imx334->streaming || imx334->active_mode != IMX334_XVS_XHS_ONE_SHOT)
+		return -EBUSY;
+	if (!imx334->xvs_pwm || !imx334->xhs_pwm)
+		return -ENODEV;
+	if (imx334->trigger_busy) {
+		imx334->trigger_busy_count++;
+		return -EBUSY;
+	}
+
+	frame_ns = imx334->xvs_period_ns;
+	frame_wait_us = DIV_ROUND_UP_ULL(frame_ns, 1000ULL);
+	pulse_wait_us = imx334->xvs_pulse_us + 50;
+	imx334->trigger_busy = true;
+	request_seq = ++imx334->trigger_request_count;
+	imx334->trigger_start_ns = ktime_get_ns();
+
+	if (imx334->light_source_enabled && imx334->light_source_gpio) {
+		imx334_light_source_set_locked(imx334, true);
+		if (imx334->light_source_advance_us)
+			usleep_range(imx334->light_source_advance_us,
+				     imx334->light_source_advance_us + 50);
+	}
+
+	for (i = 0; i < imx334->trigger_burst_count; i++) {
+		u64 pulse_start_ns = ktime_get_ns();
+		u64 elapsed_us;
+		u32 remaining_us;
+
+		ret = imx334_apply_pwm(imx334->xvs_pwm, frame_ns,
+				       (u64)imx334->xvs_pulse_us * 1000ULL, true);
+		if (ret)
+			break;
+
+		usleep_range(pulse_wait_us, pulse_wait_us + 50);
+		ret = imx334_set_continuous_xvs_locked(imx334, false);
+		if (ret)
+			break;
+
+		dev_dbg(&imx334->client->dev,
+			"trigger request=%llu pulse=%u/%u at=%llu\n",
+			request_seq, i + 1, imx334->trigger_burst_count,
+			pulse_start_ns);
+
+		if (i + 1 == imx334->trigger_burst_count)
+			continue;
+
+		elapsed_us = div_u64(ktime_get_ns() - pulse_start_ns, 1000ULL);
+		remaining_us = elapsed_us < frame_wait_us ?
+			frame_wait_us - elapsed_us : 1;
+		usleep_range(remaining_us, remaining_us + 100);
+	}
+
+	if (!ret) {
+		imx334->last_trigger_ns = ktime_get_ns();
+		imx334->trigger_end_ns = imx334->last_trigger_ns;
+		imx334->trigger_complete_count++;
+		light_hold_us = imx334_lines_to_exposure_us(imx334,
+			imx334_exposure_us_to_lines(imx334, imx334->exposure->val));
+		dev_info(&imx334->client->dev,
+			 "trigger request=%llu complete burst=%u duration_us=%llu\n",
+			 request_seq, imx334->trigger_burst_count,
+			 div_u64(imx334->trigger_end_ns - imx334->trigger_start_ns,
+				 1000ULL));
+	} else {
+		imx334_set_continuous_xvs_locked(imx334, false);
+		imx334->trigger_end_ns = ktime_get_ns();
+		imx334->trigger_fail_count++;
+		dev_err(&imx334->client->dev,
+			"trigger request=%llu failed pulse=%u/%u ret=%d\n",
+			request_seq, i + 1, imx334->trigger_burst_count, ret);
+	}
+
+	if (imx334->light_source_enabled && imx334->light_source_gpio) {
+		if (!ret && light_hold_us)
+			usleep_range(light_hold_us, light_hold_us + 100);
+		if (imx334->light_source_off_delay_us)
+			usleep_range(imx334->light_source_off_delay_us,
+				     imx334->light_source_off_delay_us + 50);
+		imx334_light_source_set_locked(imx334, false);
+	}
+	imx334->trigger_busy = false;
+	return ret;
+}
+
+static ssize_t run_mode_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	ssize_t len;
+
+	mutex_lock(&imx334->mutex);
+	len = sysfs_emit(buf, "pending=%s\nactive=%s\nstreaming=%u\navailable=free_run xvs_xhs_one_shot\n",
+			 imx334_op_mode_name(imx334->pending_mode),
+			 imx334_op_mode_name(imx334->active_mode), imx334->streaming);
+	mutex_unlock(&imx334->mutex);
+	return len;
+}
+
+static ssize_t run_mode_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	enum imx334_op_mode mode;
+	int ret;
+
+	ret = imx334_parse_run_mode(buf, &mode);
+	if (ret)
+		return ret;
+
+	/*
+	 * Keep the V4L2 operation-mode control as the canonical value.  Stream-on
+	 * reapplies cached controls, so changing only pending_mode here would be
+	 * overwritten by the old control value during v4l2_ctrl_handler_setup().
+	 */
+	if (imx334->op_mode_ctrl)
+		ret = v4l2_ctrl_s_ctrl(imx334->op_mode_ctrl, mode);
+	else {
+		mutex_lock(&imx334->mutex);
+		ret = imx334_mode_switch(imx334, mode);
+		mutex_unlock(&imx334->mutex);
+	}
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(run_mode);
+
+static ssize_t trigger_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	ssize_t len;
+
+	mutex_lock(&imx334->mutex);
+	len = sysfs_emit(buf,
+		"available=echo 1 > trigger\n"
+		"pulse_us=%u\n"
+		"xhs_period_ns=%u\n"
+		"xvs_period_ns=%u\n"
+		"burst_count=%u\n"
+		"busy=%u\n"
+		"requests=%llu\n"
+		"completed=%llu\n"
+		"failed=%llu\n"
+		"busy_rejected=%llu\n"
+		"last_start_ns=%llu\n"
+		"last_end_ns=%llu\n"
+		"mode=%s\n"
+		"streaming=%u\n",
+		imx334->xvs_pulse_us, imx334->xhs_period_ns,
+		imx334->xvs_period_ns, imx334->trigger_burst_count,
+		imx334->trigger_busy, imx334->trigger_request_count,
+		imx334->trigger_complete_count, imx334->trigger_fail_count,
+		imx334->trigger_busy_count, imx334->trigger_start_ns,
+		imx334->trigger_end_ns, imx334_op_mode_name(imx334->active_mode),
+		imx334->streaming);
+	mutex_unlock(&imx334->mutex);
+	return len;
+}
+
+static ssize_t trigger_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret)
+		return ret;
+	if (!value)
+		return count;
+	mutex_lock(&imx334->mutex);
+	ret = imx334_trigger_once_locked(imx334);
+	mutex_unlock(&imx334->mutex);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(trigger);
+
+static ssize_t trigger_pulse_us_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	ssize_t len;
+
+	mutex_lock(&imx334->mutex);
+	len = sysfs_emit(buf, "%u\n", imx334->xvs_pulse_us);
+	mutex_unlock(&imx334->mutex);
+	return len;
+}
+
+static ssize_t trigger_pulse_us_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	unsigned int pulse_us;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &pulse_us);
+	if (ret)
+		return ret;
+	if (pulse_us < IMX334_XVS_PULSE_US_MIN ||
+	    pulse_us > IMX334_XVS_PULSE_US_MAX ||
+	    (u64)pulse_us * 1000ULL >= imx334->xvs_period_ns)
+		return -ERANGE;
+	mutex_lock(&imx334->mutex);
+	imx334->xvs_pulse_us = pulse_us;
+	if (imx334->streaming && imx334->active_mode == IMX334_FREE_RUN)
+		ret = imx334_set_continuous_xvs_locked(imx334, true);
+	mutex_unlock(&imx334->mutex);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(trigger_pulse_us);
+
+static ssize_t trigger_burst_count_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	ssize_t len;
+
+	mutex_lock(&imx334->mutex);
+	len = sysfs_emit(buf, "%u\n", imx334->trigger_burst_count);
+	mutex_unlock(&imx334->mutex);
+	return len;
+}
+
+static ssize_t trigger_burst_count_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
+	struct imx334 *imx334 = to_imx334(sd);
+	unsigned int burst_count;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &burst_count);
+	if (ret)
+		return ret;
+	if (burst_count < 1 || burst_count > IMX334_TRIGGER_BURST_COUNT_MAX)
+		return -ERANGE;
+
+	mutex_lock(&imx334->mutex);
+	if (imx334->trigger_busy)
+		ret = -EBUSY;
+	else
+		imx334->trigger_burst_count = burst_count;
+	mutex_unlock(&imx334->mutex);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(trigger_burst_count);
+
+static struct attribute *imx334_attrs[] = {
+	&dev_attr_run_mode.attr,
+	&dev_attr_trigger.attr,
+	&dev_attr_trigger_pulse_us.attr,
+	&dev_attr_trigger_burst_count.attr,
+	NULL,
+};
+
+static const struct attribute_group imx334_attr_group = {
+	.attrs = imx334_attrs,
+};
+
 static int imx334_set_fmt(struct v4l2_subdev *sd,
 			  struct v4l2_subdev_state *sd_state,
 			  struct v4l2_subdev_format *fmt)
@@ -736,13 +978,15 @@ static int imx334_set_fmt(struct v4l2_subdev *sd,
 					 IMX334_VTS_MAX - mode->height,
 					 1, vblank_def);
 		if (imx334->cur_vclk_freq != mode->vclk_freq) {
-			clk_disable_unprepare(imx334->xvclk);
-			ret = clk_set_rate(imx334->xvclk, mode->vclk_freq);
-			ret |= clk_prepare_enable(imx334->xvclk);
-			if (ret < 0) {
-				dev_err(&imx334->client->dev, "Failed to enable xvclk\n");
-				mutex_unlock(&imx334->mutex);
-				return ret;
+			if (imx334->xvclk) {
+				clk_disable_unprepare(imx334->xvclk);
+				ret = clk_set_rate(imx334->xvclk, mode->vclk_freq);
+				ret |= clk_prepare_enable(imx334->xvclk);
+				if (ret < 0) {
+					dev_err(&imx334->client->dev, "Failed to enable xvclk\n");
+					mutex_unlock(&imx334->mutex);
+					return ret;
+				}
 			}
 			imx334->cur_vclk_freq = mode->vclk_freq;
 		}
@@ -860,141 +1104,37 @@ static void imx334_get_module_inf(struct imx334 *imx334,
 				  struct rkmodule_inf *inf)
 {
 	memset(inf, 0, sizeof(*inf));
-	strlcpy(inf->base.sensor, IMX334_NAME, sizeof(inf->base.sensor));
-	strlcpy(inf->base.module, imx334->module_name,
+	strscpy(inf->base.sensor, IMX334_NAME, sizeof(inf->base.sensor));
+	strscpy(inf->base.module, imx334->module_name,
 		sizeof(inf->base.module));
-	strlcpy(inf->base.lens, imx334->len_name, sizeof(inf->base.lens));
+	strscpy(inf->base.lens, imx334->len_name, sizeof(inf->base.lens));
 }
 
-static int imx334_set_hdrae(struct imx334 *imx334,
-			    struct preisp_hdrae_exp_s *ae)
+static int imx334_quick_stream_locked(struct imx334 *imx334, bool on)
 {
-	struct i2c_client *client = imx334->client;
-	u32 l_exp_time, m_exp_time, s_exp_time;
-	u32 l_a_gain, m_a_gain, s_a_gain;
-	u32 shr1 = 0;
-	u32 shr0 = 0;
-	u32 rhs1 = 0;
-	u32 rhs1_max = 0;
-	static int rhs1_old = 225;
-	int rhs1_change_limit;
-	int ret = 0;
-	u32 fsc = imx334->cur_vts;
+	int ret;
 
-	if (!imx334->has_init_exp && !imx334->streaming) {
-		imx334->init_hdrae_exp = *ae;
-		imx334->has_init_exp = true;
-		dev_dbg(&imx334->client->dev, "imx334 don't stream, record exp for hdr!\n");
-		return ret;
+	if (on) {
+		if (imx334->streaming)
+			return 0;
+		ret = pm_runtime_resume_and_get(&imx334->client->dev);
+		if (ret < 0)
+			return ret;
+		ret = __imx334_start_stream(imx334, true);
+		if (ret) {
+			pm_runtime_put(&imx334->client->dev);
+			return ret;
+		}
+		imx334->streaming = true;
+		return 0;
 	}
-	l_exp_time = ae->long_exp_reg;
-	m_exp_time = ae->middle_exp_reg;
-	s_exp_time = ae->short_exp_reg;
-	l_a_gain = ae->long_gain_reg;
-	m_a_gain = ae->middle_gain_reg;
-	s_a_gain = ae->short_gain_reg;
-	dev_dbg(&client->dev,
-		"rev exp: L_exp:0x%x,0x%x, M_exp:0x%x,0x%x S_exp:0x%x,0x%x\n",
-		l_exp_time, l_a_gain,
-		m_exp_time, m_a_gain,
-		s_exp_time, s_a_gain);
 
-	if (imx334->cur_mode->hdr_mode == HDR_X2) {
-		//2 stagger
-		l_a_gain = m_a_gain;
-		l_exp_time = m_exp_time;
-	}
-	//gain effect n+1
-	ret |= imx334_write_reg(client,
-		IMX334_LF_GAIN_REG_L,
-		IMX334_REG_VALUE_08BIT,
-		l_a_gain & 0xff);
-	ret |= imx334_write_reg(client,
-		IMX334_SF1_GAIN_REG_L,
-		IMX334_REG_VALUE_08BIT,
-		s_a_gain & 0xff);
-
-	//long exposure and short exposure
-	shr0 = fsc - l_exp_time;
-	rhs1_max = (RHS1_MAX > (shr0 - 9)) ? (shr0 - 9) : RHS1_MAX;
-	rhs1_max = (rhs1_max >> 2) * 4 + 1;
-	rhs1 = ((SHR1_MIN + s_exp_time + 3) >> 2) * 4 + 1;
-	dev_dbg(&client->dev, "line(%d) rhs1 %d\n", __LINE__, rhs1);
-	if (rhs1 < 13)
-		rhs1 = 13;
-	else if (rhs1 > rhs1_max)
-		rhs1 = rhs1_max;
-	dev_dbg(&client->dev, "line(%d) rhs1 %d\n", __LINE__, rhs1);
-
-	//Dynamic adjustment rhs1 must meet the following conditions
-	rhs1_change_limit = rhs1_old + 2 * BRL - fsc + 2;
-	rhs1_change_limit = (rhs1_change_limit < 13) ?  13 : rhs1_change_limit;
-	rhs1_change_limit = ((rhs1_change_limit + 3) >> 2) * 4 + 1;
-	if (rhs1 < rhs1_change_limit)
-		rhs1 = rhs1_change_limit;
-
-	dev_dbg(&client->dev,
-		"line(%d) rhs1 %d,short time %d rhs1_old %d test %d\n",
-		__LINE__, rhs1, s_exp_time, rhs1_old,
-		(rhs1_old + 2 * BRL - fsc + 2));
-
-	rhs1_old = rhs1;
-	shr1 = rhs1 - s_exp_time;
-
-	if (shr1 < 9)
-		shr1 = 9;
-	else if (shr1 > (rhs1 - 2))
-		shr1 = rhs1 - 2;
-
-	if (shr0 < (rhs1 + 9))
-		shr0 = rhs1 + 9;
-	else if (shr0 > (fsc - 2))
-		shr0 = fsc - 2;
-
-	dev_dbg(&client->dev,
-		"fsc=%d,RHS1_MAX=%d,SHR1_MIN=%d,rhs1_max=%d\n",
-		fsc, RHS1_MAX, SHR1_MIN, rhs1_max);
-	dev_dbg(&client->dev,
-		"l_exp_time=%d,s_exp_time=%d,shr0=%d,shr1=%d,rhs1=%d,l_a_gain=%d,s_a_gain=%d\n",
-		l_exp_time, s_exp_time, shr0, shr1, rhs1, l_a_gain, s_a_gain);
-	//time effect n+2
-	ret |= imx334_write_reg(client,
-		IMX334_RHS1_REG_L,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_RHS1_L(rhs1));
-	ret |= imx334_write_reg(client,
-		IMX334_RHS1_REG_M,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_RHS1_M(rhs1));
-	ret |= imx334_write_reg(client,
-		IMX334_RHS1_REG_H,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_RHS1_H(rhs1));
-
-	ret |= imx334_write_reg(client,
-		IMX334_SF1_EXPO_REG_L,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_EXP_L(shr1));
-	ret |= imx334_write_reg(client,
-		IMX334_SF1_EXPO_REG_M,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_EXP_M(shr1));
-	ret |= imx334_write_reg(client,
-		IMX334_SF1_EXPO_REG_H,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_EXP_H(shr1));
-	ret |= imx334_write_reg(client,
-		IMX334_LF_EXPO_REG_L,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_EXP_L(shr0));
-	ret |= imx334_write_reg(client,
-		IMX334_LF_EXPO_REG_M,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_EXP_M(shr0));
-	ret |= imx334_write_reg(client,
-		IMX334_LF_EXPO_REG_H,
-		IMX334_REG_VALUE_08BIT,
-		IMX334_FETCH_EXP_H(shr0));
+	if (!imx334->streaming)
+		return 0;
+	ret = __imx334_stop_stream(imx334);
+	pm_runtime_put(&imx334->client->dev);
+	if (!ret)
+		imx334->streaming = false;
 	return ret;
 }
 
@@ -1003,14 +1143,13 @@ static long imx334_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	struct imx334 *imx334 = to_imx334(sd);
 	struct rkmodule_hdr_cfg *hdr;
 	long ret = 0;
-	u32 i, h, w;
-	s64 dst_pixel_rate = 0;
-	const struct imx334_mode *mode;
 	u32 stream = 0;
+	u32 sync_mode;
 
 	switch (cmd) {
 	case PREISP_CMD_SET_HDRAE_EXP:
-		return imx334_set_hdrae(imx334, arg);
+		ret = -EINVAL;
+		break;
 	case RKMODULE_GET_MODULE_INFO:
 		imx334_get_module_inf(imx334, (struct rkmodule_inf *)arg);
 		break;
@@ -1021,62 +1160,30 @@ static long imx334_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		break;
 	case RKMODULE_SET_HDR_CFG:
 		hdr = (struct rkmodule_hdr_cfg *)arg;
-		w = imx334->cur_mode->width;
-		h = imx334->cur_mode->height;
-		for (i = 0; i < ARRAY_SIZE(supported_modes); i++) {
-			if (w == supported_modes[i].width &&
-			    h == supported_modes[i].height &&
-			    supported_modes[i].hdr_mode == hdr->hdr_mode) {
-				imx334->cur_mode = &supported_modes[i];
-				break;
-			}
-		}
-		if (i == ARRAY_SIZE(supported_modes)) {
-			dev_err(&imx334->client->dev,
-				"not find hdr mode:%d %dx%d config\n",
-				hdr->hdr_mode, w, h);
+		if (hdr->hdr_mode != NO_HDR)
 			ret = -EINVAL;
-		} else {
-			mode = imx334->cur_mode;
-			imx334->cur_vts = mode->vts_def;
-			w = mode->hts_def - mode->width;
-			h = mode->vts_def - mode->height;
-			__v4l2_ctrl_modify_range(imx334->hblank, w, w, 1, w);
-			__v4l2_ctrl_modify_range(imx334->vblank, h,
-						 IMX334_VTS_MAX -
-						 mode->height,
-						 1, h);
-			if (imx334->cur_vclk_freq != mode->vclk_freq) {
-				clk_disable_unprepare(imx334->xvclk);
-				ret = clk_set_rate(imx334->xvclk, mode->vclk_freq);
-				ret |= clk_prepare_enable(imx334->xvclk);
-				if (ret < 0) {
-					dev_err(&imx334->client->dev, "Failed to enable xvclk\n");
-					return ret;
-				}
-				imx334->cur_vclk_freq = mode->vclk_freq;
-			}
-			if (imx334->cur_mipi_freq_idx != mode->mipi_freq_idx) {
-				dst_pixel_rate = ((u32)link_freq_menu_items[mode->mipi_freq_idx]) /
-						 mode->bpp * 2 * IMX334_LANES;
-				__v4l2_ctrl_s_ctrl_int64(imx334->pixel_rate,
-							 dst_pixel_rate);
-				__v4l2_ctrl_s_ctrl(imx334->link_freq,
-						   mode->mipi_freq_idx);
-				imx334->cur_mipi_freq_idx = mode->mipi_freq_idx;
-			}
-		}
+		break;
+	case RKMODULE_GET_SYNC_MODE:
+		/*
+		 * This ioctl describes Rockchip CIF multi-camera group sync, not the
+		 * IMX334 XMASTER electrical role.  This board has one externally timed
+		 * sensor, so attaching it as a lone CIF SLAVE leaves the group without
+		 * an internal master and causes every SOF to be rejected.
+		 */
+		*((u32 *)arg) = NO_SYNC_MODE;
+		break;
+	case RKMODULE_SET_SYNC_MODE:
+		sync_mode = *((u32 *)arg);
+		if (sync_mode != NO_SYNC_MODE)
+			ret = -EINVAL;
+		else
+			imx334->sync_mode = NO_SYNC_MODE;
 		break;
 	case RKMODULE_SET_QUICK_STREAM:
-
 		stream = *((u32 *)arg);
-
-		if (stream)
-			ret = imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
-				IMX334_REG_VALUE_08BIT, 0);
-		else
-			ret = imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
-				IMX334_REG_VALUE_08BIT, 1);
+		mutex_lock(&imx334->mutex);
+		ret = imx334_quick_stream_locked(imx334, !!stream);
+		mutex_unlock(&imx334->mutex);
 		break;
 	default:
 		ret = -ENOIOCTLCMD;
@@ -1097,6 +1204,7 @@ static long imx334_compat_ioctl32(struct v4l2_subdev *sd,
 	struct preisp_hdrae_exp_s *hdrae;
 	long ret;
 	u32 stream = 0;
+	u32 sync_mode = 0;
 
 	switch (cmd) {
 	case RKMODULE_GET_MODULE_INFO:
@@ -1159,6 +1267,16 @@ static long imx334_compat_ioctl32(struct v4l2_subdev *sd,
 			ret = imx334_ioctl(sd, cmd, hdrae);
 		kfree(hdrae);
 		break;
+	case RKMODULE_GET_SYNC_MODE:
+		ret = imx334_ioctl(sd, cmd, &sync_mode);
+		if (!ret)
+			ret = copy_to_user(up, &sync_mode, sizeof(sync_mode));
+		break;
+	case RKMODULE_SET_SYNC_MODE:
+		ret = copy_from_user(&sync_mode, up, sizeof(sync_mode));
+		if (!ret)
+			ret = imx334_ioctl(sd, cmd, &sync_mode);
+		break;
 	case RKMODULE_SET_QUICK_STREAM:
 		ret = copy_from_user(&stream, up, sizeof(u32));
 		if (!ret)
@@ -1173,7 +1291,7 @@ static long imx334_compat_ioctl32(struct v4l2_subdev *sd,
 }
 #endif
 
-static int __imx334_start_stream(struct imx334 *imx334)
+static int __imx334_start_stream(struct imx334 *imx334, bool setup_controls)
 {
 	int ret;
 
@@ -1183,30 +1301,79 @@ static int __imx334_start_stream(struct imx334 *imx334)
 	ret = imx334_write_array(imx334->client, imx334->cur_mode->reg_list);
 	if (ret)
 		return ret;
-	/* In case these controls are set before streaming */
-	if (imx334->has_init_exp && imx334->cur_mode->hdr_mode != NO_HDR) {
-		ret = imx334_ioctl(&imx334->subdev, PREISP_CMD_SET_HDRAE_EXP,
-			&imx334->init_hdrae_exp);
-		if (ret) {
-			dev_err(&imx334->client->dev,
-				"init exp fail in hdr mode\n");
-			return ret;
-		}
-	} else {
+
+	if (setup_controls) {
 		mutex_unlock(&imx334->mutex);
 		ret = v4l2_ctrl_handler_setup(&imx334->ctrl_handler);
 		mutex_lock(&imx334->mutex);
 		if (ret)
 			return ret;
 	}
-	return imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
-				IMX334_REG_VALUE_08BIT, 0);
+
+	ret = imx334_set_xhs_locked(imx334, true);
+	if (ret)
+		return ret;
+
+	ret = imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
+			       IMX334_REG_VALUE_08BIT, IMX334_MODE_STREAMING);
+	if (ret)
+		goto err_sync;
+
+	usleep_range(IMX334_STANDBY_EXIT_US, IMX334_STANDBY_EXIT_US + 1000);
+	if (imx334->pending_mode == IMX334_FREE_RUN) {
+		ret = imx334_set_continuous_xvs_locked(imx334, true);
+		if (ret)
+			goto err_standby;
+	}
+
+	imx334->active_mode = imx334->pending_mode;
+	imx334->last_trigger_ns = 0;
+	return 0;
+
+err_standby:
+	imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
+			 IMX334_REG_VALUE_08BIT, IMX334_MODE_SW_STANDBY);
+err_sync:
+	imx334_stop_sync_locked(imx334);
+	return ret;
 }
 
 static int __imx334_stop_stream(struct imx334 *imx334)
 {
-	return imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
-				IMX334_REG_VALUE_08BIT, 1);
+	int ret;
+	int sync_ret;
+
+	imx334->trigger_busy = false;
+	imx334_light_source_set_locked(imx334, false);
+	sync_ret = imx334_stop_sync_locked(imx334);
+	ret = imx334_write_reg(imx334->client, IMX334_REG_CTRL_MODE,
+			       IMX334_REG_VALUE_08BIT, IMX334_MODE_SW_STANDBY);
+	return ret ? ret : sync_ret;
+}
+
+static int imx334_mode_switch(struct imx334 *imx334,
+			      enum imx334_op_mode new_mode)
+{
+	int ret;
+
+	if (new_mode > IMX334_XVS_XHS_ONE_SHOT)
+		return -EINVAL;
+	if (imx334->pending_mode == new_mode &&
+	    (!imx334->streaming || imx334->active_mode == new_mode))
+		return 0;
+
+	imx334->pending_mode = new_mode;
+	if (!imx334->streaming)
+		return 0;
+
+	ret = __imx334_stop_stream(imx334);
+	if (ret)
+		return ret;
+	imx334->streaming = false;
+	ret = __imx334_start_stream(imx334, false);
+	if (!ret)
+		imx334->streaming = true;
+	return ret;
 }
 
 static int imx334_s_stream(struct v4l2_subdev *sd, int on)
@@ -1227,15 +1394,17 @@ static int imx334_s_stream(struct v4l2_subdev *sd, int on)
 			goto unlock_and_return;
 		}
 
-		ret = __imx334_start_stream(imx334);
+		ret = __imx334_start_stream(imx334, true);
 		if (ret) {
 			v4l2_err(sd, "start stream failed while write regs\n");
 			pm_runtime_put(&client->dev);
 			goto unlock_and_return;
 		}
 	} else {
-		__imx334_stop_stream(imx334);
+		ret = __imx334_stop_stream(imx334);
 		pm_runtime_put(&client->dev);
+		if (ret)
+			goto unlock_and_return;
 	}
 
 	imx334->streaming = on;
@@ -1305,21 +1474,23 @@ static int __imx334_power_on(struct imx334 *imx334)
 	else
 		vclk_freq = IMX334_XVCLK_FREQ_74;
 
-	ret = clk_set_rate(imx334->xvclk, vclk_freq);
-	if (ret < 0) {
-		dev_err(dev, "Failed to set xvclk rate (24MHz)\n");
-		return ret;
-	}
-	if (clk_get_rate(imx334->xvclk) != vclk_freq)
-		dev_warn(dev, "xvclk mismatched, modes are based on 37.125MHz\n");
-	ret = clk_prepare_enable(imx334->xvclk);
-	if (ret < 0) {
-		dev_err(dev, "Failed to enable xvclk\n");
-		return ret;
+	if (imx334->xvclk) {
+		ret = clk_set_rate(imx334->xvclk, vclk_freq);
+		if (ret < 0) {
+			dev_err(dev, "Failed to set xvclk rate\n");
+			return ret;
+		}
+		if (clk_get_rate(imx334->xvclk) != vclk_freq)
+			dev_warn(dev, "xvclk mismatched, modes are based on 37.125MHz\n");
+		ret = clk_prepare_enable(imx334->xvclk);
+		if (ret < 0) {
+			dev_err(dev, "Failed to enable xvclk\n");
+			return ret;
+		}
 	}
 
-	if (!IS_ERR(imx334->reset_gpio))
-		gpiod_set_value_cansleep(imx334->reset_gpio, 0);
+	if (!IS_ERR_OR_NULL(imx334->reset_gpio))
+		gpiod_set_value_cansleep(imx334->reset_gpio, 1);
 
 	ret = regulator_bulk_enable(IMX334_NUM_SUPPLIES, imx334->supplies);
 	if (ret < 0) {
@@ -1327,32 +1498,36 @@ static int __imx334_power_on(struct imx334 *imx334)
 		goto disable_clk;
 	}
 
-	if (!IS_ERR(imx334->reset_gpio))
-		gpiod_set_value_cansleep(imx334->reset_gpio, 1);
-
 	usleep_range(500, 1000);
-	if (!IS_ERR(imx334->pwdn_gpio))
+	if (!IS_ERR_OR_NULL(imx334->reset_gpio))
+		gpiod_set_value_cansleep(imx334->reset_gpio, 0);
+
+	if (!IS_ERR_OR_NULL(imx334->pwdn_gpio))
 		gpiod_set_value_cansleep(imx334->pwdn_gpio, 1);
 
-	/* 8192 cycles prior to first SCCB transaction */
-	delay_us = imx334_cal_delay(8192, imx334);
+	/* Allow the on-module oscillator and serial interface to settle. */
+	delay_us = max_t(u32, imx334_cal_delay(8192, imx334), 2000);
 	usleep_range(delay_us, delay_us * 2);
 
 	return 0;
 
 disable_clk:
-	clk_disable_unprepare(imx334->xvclk);
+	if (imx334->xvclk)
+		clk_disable_unprepare(imx334->xvclk);
 
 	return ret;
 }
 
 static void __imx334_power_off(struct imx334 *imx334)
 {
-	if (!IS_ERR(imx334->pwdn_gpio))
+	imx334_stop_sync_locked(imx334);
+	imx334_light_source_set_locked(imx334, false);
+	if (!IS_ERR_OR_NULL(imx334->pwdn_gpio))
 		gpiod_set_value_cansleep(imx334->pwdn_gpio, 0);
-	clk_disable_unprepare(imx334->xvclk);
-	if (!IS_ERR(imx334->reset_gpio))
-		gpiod_set_value_cansleep(imx334->reset_gpio, 0);
+	if (imx334->xvclk)
+		clk_disable_unprepare(imx334->xvclk);
+	if (!IS_ERR_OR_NULL(imx334->reset_gpio))
+		gpiod_set_value_cansleep(imx334->reset_gpio, 1);
 	regulator_bulk_disable(IMX334_NUM_SUPPLIES, imx334->supplies);
 }
 
@@ -1474,6 +1649,63 @@ static const struct v4l2_subdev_ops imx334_subdev_ops = {
 	.pad	= &imx334_pad_ops,
 };
 
+static const struct v4l2_ctrl_ops imx334_ctrl_ops;
+
+static u32 imx334_exposure_us_to_lines(struct imx334 *imx334, u32 exposure_us)
+{
+	u64 request_ns = (u64)exposure_us * 1000ULL;
+	u32 max_lines = imx334->cur_vts - IMX334_EXPOSURE_MIN;
+
+	if (request_ns <= IMX334_EXPOSURE_OFFSET_NS)
+		return 1;
+	return clamp_t(u32,
+		DIV_ROUND_CLOSEST_ULL(request_ns - IMX334_EXPOSURE_OFFSET_NS,
+				      imx334->xhs_period_ns),
+		1, max_lines);
+}
+
+static u32 imx334_lines_to_exposure_us(struct imx334 *imx334, u32 lines)
+{
+	return DIV_ROUND_CLOSEST_ULL((u64)lines * imx334->xhs_period_ns +
+				     IMX334_EXPOSURE_OFFSET_NS, 1000);
+}
+
+static const char * const imx334_op_mode_menu[] = {
+	"FREE_RUN",
+	"XVS_XHS_ONE_SHOT",
+};
+
+static const struct v4l2_ctrl_config imx334_op_mode_ctrl_cfg = {
+	.ops = &imx334_ctrl_ops,
+	.id = V4L2_CID_IMX334_OP_MODE,
+	.name = "operation_mode",
+	.type = V4L2_CTRL_TYPE_MENU,
+	.min = IMX334_FREE_RUN,
+	.max = IMX334_XVS_XHS_ONE_SHOT,
+	.def = IMX334_FREE_RUN,
+	.qmenu = imx334_op_mode_menu,
+};
+
+#define IMX334_BOOL_CTRL(_id, _name) \
+	{ .ops = &imx334_ctrl_ops, .id = (_id), .name = (_name), \
+	  .type = V4L2_CTRL_TYPE_BOOLEAN, .min = 0, .max = 1, .step = 1 }
+#define IMX334_INT_CTRL(_id, _name, _max) \
+	{ .ops = &imx334_ctrl_ops, .id = (_id), .name = (_name), \
+	  .type = V4L2_CTRL_TYPE_INTEGER, .min = 0, .max = (_max), .step = 1 }
+
+static const struct v4l2_ctrl_config imx334_light_source_enable_cfg =
+	IMX334_BOOL_CTRL(V4L2_CID_IMX334_LIGHT_SOURCE_ENABLE,
+			 "light_source_enable");
+static const struct v4l2_ctrl_config imx334_light_source_active_level_cfg =
+	IMX334_BOOL_CTRL(V4L2_CID_IMX334_LIGHT_SOURCE_ACTIVE_LEVEL,
+			 "light_source_active_level");
+static const struct v4l2_ctrl_config imx334_light_source_advance_us_cfg =
+	IMX334_INT_CTRL(V4L2_CID_IMX334_LIGHT_SOURCE_ADVANCE_US,
+			"light_source_advance_us", 100000);
+static const struct v4l2_ctrl_config imx334_light_source_off_delay_us_cfg =
+	IMX334_INT_CTRL(V4L2_CID_IMX334_LIGHT_SOURCE_OFF_DELAY_US,
+			"light_source_off_delay_us", 1000000);
+
 static int imx334_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct imx334 *imx334 = container_of(ctrl->handler,
@@ -1481,19 +1713,35 @@ static int imx334_set_ctrl(struct v4l2_ctrl *ctrl)
 	struct i2c_client *client = imx334->client;
 	s64 max;
 	int ret = 0;
+	u32 exposure_lines;
 	u32 shr0 = 0;
 	u32 vts = 0;
 	u32 flip = 0;
 
+	if (ctrl->id == V4L2_CID_IMX334_OP_MODE)
+		return imx334_mode_switch(imx334, ctrl->val);
+
 	/* Propagate change of current control to all related controls */
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
-		/* Update max exposure while meeting expected vblanking */
-		max = imx334->cur_mode->height + ctrl->val - 4;
+		max = imx334_lines_to_exposure_us(imx334,
+			imx334->cur_mode->height + ctrl->val - IMX334_EXPOSURE_MIN);
 		__v4l2_ctrl_modify_range(imx334->exposure,
 					 imx334->exposure->minimum, max,
 					 imx334->exposure->step,
-					 imx334->exposure->default_value);
+					 min_t(s64, imx334->exposure->default_value, max));
+		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_ENABLE:
+		imx334->light_source_enabled = !!ctrl->val;
+		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_ACTIVE_LEVEL:
+		imx334->light_source_active_level = !!ctrl->val;
+		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_ADVANCE_US:
+		imx334->light_source_advance_us = ctrl->val;
+		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_OFF_DELAY_US:
+		imx334->light_source_off_delay_us = ctrl->val;
 		break;
 	}
 
@@ -1502,12 +1750,14 @@ static int imx334_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
-		shr0 = imx334->cur_vts - ctrl->val;
-		/* 4 least significant bits of expsoure are fractional part */
-		ret = imx334_write_reg(imx334->client,
-				       IMX334_LF_EXPO_REG_H,
-				       IMX334_REG_VALUE_08BIT,
-				       IMX334_FETCH_EXP_H(shr0));
+		exposure_lines = imx334_exposure_us_to_lines(imx334, ctrl->val);
+		shr0 = imx334->cur_vts - exposure_lines;
+		ret = imx334_write_reg(imx334->client, IMX334_REG_GROUP_HOLD,
+				       IMX334_REG_VALUE_08BIT, IMX334_GROUP_HOLD_START);
+		ret |= imx334_write_reg(imx334->client,
+					IMX334_LF_EXPO_REG_H,
+					IMX334_REG_VALUE_08BIT,
+					IMX334_FETCH_EXP_H(shr0));
 		ret |= imx334_write_reg(imx334->client,
 					IMX334_LF_EXPO_REG_M,
 					IMX334_REG_VALUE_08BIT,
@@ -1516,6 +1766,8 @@ static int imx334_set_ctrl(struct v4l2_ctrl *ctrl)
 					IMX334_LF_EXPO_REG_L,
 					IMX334_REG_VALUE_08BIT,
 					IMX334_FETCH_EXP_L(shr0));
+		ret |= imx334_write_reg(imx334->client, IMX334_REG_GROUP_HOLD,
+					IMX334_REG_VALUE_08BIT, IMX334_GROUP_HOLD_END);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
 		ret = imx334_write_reg(imx334->client,
@@ -1573,6 +1825,21 @@ static int imx334_set_ctrl(struct v4l2_ctrl *ctrl)
 				IMX334_REG_VALUE_08BIT, 0x02);
 		}
 		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_ENABLE:
+		if (imx334->streaming && imx334->active_mode == IMX334_FREE_RUN)
+			imx334_light_source_set_locked(imx334,
+						 imx334->light_source_enabled);
+		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_ACTIVE_LEVEL:
+		ret = imx334_light_source_init_locked(imx334);
+		if (!ret && imx334->streaming &&
+		    imx334->active_mode == IMX334_FREE_RUN)
+			imx334_light_source_set_locked(imx334,
+						 imx334->light_source_enabled);
+		break;
+	case V4L2_CID_IMX334_LIGHT_SOURCE_ADVANCE_US:
+	case V4L2_CID_IMX334_LIGHT_SOURCE_OFF_DELAY_US:
+		break;
 	default:
 		dev_warn(&client->dev, "%s Unhandled id:0x%x, val:0x%x\n",
 			 __func__, ctrl->id, ctrl->val);
@@ -1599,14 +1866,16 @@ static int imx334_initialize_controls(struct imx334 *imx334)
 
 	handler = &imx334->ctrl_handler;
 	mode = imx334->cur_mode;
-	ret = v4l2_ctrl_handler_init(handler, 9);
+	ret = v4l2_ctrl_handler_init(handler, 14);
 	if (ret)
 		return ret;
 	handler->lock = &imx334->mutex;
 
 	imx334->link_freq = v4l2_ctrl_new_int_menu(handler, NULL,
 						   V4L2_CID_LINK_FREQ,
-						   2, 0, link_freq_menu_items);
+						   0, 0, link_freq_menu_items);
+	if (imx334->link_freq)
+		imx334->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	dst_pixel_rate = ((u32)link_freq_menu_items[mode->mipi_freq_idx]) /
 		mode->bpp * 2 * IMX334_LANES;
@@ -1615,6 +1884,8 @@ static int imx334_initialize_controls(struct imx334 *imx334)
 					       V4L2_CID_PIXEL_RATE,
 					       0, PIXEL_RATE_WITH_891M_10BIT,
 					       1, dst_pixel_rate);
+	if (imx334->pixel_rate)
+		imx334->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	v4l2_ctrl_s_ctrl(imx334->link_freq,
 			 mode->mipi_freq_idx);
 	imx334->cur_mipi_freq_idx = mode->mipi_freq_idx;
@@ -1632,13 +1903,14 @@ static int imx334_initialize_controls(struct imx334 *imx334)
 					   IMX334_VTS_MAX - mode->height,
 					   1, vblank_def);
 	imx334->cur_vts = mode->vts_def;
-	exposure_max = mode->vts_def - 4;
+	exposure_max = imx334_lines_to_exposure_us(imx334,
+						 mode->vts_def - IMX334_EXPOSURE_MIN);
 	imx334->exposure = v4l2_ctrl_new_std(handler, &imx334_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
-					     IMX334_EXPOSURE_MIN,
-					     exposure_max,
+					     1, exposure_max,
 					     IMX334_EXPOSURE_STEP,
-					     mode->exp_def);
+					     imx334_lines_to_exposure_us(imx334,
+								      mode->exp_def));
 
 	imx334->anal_gain = v4l2_ctrl_new_std(handler, &imx334_ctrl_ops,
 					      V4L2_CID_ANALOGUE_GAIN,
@@ -1656,6 +1928,17 @@ static int imx334_initialize_controls(struct imx334 *imx334)
 	v4l2_ctrl_new_std(handler, &imx334_ctrl_ops, V4L2_CID_HFLIP, 0, 1, 1, 0);
 	v4l2_ctrl_new_std(handler, &imx334_ctrl_ops, V4L2_CID_VFLIP, 0, 1, 1, 0);
 
+	imx334->op_mode_ctrl = v4l2_ctrl_new_custom(handler,
+						    &imx334_op_mode_ctrl_cfg, NULL);
+	imx334->light_source_enable_ctrl = v4l2_ctrl_new_custom(
+		handler, &imx334_light_source_enable_cfg, NULL);
+	imx334->light_source_active_level_ctrl = v4l2_ctrl_new_custom(
+		handler, &imx334_light_source_active_level_cfg, NULL);
+	imx334->light_source_advance_us_ctrl = v4l2_ctrl_new_custom(
+		handler, &imx334_light_source_advance_us_cfg, NULL);
+	imx334->light_source_off_delay_us_ctrl = v4l2_ctrl_new_custom(
+		handler, &imx334_light_source_off_delay_us_cfg, NULL);
+
 	if (handler->error) {
 		ret = handler->error;
 		dev_err(&imx334->client->dev,
@@ -1663,8 +1946,23 @@ static int imx334_initialize_controls(struct imx334 *imx334)
 		goto err_free_handler;
 	}
 
+	if (imx334->op_mode_ctrl) {
+		ret = __v4l2_ctrl_s_ctrl(imx334->op_mode_ctrl,
+					   imx334->pending_mode);
+		if (ret)
+			goto err_free_handler;
+	}
+	if (imx334->light_source_active_level_ctrl)
+		__v4l2_ctrl_s_ctrl(imx334->light_source_active_level_ctrl,
+				     imx334->light_source_active_level);
+	if (imx334->light_source_advance_us_ctrl)
+		__v4l2_ctrl_s_ctrl(imx334->light_source_advance_us_ctrl,
+				     imx334->light_source_advance_us);
+	if (imx334->light_source_off_delay_us_ctrl)
+		__v4l2_ctrl_s_ctrl(imx334->light_source_off_delay_us_ctrl,
+				     imx334->light_source_off_delay_us);
+
 	imx334->subdev.ctrl_handler = handler;
-	imx334->has_init_exp = false;
 	return 0;
 
 err_free_handler:
@@ -1720,6 +2018,7 @@ static int imx334_probe(struct i2c_client *client,
 	char facing[2];
 	int ret;
 	u32 i, hdr_mode = 0;
+	u32 trigger_mode = IMX334_FREE_RUN;
 
 	dev_info(dev, "driver version: %02x.%02x.%02x",
 		 DRIVER_VERSION >> 16,
@@ -1754,19 +2053,94 @@ static int imx334_probe(struct i2c_client *client,
 	if (i == ARRAY_SIZE(supported_modes))
 		imx334->cur_mode = &supported_modes[0];
 
-	imx334->xvclk = devm_clk_get(dev, "xvclk");
-	if (IS_ERR(imx334->xvclk)) {
-		dev_err(dev, "Failed to get xvclk\n");
+	imx334->sync_mode = NO_SYNC_MODE;
+	imx334->pending_mode = IMX334_FREE_RUN;
+	imx334->active_mode = IMX334_FREE_RUN;
+	imx334->xvs_pulse_us = IMX334_XVS_PULSE_US_DEFAULT;
+	imx334->xvs_period_ns = IMX334_XVS_PERIOD_NS_DEFAULT;
+	imx334->xhs_period_ns = IMX334_XHS_PERIOD_NS_DEFAULT;
+	imx334->xhs_duty_ns = IMX334_XHS_DUTY_NS_DEFAULT;
+	imx334->trigger_burst_count = IMX334_TRIGGER_BURST_COUNT_DEFAULT;
+
+	if (!of_property_read_u32(node, OF_IMX334_TRIGGER_MODE, &trigger_mode) &&
+	    trigger_mode <= IMX334_XVS_XHS_ONE_SHOT)
+		imx334->pending_mode = trigger_mode;
+	imx334->active_mode = imx334->pending_mode;
+	of_property_read_u32(node, OF_IMX334_XVS_PULSE_US,
+			     &imx334->xvs_pulse_us);
+	of_property_read_u32(node, OF_IMX334_XVS_PERIOD_NS,
+			     &imx334->xvs_period_ns);
+	of_property_read_u32(node, OF_IMX334_XHS_PERIOD_NS,
+			     &imx334->xhs_period_ns);
+	of_property_read_u32(node, OF_IMX334_XHS_DUTY_NS,
+			     &imx334->xhs_duty_ns);
+	if (imx334->xvs_pulse_us < IMX334_XVS_PULSE_US_MIN ||
+	    imx334->xvs_pulse_us > IMX334_XVS_PULSE_US_MAX ||
+	    (u64)imx334->xvs_pulse_us * 1000ULL >= imx334->xvs_period_ns ||
+	    !imx334->xhs_period_ns || !imx334->xhs_duty_ns ||
+	    imx334->xhs_duty_ns >= imx334->xhs_period_ns) {
+		dev_err(dev, "invalid XVS/XHS timing properties\n");
 		return -EINVAL;
 	}
 
-	imx334->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(imx334->reset_gpio))
-		dev_warn(dev, "Failed to get reset-gpios\n");
+	imx334->xvclk = devm_clk_get_optional(dev, "inck");
+	if (IS_ERR(imx334->xvclk))
+		return dev_err_probe(dev, PTR_ERR(imx334->xvclk),
+				     "failed to get inck\n");
+	if (!imx334->xvclk) {
+		imx334->xvclk = devm_clk_get_optional(dev, "xvclk");
+		if (IS_ERR(imx334->xvclk))
+			return dev_err_probe(dev, PTR_ERR(imx334->xvclk),
+					     "failed to get xvclk\n");
+	}
+	if (!imx334->xvclk)
+		dev_info(dev, "using on-module 37.125 MHz oscillator\n");
 
-	imx334->pwdn_gpio = devm_gpiod_get(dev, "pwdn", GPIOD_OUT_LOW);
+	imx334->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+						     GPIOD_OUT_HIGH);
+	if (IS_ERR(imx334->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(imx334->reset_gpio),
+				     "failed to get reset-gpios\n");
+
+	imx334->pwdn_gpio = devm_gpiod_get_optional(dev, "pwdn",
+						    GPIOD_OUT_LOW);
 	if (IS_ERR(imx334->pwdn_gpio))
-		dev_warn(dev, "Failed to get pwdn-gpios\n");
+		return dev_err_probe(dev, PTR_ERR(imx334->pwdn_gpio),
+				     "failed to get pwdn-gpios\n");
+
+	imx334->xvs_pwm = imx334_devm_pwm_get_optional(dev, "xvs");
+	if (IS_ERR(imx334->xvs_pwm))
+		return dev_err_probe(dev, PTR_ERR(imx334->xvs_pwm),
+				     "failed to get XVS PWM\n");
+	imx334->xhs_pwm = imx334_devm_pwm_get_optional(dev, "xhs");
+	if (IS_ERR(imx334->xhs_pwm))
+		return dev_err_probe(dev, PTR_ERR(imx334->xhs_pwm),
+				     "failed to get XHS PWM\n");
+	if (!imx334->xvs_pwm || !imx334->xhs_pwm)
+		return dev_err_probe(dev, -ENODEV,
+				     "both XVS and XHS PWMs are required\n");
+
+	imx334->light_source_gpio = devm_gpiod_get_optional(dev, "light-source",
+							    GPIOD_ASIS);
+	if (IS_ERR(imx334->light_source_gpio))
+		return dev_err_probe(dev, PTR_ERR(imx334->light_source_gpio),
+				     "failed to get light-source-gpios\n");
+	{
+		const char *active_level;
+
+		if (!of_property_read_string(node, "light-source-active-level",
+					     &active_level))
+			imx334->light_source_active_level =
+				!strcmp(active_level, "high");
+	}
+	of_property_read_u32(node, "light-source-exposure-advance-us",
+			     &imx334->light_source_advance_us);
+	of_property_read_u32(node, "light-source-exposure-off-delay-us",
+			     &imx334->light_source_off_delay_us);
+	imx334->light_source_advance_us =
+		min(imx334->light_source_advance_us, 100000U);
+	imx334->light_source_off_delay_us =
+		min(imx334->light_source_off_delay_us, 1000000U);
 
 	imx334->pinctrl = devm_pinctrl_get(dev);
 	if (!IS_ERR(imx334->pinctrl)) {
@@ -1792,6 +2166,12 @@ static int imx334_probe(struct i2c_client *client,
 	}
 
 	mutex_init(&imx334->mutex);
+	ret = imx334_stop_sync_locked(imx334);
+	if (ret)
+		goto err_destroy_mutex;
+	ret = imx334_light_source_init_locked(imx334);
+	if (ret)
+		goto err_destroy_mutex;
 
 	sd = &imx334->subdev;
 	v4l2_i2c_subdev_init(sd, client, &imx334_subdev_ops);
@@ -1835,12 +2215,18 @@ static int imx334_probe(struct i2c_client *client,
 		goto err_clean_entity;
 	}
 
+	ret = devm_device_add_group(dev, &imx334_attr_group);
+	if (ret)
+		goto err_unregister_subdev;
+
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 	pm_runtime_idle(dev);
 
 	return 0;
 
+err_unregister_subdev:
+	v4l2_async_unregister_subdev(sd);
 err_clean_entity:
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	media_entity_cleanup(&sd->entity);

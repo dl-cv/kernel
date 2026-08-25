@@ -265,7 +265,7 @@
 
 	/*
 	 * External Trigger Device
-	 * GPIO0_D2 input -> trigger-dev -> imx296 sysfs trigger
+	 * GPIO0_D2 input -> trigger-dev -> imx334 sysfs trigger
 	 * -> PWM output on GPIO0_B5
 	 */
 	trigger_dev: trigger-dev {
@@ -289,7 +289,7 @@
 		ok-led-gpios = <&gpio2 RK_PB0 GPIO_ACTIVE_HIGH>;
 		ng-led-gpios = <&gpio2 RK_PA7 GPIO_ACTIVE_HIGH>;
 
-		/* Trigger imx296 via sysfs */
+		/* Trigger imx334 via sysfs */
 		trigger-path = "/sys/bus/i2c/devices/4-001a/trigger";
 		trigger-value = "1";
 	};
@@ -348,13 +348,13 @@
 		};
 	};
 
-	imx296_light_source {
-		imx296_light_source_pin: imx296-light-source-pin {
+	imx334_light_source {
+		imx334_light_source_pin: imx334-light-source-pin {
 			/* GPIO0_C7: low active, idle high, pull-up */
 			rockchip,pins = <0 RK_PC7 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 
-		imx296_light_source_active_high_pin: imx296-light-source-active-high-pin {
+		imx334_light_source_active_high_pin: imx334-light-source-active-high-pin {
 			/* GPIO0_C7: high active, idle low, pull-down */
 			rockchip,pins = <0 RK_PC7 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
