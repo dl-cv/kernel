@@ -9,7 +9,8 @@ Scenarios:
     optional center-luma monotonicity under controlled light (soft check)
   - multi-signal bottom quality: classic / seam / tear
 
-Does not override CamOS warmup/gate. Kernel #2026081301 + imx296_bottom_quality.
+Does not override CamOS warmup/gate. Kernel #2026082001 + imx296_bottom_quality.
+CamOS 控制面默认 /ws/cmd（/ws 只读）；可用 CAMOS_WS 覆盖。
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ import requests
 import websockets
 
 BASE = os.environ.get("CAMOS_BASE", "http://127.0.0.1:8000")
-WS_URL = os.environ.get("CAMOS_WS", "ws://127.0.0.1:8000/ws")
+WS_URL = os.environ.get("CAMOS_WS", "ws://127.0.0.1:8000/ws/cmd")
 OUT = Path(os.environ.get("VERIFY_OUT", "/userdata/imx296_warmup_ab/verify_accept_user"))
 SW_ROUNDS = int(os.environ.get("VERIFY_SW_ROUNDS", "6"))
 LINE0_ROUNDS = int(os.environ.get("VERIFY_LINE0_ROUNDS", "4"))
@@ -34,7 +35,8 @@ HEAD = int(os.environ.get("VERIFY_HEAD", "12"))
 N1_SEQ = int(os.environ.get("VERIFY_N1_SEQ", "16"))
 ROI_HEAD = int(os.environ.get("VERIFY_ROI_HEAD", "8"))
 COOLDOWN = float(os.environ.get("VERIFY_COOLDOWN", "5.5"))
-USER, PASS = "admin", "dlcv2026"
+USER = os.environ.get("CAMOS_USER", "admin")
+PASS = os.environ.get("CAMOS_PASS", "dlcv2026")
 XTRIG = Path(os.environ.get("XTRIG_PATH", "/sys/bus/i2c/devices/4-001a/trigger"))
 N1TRACE = Path("/sys/module/video_rkisp/parameters/n1trace")
 

@@ -344,10 +344,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--report",
-        default=str(
-            Path(__file__).resolve().parents[1]
-            / "IMX296_24h稳定性测试_20260807.md"
-        ),
+        default=str(Path("/tmp/imx296_day_watchdog/report.md")),
     )
     ap.add_argument("--state-dir", default="/tmp/imx296_day_watchdog")
     ap.add_argument("--interval", type=int, default=120)

@@ -48,7 +48,7 @@ except ImportError:
     raise SystemExit(2)
 
 BASE = os.environ.get("CAMOS_BASE", "http://127.0.0.1:8000")
-WS_URL = os.environ.get("CAMOS_WS", "ws://127.0.0.1:8000/ws")
+WS_URL = os.environ.get("CAMOS_WS", "ws://127.0.0.1:8000/ws/cmd")
 USER = os.environ.get("CAMOS_USER", "admin")
 PASS = os.environ.get("CAMOS_PASS", "dlcv2026")
 

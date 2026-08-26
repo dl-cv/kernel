@@ -3,6 +3,7 @@
 
 Measures mon→software apply wall-clock (real switches only: apply_s>=0.5).
 Hard limit 5s target 2–3s. Does not lengthen warmup/gate.
+CamOS 控制面默认 /ws/cmd（/ws 只读）；可用 CAMOS_WS 覆盖。
 """
 from __future__ import annotations
 
@@ -19,13 +20,14 @@ import requests
 import websockets
 
 BASE = os.environ.get("CAMOS_BASE", "http://127.0.0.1:8000")
-WS_URL = os.environ.get("CAMOS_WS", "ws://127.0.0.1:8000/ws")
+WS_URL = os.environ.get("CAMOS_WS", "ws://127.0.0.1:8000/ws/cmd")
 OUT = Path(os.environ.get("VERIFY_OUT", "/userdata/imx296_warmup_ab/verify_k1301_lat"))
 SW_ROUNDS = int(os.environ.get("VERIFY_SW_ROUNDS", "8"))
 HEAD = int(os.environ.get("VERIFY_HEAD", "10"))
 ROI_HEAD = int(os.environ.get("VERIFY_ROI_HEAD", "8"))
 COOLDOWN = float(os.environ.get("VERIFY_COOLDOWN", "5.5"))
-USER, PASS = "admin", "dlcv2026"
+USER = os.environ.get("CAMOS_USER", "admin")
+PASS = os.environ.get("CAMOS_PASS", "dlcv2026")
 
 _det = None
 for cand in (
