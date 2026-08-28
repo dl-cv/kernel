@@ -69,6 +69,8 @@ config VIDEO_AR0230
 config VIDEO_AR0521
 	tristate "ON Semiconductor AR0521 sensor support"
 	depends on I2C && VIDEO_DEV
+	depends on MEDIA_CAMERA_SUPPORT
+	depends on PWM
 	select MEDIA_CONTROLLER
 	select VIDEO_V4L2_SUBDEV_API
 	select V4L2_FWNODE

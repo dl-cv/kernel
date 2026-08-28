@@ -24,6 +24,16 @@
     status = "okay";
 };
 
+/* Module on-board 27 MHz crystal; not a SoC MCLK. */
+/ {
+	ar0521_extclk: ar0521-extclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <27000000>;
+		clock-output-names = "ar0521_extclk";
+	};
+};
+
 /*-----------------------------------------------------------
  * Camera Link Configuration
  *----------------------------------------------------------*/
@@ -31,28 +41,22 @@
 	status = "okay";
 	pinctrl-0 = <&i2c4m3_xfer>;
 
-	imx296_mipi0: imx296@1a {
+	ar0521_mipi0: ar0521@36 {
 		status = "okay";
-		compatible = "sony,imx296lq";
-		reg = <0x1a>;
-		/* Module has on-board 37.125MHz oscillator, disable board MCLK */
-		/* clocks = <&cru CLK_MIPI_CAMERAOUT_M0>; */
-		/* assigned-clocks = <&cru CLK_MIPI_CAMERAOUT_M0>; */
-		/* assigned-clock-rates = <74250000>; */
-		/* clock-names = "inck"; */
-		/* pinctrl-names = "default"; */
-		/* pinctrl-0 = <&cam_clk0m0_clk0>; */
+		compatible = "onnn,ar0521";
+		reg = <0x36>;
+		clocks = <&ar0521_extclk>;
+		clock-names = "extclk";
 		power-domains = <&power RK3576_PD_VI>;
-
-		avdd-supply = <&vcc_mipicsi0_avdd>;
-		dvdd-supply = <&vcc_mipicsi0_dvdd>;
-		ovdd-supply = <&vcc_mipicsi0_dovdd>;
 
 		reset-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_LOW>;
 
-		/* External trigger: PWM output on GPIO0_B5 (pwm1_ch1_m0) */
+		/*
+		 * External trigger: PWM output on GPIO0_B5 (pwm1_ch1_m0).
+		 * Polarity normal: idle-low, rising edge starts one AR0521 frame.
+		 */
 		pwm-names = "trigger";
-		pwms = <&pwm1_6ch_1 0 10000000 PWM_POLARITY_INVERTED>;
+		pwms = <&pwm1_6ch_1 0 10000000 0>;
 		rockchip,trigger-pulse-us = <800>;
 
 		/* Light source control on GPIO1/OUTPUT1 = GPIO0_C7 */
@@ -62,22 +66,22 @@
 		light-source-exposure-off-delay-us = <0>;
 
 		pinctrl-names = "default", "active-high";
-		pinctrl-0 = <&imx296_light_source_pin>;
-		pinctrl-1 = <&imx296_light_source_active_high_pin>;
+		pinctrl-0 = <&ar0521_light_source_pin>;
+		pinctrl-1 = <&ar0521_light_source_active_high_pin>;
 
 		rockchip,camera-module-index = <0>;
 		rockchip,camera-module-facing = "back";
-		rockchip,camera-module-name = "IMX296-MIPI";
+		rockchip,camera-module-name = "AR0521-MIPI";
 		rockchip,camera-module-lens-name = "default";
 
-		/* 0 = FREE_RUN, 1 = XTRIG_ONE_SHOT */
+		/* 0 = FREE_RUN, 1 = TRIGGER_ONE_SHOT */
 		trigger-mode = <1>;
 
 		port {
-			imx296_dcphy0_out: endpoint {
-				remote-endpoint = <&dcphy0_in_imx296>;
+			ar0521_dcphy0_out: endpoint {
+				remote-endpoint = <&dcphy0_in_ar0521>;
 				clock-lanes = <0>;
-				data-lanes = <1>;
+				data-lanes = <1 2 3 4>;
 			};
 		};
 	};
@@ -95,10 +99,10 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			dcphy0_in_imx296: endpoint@1 {
+			dcphy0_in_ar0521: endpoint@1 {
 				reg = <1>;
-				remote-endpoint = <&imx296_dcphy0_out>;
-				data-lanes = <1>;
+				remote-endpoint = <&ar0521_dcphy0_out>;
+				data-lanes = <1 2 3 4>;
 			};
 		};
 		port@1 {
@@ -221,7 +225,7 @@
 };
 
 /*-----------------------------------------------------------
- * PWM1 CH1 for IMX296 external trigger output on GPIO0_B5
+ * PWM1 CH1 for AR0521 external trigger output on GPIO0_B5
  *----------------------------------------------------------*/
 &pwm1_6ch_1 {
 	status = "okay";

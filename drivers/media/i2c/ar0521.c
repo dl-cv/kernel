@@ -1,147 +1,523 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * ON Semiconductor AR0521 MIPI CSI-2 sensor driver
+ *
  * Copyright (C) 2021 Sieć Badawcza Łukasiewicz
  * - Przemysłowy Instytut Automatyki i Pomiarów PIAP
  * Written by Krzysztof Hałasa
+ *
+ * Rockchip / DLCVCAM integration, RAW10 4-lane, AND9573 slave trigger.
  */
 
 #include <linux/clk.h>
+#include <linux/compat.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/pwm.h>
+#include <linux/regulator/consumer.h>
+#include <linux/slab.h>
+#include <linux/sysfs.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/version.h>
+#include <linux/videodev2.h>
 
+#include <linux/rk-camera-module.h>
+
+#include <media/media-entity.h>
+#include <media/v4l2-async.h>
 #include <media/v4l2-ctrls.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
+#include <media/v4l2-mediabus.h>
 #include <media/v4l2-subdev.h>
 
-/* External clock (extclk) frequencies */
-#define AR0521_EXTCLK_MIN	  (10 * 1000 * 1000)
-#define AR0521_EXTCLK_MAX	  (48 * 1000 * 1000)
+#define DRIVER_VERSION				KERNEL_VERSION(0, 0x01, 0x00)
+#define AR0521_NAME				"ar0521"
 
-/* PLL and PLL2 */
-#define AR0521_PLL_MIN		 (320 * 1000 * 1000)
-#define AR0521_PLL_MAX		(1280 * 1000 * 1000)
+#define AR0521_EXTCLK_MIN			(10 * 1000 * 1000)
+#define AR0521_EXTCLK_MAX			(48 * 1000 * 1000)
+#define AR0521_EXTCLK_DEFAULT			27000000U
+#define AR0521_EXTCLK_EXPECTED			AR0521_EXTCLK_DEFAULT
 
-/* Effective pixel clocks, the registers may be DDR */
-#define AR0521_PIXEL_CLOCK_RATE	 (184 * 1000 * 1000)
-#define AR0521_PIXEL_CLOCK_MIN	 (168 * 1000 * 1000)
-#define AR0521_PIXEL_CLOCK_MAX	 (414 * 1000 * 1000)
+#define AR0521_PLL_MIN				(320 * 1000 * 1000)
+#define AR0521_PLL_MAX				(1280 * 1000 * 1000)
 
-#define AR0521_WIDTH_MIN	       8u
-#define AR0521_WIDTH_MAX	    2608u
-#define AR0521_HEIGHT_MIN	       8u
-#define AR0521_HEIGHT_MAX	    1958u
+/*
+ * AND9573 p18 Table 5, RAW10 Full, 27 MHz EXTCLK (register values as-is):
+ *   vt_pix=5, vt_sys=1, pre1=pre2=3, mult1=89, mult2=115,
+ *   op_pix=10, op_sys=1.
+ *
+ * RR 0x0304 / 0x0306 packing (pre2/pre1 and pll_multiplier2/1):
+ *   0x0304 = (pre2 << 8) | pre1 = 0x0303
+ *   0x0306 = (mult2 << 8) | mult1 = 0x7359
+ *
+ * Datasheet p10: PLL multipliers must be even; an odd programmed M is
+ * used as M-1. Registers still write Table 5's 89/115; software clocks
+ * use the effective even values 88/114. Do not mix nominal Table M with
+ * derived VCO / VT / link / pixel rates.
+ *
+ * Effective clocks (27 MHz * Meff / pre):
+ *   PLL1 VCO = 27e6 * 88 / 3 = 792 MHz
+ *   PLL2 VCO = 27e6 * 114 / 3 = 1026 MHz
+ *   VT pix   = PLL2 / vt_pix = 1026 / 5 = 205.2 MHz
+ *   Word clk = PLL2 / op_pix = 1026 / 10 = 102.6 MHz
+ *   MIPI bitrate/lane = PLL2 VCO = 1026 Mbps
+ *   V4L2 link_freq    = bitrate/2 = 513 MHz
+ *   4-lane RAW10 pixel_rate = 1026e6 * 4 / 10 = 410.4 MHz = 2 * VT
+ *
+ * RAW10 0x0112 = 0x0A0A; 4-lane 0x31AE = 0x0204.
+ */
+#define AR0521_PLL_PRE				3U
+#define AR0521_PLL1_MULT_REG			89U
+#define AR0521_PLL2_MULT_REG			115U
+#define AR0521_PLL1_MULT_EFF			(AR0521_PLL1_MULT_REG & ~1U)
+#define AR0521_PLL2_MULT_EFF			(AR0521_PLL2_MULT_REG & ~1U)
+#define AR0521_VT_PIX_CLK_DIV			5U
+#define AR0521_VT_SYS_CLK_DIV			1U
+#define AR0521_OP_PIX_CLK_DIV			10U
+#define AR0521_OP_SYS_CLK_DIV			1U
+#define AR0521_PLL1_VCO_HZ			792000000ULL
+#define AR0521_PLL2_VCO_HZ			1026000000ULL
+#define AR0521_VT_PIX_CLK_HZ			205200000ULL
+#define AR0521_WORD_CLK_HZ			102600000ULL
+#define AR0521_MIPI_BITRATE_PER_LANE_HZ		1026000000ULL
+#define AR0521_LINK_FREQ_HZ			513000000LL
+#define AR0521_PIXEL_RATE			410400000ULL
+#define AR0521_PIXEL_RATE_MIN			(168 * 1000 * 1000ULL)
+#define AR0521_PIXEL_RATE_MAX			(420 * 1000 * 1000ULL)
+#define AR0521_NUM_DATA_LANES			4U
+#define AR0521_BITS_PER_SAMPLE			10U
 
-#define AR0521_WIDTH_BLANKING_MIN     572u
-#define AR0521_HEIGHT_BLANKING_MIN     38u /* must be even */
-#define AR0521_TOTAL_WIDTH_MIN	     2968u
+/*
+ * AND9484 default window is 2600x1952 starting at (4,4). Product mode
+ * 2592x1944 is a symmetric 8-pixel crop (4 per side). No official
+ * 2592x1944 table is published.
+ */
+#define AR0521_NATIVE_LEFT			4U
+#define AR0521_NATIVE_TOP			4U
+#define AR0521_NATIVE_WIDTH			2600U
+#define AR0521_NATIVE_HEIGHT			1952U
+#define AR0521_WIDTH_MIN			8U
+#define AR0521_HEIGHT_MIN			8U
+#define AR0521_WIDTH_MAX			2592U
+#define AR0521_HEIGHT_MAX			1944U
+#define AR0521_DEFAULT_LEFT			8U
+#define AR0521_DEFAULT_TOP			8U
 
-/* AR0521 registers */
+#define AR0521_WIDTH_BLANKING_MIN		572U
+#define AR0521_HEIGHT_BLANKING_MIN		38U /* must be even */
+#define AR0521_TOTAL_WIDTH_MIN			2968U
+#define AR0521_TOTAL_HEIGHT_MAX			65535U
+#define AR0521_CIT_MARGIN			4U
+#define AR0521_MIN_FRAME_BLANK_LINES		28U
+
+/*
+ * Product default ~30 fps at 2592x1944, LLPCK/total_width = 3164.
+ * FLL = round(pixel_rate / (LLPCK * 30)) = round(410.4e6 / (3164 * 30))
+ *     = 4324 (even). VBLANK = FLL - 1944 = 2380 (even).
+ * Constraints: even VBLANK; FLL >= active + 28 and CIT + 4.
+ * Actual fps = 410.4e6 / (3164 * 4324) ≈ 29.998 fps. This is a product
+ * default, not a Table 5 30 fps definition.
+ */
+#define AR0521_DEFAULT_TOTAL_HEIGHT		4324U
+#define AR0521_HEIGHT_BLANKING_DEFAULT		(AR0521_DEFAULT_TOTAL_HEIGHT - \
+						 AR0521_HEIGHT_MAX)
+
+/*
+ * V4L2 analogue gain is Q8 (256 = 1x). Hardware mapping uses R0x305E
+ * (AND9573 Table 2 / RR global_gain): 1x = 0x2000.
+ *   [15:7] digital gain / 64, 0x40 = 1x
+ *   [6:4]  analog_coarse
+ *   [3:0]  analog_fine
+ * Analog-only coverage is 1x..16x (digital held at 1x). Do not program
+ * R0x3EC4 companions from Table 2. R0x3028 is SMIA analogue_gain_code,
+ * not the product analog path.
+ */
+#define AR0521_ANA_GAIN_MIN			256U	/* 1x */
+#define AR0521_ANA_GAIN_MAX			4096U	/* 16x */
+#define AR0521_ANA_GAIN_STEP			1U
+#define AR0521_ANA_GAIN_DEFAULT			256U	/* 1x */
+#define AR0521_GLOBAL_GAIN_DG_1X		0x40
+#define AR0521_GLOBAL_GAIN_DG_SHIFT		7
+#define AR0521_GLOBAL_GAIN_COARSE_SHIFT		4
+#define AR0521_GLOBAL_GAIN_FINE_MASK		0x0F
+#define AR0521_GLOBAL_GAIN_COARSE_MASK		0x07
+
+#define AR0521_MODEL_ID				0x0457
+#define AR0521_REG_MODEL_ID			0x3000
+#define AR0521_REG_REVISION			0x0002
+
 #define AR0521_REG_VT_PIX_CLK_DIV		0x0300
+#define AR0521_REG_VT_SYS_CLK_DIV		0x0302
+#define AR0521_REG_PRE_PLL_CLK_DIV		0x0304
+#define AR0521_REG_PLL_MULTIPLIER		0x0306
+#define AR0521_REG_OP_PIX_CLK_DIV		0x0308
+#define AR0521_REG_OP_SYS_CLK_DIV		0x030A
 #define AR0521_REG_FRAME_LENGTH_LINES		0x0340
+#define AR0521_REG_LINE_LENGTH_PCK		0x0342
+#define AR0521_REG_X_ADDR_START			0x0344
+#define AR0521_REG_Y_ADDR_START			0x0346
+#define AR0521_REG_X_ADDR_END			0x0348
+#define AR0521_REG_Y_ADDR_END			0x034A
+#define AR0521_REG_X_OUTPUT_SIZE			0x034C
+#define AR0521_REG_Y_OUTPUT_SIZE			0x034E
 
-#define AR0521_REG_CHIP_ID			0x3000
 #define AR0521_REG_COARSE_INTEGRATION_TIME	0x3012
 #define AR0521_REG_ROW_SPEED			0x3016
-#define AR0521_REG_EXTRA_DELAY			0x3018
-#define AR0521_REG_RESET			0x301A
-#define   AR0521_REG_RESET_DEFAULTS		  0x0238
+#define AR0521_REG_RESET				0x301A
+/* AND9573 RESET_REGISTER: 0x0218 standby, 0x021C streaming (bit2). */
+#define   AR0521_REG_RESET_DEFAULTS		  0x0218
 #define   AR0521_REG_RESET_GROUP_PARAM_HOLD	  0x8000
+#define   AR0521_REG_RESET_GPI			  BIT(8)
 #define   AR0521_REG_RESET_STREAM		  BIT(2)
 #define   AR0521_REG_RESET_RESTART		  BIT(1)
 #define   AR0521_REG_RESET_INIT			  BIT(0)
 
-#define AR0521_REG_GREEN1_GAIN			0x3056
-#define AR0521_REG_BLUE_GAIN			0x3058
-#define AR0521_REG_RED_GAIN			0x305A
-#define AR0521_REG_GREEN2_GAIN			0x305C
+#define AR0521_REG_GPIO_GPO_1			0x30F8
+#define AR0521_REG_GPIO_GPO_2			0x30FA
+#define AR0521_REG_GPIO_CTRL2			0x3026
+#define AR0521_REG_GROUPED_PARAMETER_HOLD	0x0104
 #define AR0521_REG_GLOBAL_GAIN			0x305E
+#define AR0521_REG_READ_MODE			0x3040
+#define   AR0521_REG_READ_MODE_VERT_FLIP	  BIT(15)
+#define   AR0521_REG_READ_MODE_HORIZ_MIRROR	  BIT(14)
 
 #define AR0521_REG_HISPI_TEST_MODE		0x3066
 #define AR0521_REG_HISPI_TEST_MODE_LP11		  0x0004
-
 #define AR0521_REG_TEST_PATTERN_MODE		0x3070
-
-#define AR0521_REG_SERIAL_FORMAT		0x31AE
+#define AR0521_REG_SERIAL_FORMAT			0x31AE
 #define AR0521_REG_SERIAL_FORMAT_MIPI		  0x0200
-
+#define AR0521_REG_HISPI_TIMING			0x31BC
+#define   AR0521_REG_HISPI_TIMING_CONT_TX_CLK	  BIT(15)
 #define AR0521_REG_HISPI_CONTROL_STATUS		0x31C6
 #define AR0521_REG_HISPI_CONTROL_STATUS_FRAMER_TEST_MODE_ENABLE 0x80
+#define AR0521_REG_VD_TRIG_NEW_FRAME		0x3158
+#define AR0521_REG_GLOBAL_SEQ_TRIGGER		0x315E
+#define   AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR	  BIT(0)
 
-#define be		cpu_to_be16
+#define AR0521_SLAVE_GPIO_GPO_1			0x0002
+#define AR0521_SLAVE_GPIO_CTRL2			0xFC70
+#define AR0521_SLAVE_VD_TRIG			0x8000
+
+#define OF_CAMERA_PINCTRL_STATE_DEFAULT		"rockchip,camera_default"
+#define OF_CAMERA_PINCTRL_STATE_SLEEP		"rockchip,camera_sleep"
+#define OF_AR0521_TRIGGER_MODE			"trigger-mode"
+#define OF_AR0521_TRIGGER_PULSE_US		"rockchip,trigger-pulse-us"
+#define AR0521_TRIGGER_PULSE_US_DEFAULT		800U
+#define AR0521_TRIGGER_PULSE_US_MIN		1U
+#define AR0521_TRIGGER_PULSE_US_MAX		1000000U
+#define AR0521_TRIGGER_PERIOD_NS_DEFAULT	10000000ULL
+#define AR0521_TRIGGER_PERIOD_MARGIN_NS		10000000ULL
+
+/*
+ * CODA already owns USER_BASE+0x10e0. IMX296 uses +0x10d0. Pick an
+ * unused 16-id window after DW100 (+0x1190).
+ */
+#define V4L2_CID_USER_AR0521_BASE		(V4L2_CID_USER_BASE + 0x11a0)
+#define V4L2_CID_AR0521_OP_MODE			(V4L2_CID_USER_AR0521_BASE + 0x1)
+#define V4L2_CID_AR0521_LIGHT_SOURCE_ENABLE	(V4L2_CID_USER_AR0521_BASE + 0x2)
+#define V4L2_CID_AR0521_LIGHT_SOURCE_ACTIVE_LEVEL (V4L2_CID_USER_AR0521_BASE + 0x3)
+#define V4L2_CID_AR0521_LIGHT_SOURCE_ADVANCE_US	(V4L2_CID_USER_AR0521_BASE + 0x4)
+#define V4L2_CID_AR0521_LIGHT_SOURCE_OFF_DELAY_US (V4L2_CID_USER_AR0521_BASE + 0x5)
+
+#define be					cpu_to_be16
+
+enum ar0521_op_mode {
+	AR0521_FREE_RUN = 0,
+	AR0521_TRIGGER_ONE_SHOT = 1,
+};
 
 static const char * const ar0521_supply_names[] = {
-	"vdd_io",	/* I/O (1.8V) supply */
-	"vdd",		/* Core, PLL and MIPI (1.2V) supply */
-	"vaa",		/* Analog (2.7V) supply */
+	"vdd_io",
+	"vdd",
+	"vaa",
 };
 
-struct ar0521_ctrls {
-	struct v4l2_ctrl_handler handler;
-	struct {
-		struct v4l2_ctrl *gain;
-		struct v4l2_ctrl *red_balance;
-		struct v4l2_ctrl *blue_balance;
-	};
-	struct {
-		struct v4l2_ctrl *hblank;
-		struct v4l2_ctrl *vblank;
-	};
-	struct v4l2_ctrl *pixrate;
-	struct v4l2_ctrl *exposure;
-	struct v4l2_ctrl *test_pattern;
-};
-
-struct ar0521_dev {
-	struct i2c_client *i2c_client;
-	struct v4l2_subdev sd;
-	struct media_pad pad;
+struct ar0521 {
+	struct device *dev;
+	struct i2c_client *client;
 	struct clk *extclk;
 	u32 extclk_freq;
-
 	struct regulator *supplies[ARRAY_SIZE(ar0521_supply_names)];
 	struct gpio_desc *reset_gpio;
+	struct pwm_device *trigger_pwm;
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *pins_default;
+	struct pinctrl_state *pins_sleep;
+	struct pinctrl_state *pins_active_high;
+	struct mutex mutex; /* serialize streaming, controls, and trigger */
 
-	/* lock to protect all members below */
-	struct mutex lock;
-
-	struct v4l2_mbus_framefmt fmt;
-	struct ar0521_ctrls ctrls;
-	unsigned int lane_count;
-	u16 total_width;
-	u16 total_height;
-	u16 pll_pre;
-	u16 pll_mult;
-	u16 pll_pre2;
-	u16 pll_mult2;
 	bool streaming;
+	bool power_on;
+	bool sysfs_registered;
+	unsigned int lane_count;
+
+	enum rkmodule_sync_mode sync_mode;
+	enum ar0521_op_mode active_mode;
+	enum ar0521_op_mode pending_mode;
+	u32 trigger_pulse_us;
+
+	struct gpio_desc *light_source_gpio;
+	bool light_source_enabled;
+	bool light_source_active_level;
+	u32 light_source_advance_us;
+	u32 light_source_off_delay_us;
+
+	struct v4l2_ctrl *light_source_enable_ctrl;
+	struct v4l2_ctrl *light_source_active_level_ctrl;
+	struct v4l2_ctrl *light_source_advance_us_ctrl;
+	struct v4l2_ctrl *light_source_off_delay_us_ctrl;
+
+	u32 module_index;
+	const char *module_facing;
+	const char *module_name;
+	const char *len_name;
+
+	struct v4l2_subdev sd;
+	struct media_pad pad;
+	struct v4l2_rect crop;
+	struct v4l2_mbus_framefmt format;
+
+	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *exposure;
+	struct v4l2_ctrl *anal_gain;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *link_freq;
+	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *test_pattern;
+	struct v4l2_ctrl *vflip;
+	struct v4l2_ctrl *hflip;
+	struct v4l2_ctrl *op_mode_ctrl;
+
+	u16 saved_gpio_gpo_1;
+	u16 saved_gpio_ctrl2;
+	u16 saved_vd_trig;
+	u16 saved_global_seq;
+	u16 saved_reset;
+	bool slave_backup_valid;
 };
 
-static inline struct ar0521_dev *to_ar0521_dev(struct v4l2_subdev *sd)
+static inline struct ar0521 *to_ar0521(struct v4l2_subdev *sd)
 {
-	return container_of(sd, struct ar0521_dev, sd);
+	return container_of(sd, struct ar0521, sd);
 }
 
-static inline struct v4l2_subdev *ctrl_to_sd(struct v4l2_ctrl *ctrl)
+static const char * const ar0521_test_pattern_menu[] = {
+	"Disabled",
+	"Solid color",
+	"Color bars",
+	"Faded color bars"
+};
+
+static const char * const ar0521_op_mode_menu[] = {
+	"FREE_RUN",
+	"XTRIG_ONE_SHOT",
+};
+
+static const s64 ar0521_link_freq_menu[] = {
+	AR0521_LINK_FREQ_HZ,
+};
+
+static const u32 ar0521_mbus_codes[] = {
+	MEDIA_BUS_FMT_SGRBG10_1X10,
+	MEDIA_BUS_FMT_SRGGB10_1X10,
+	MEDIA_BUS_FMT_SBGGR10_1X10,
+	MEDIA_BUS_FMT_SGBRG10_1X10,
+};
+
+static const char *ar0521_op_mode_name(enum ar0521_op_mode mode)
 {
-	return &container_of(ctrl->handler, struct ar0521_dev,
-			     ctrls.handler)->sd;
+	if (mode == AR0521_TRIGGER_ONE_SHOT)
+		return "master_fast_trigger";
+	return "free_run";
 }
 
-static u32 div64_round(u64 v, u32 d)
+static const char *ar0521_sync_mode_name(enum rkmodule_sync_mode mode)
 {
-	return div_u64(v + (d >> 1), d);
+	switch (mode) {
+	case INTERNAL_MASTER_MODE:
+		return "INTERNAL_MASTER";
+	case EXTERNAL_MASTER_MODE:
+		return "EXTERNAL_MASTER";
+	case SLAVE_MODE:
+		return "SLAVE";
+	case NO_SYNC_MODE:
+	default:
+		return "NO_SYNC";
+	}
 }
 
-static u32 div64_round_up(u64 v, u32 d)
+static int ar0521_parse_run_mode(const char *buf, enum ar0521_op_mode *mode)
 {
-	return div_u64(v + d - 1, d);
+	if (sysfs_streq(buf, "free_run") ||
+	    sysfs_streq(buf, "normal") ||
+	    sysfs_streq(buf, "continuous") ||
+	    sysfs_streq(buf, "0")) {
+		*mode = AR0521_FREE_RUN;
+		return 0;
+	}
+
+	if (sysfs_streq(buf, "master_fast_trigger") ||
+	    sysfs_streq(buf, "fast_trigger") ||
+	    sysfs_streq(buf, "xtrig_one_shot") ||
+	    sysfs_streq(buf, "trigger") ||
+	    sysfs_streq(buf, "1")) {
+		*mode = AR0521_TRIGGER_ONE_SHOT;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
-/* Data must be BE16, the first value is the register address */
-static int ar0521_write_regs(struct ar0521_dev *sensor, const __be16 *data,
+static struct ar0521 *ar0521_from_dev(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+
+	if (!sd)
+		return NULL;
+
+	return to_ar0521(sd);
+}
+
+static struct pwm_device *ar0521_devm_pwm_get_optional(struct device *dev,
+						       const char *con_id)
+{
+	struct pwm_device *pwm;
+	int ret;
+
+	pwm = devm_pwm_get(dev, con_id);
+	if (IS_ERR(pwm)) {
+		ret = PTR_ERR(pwm);
+		if (ret == -ENODEV || ret == -ENOENT)
+			return NULL;
+		return pwm;
+	}
+
+	return pwm;
+}
+
+static u64 ar0521_pwm_period_ns(struct pwm_device *pwm)
+{
+	struct pwm_state state;
+	struct pwm_args args;
+
+	if (!pwm)
+		return AR0521_TRIGGER_PERIOD_NS_DEFAULT;
+
+	pwm_get_state(pwm, &state);
+	if (state.period)
+		return state.period;
+
+	pwm_get_args(pwm, &args);
+	return args.period ? args.period : AR0521_TRIGGER_PERIOD_NS_DEFAULT;
+}
+
+static u64 ar0521_trigger_period_ns(u64 pulse_ns, u64 base_period_ns)
+{
+	u64 min_period_ns = pulse_ns + AR0521_TRIGGER_PERIOD_MARGIN_NS;
+
+	if (base_period_ns < AR0521_TRIGGER_PERIOD_NS_DEFAULT)
+		base_period_ns = AR0521_TRIGGER_PERIOD_NS_DEFAULT;
+
+	return max(base_period_ns, min_period_ns);
+}
+
+static int ar0521_init_trigger_pwm(struct ar0521 *sensor)
+{
+	struct pwm_state state = { 0 };
+	u64 pulse_ns;
+
+	if (!sensor->trigger_pwm)
+		return 0;
+
+	pulse_ns = (u64)sensor->trigger_pulse_us * 1000ULL;
+	state.period = ar0521_trigger_period_ns(pulse_ns,
+						ar0521_pwm_period_ns(sensor->trigger_pwm));
+	state.duty_cycle = 0;
+	state.polarity = PWM_POLARITY_NORMAL;
+	state.enabled = false;
+
+	return pwm_apply_state(sensor->trigger_pwm, &state);
+}
+
+static int ar0521_light_source_value_locked(struct ar0521 *sensor, bool on)
+{
+	return on ? sensor->light_source_active_level :
+		    !sensor->light_source_active_level;
+}
+
+static int ar0521_light_source_apply_pinctrl_locked(struct ar0521 *sensor)
+{
+	struct pinctrl_state *state;
+
+	if (!sensor->pinctrl)
+		return 0;
+
+	state = sensor->light_source_active_level ? sensor->pins_active_high
+						  : sensor->pins_default;
+	if (!state)
+		return 0;
+
+	return pinctrl_select_state(sensor->pinctrl, state);
+}
+
+static void ar0521_light_source_set_locked(struct ar0521 *sensor, bool on)
+{
+	if (!sensor->light_source_gpio)
+		return;
+
+	gpiod_set_value(sensor->light_source_gpio,
+			ar0521_light_source_value_locked(sensor, on));
+}
+
+static int ar0521_light_source_init_locked(struct ar0521 *sensor)
+{
+	int idle_value;
+	int ret;
+
+	if (!sensor->light_source_gpio)
+		return 0;
+
+	ret = ar0521_light_source_apply_pinctrl_locked(sensor);
+	if (ret)
+		dev_dbg(sensor->dev,
+			"failed to select light source pinctrl state (%d)\n", ret);
+
+	idle_value = ar0521_light_source_value_locked(sensor, false);
+	ret = gpiod_direction_output(sensor->light_source_gpio, idle_value);
+	if (ret) {
+		dev_err(sensor->dev,
+			"failed to set light source gpio direction (%d)\n", ret);
+		return ret;
+	}
+
+	ar0521_light_source_set_locked(sensor, false);
+	return 0;
+}
+
+static void ar0521_sleep_us(u32 us)
+{
+	if (!us)
+		return;
+	if (us <= 1000)
+		udelay(us);
+	else
+		usleep_range(us, us + max_t(u32, 20U, us / 10U));
+}
+
+static int ar0521_write_regs(struct ar0521 *sensor, const __be16 *data,
 			     unsigned int count)
 {
-	struct i2c_client *client = sensor->i2c_client;
+	struct i2c_client *client = sensor->client;
 	struct i2c_msg msg;
 	int ret;
 
@@ -151,395 +527,1021 @@ static int ar0521_write_regs(struct ar0521_dev *sensor, const __be16 *data,
 	msg.len = count * sizeof(*data);
 
 	ret = i2c_transfer(client->adapter, &msg, 1);
-
-	if (ret < 0) {
-		v4l2_err(&sensor->sd, "%s: I2C write error\n", __func__);
+	if (ret != 1) {
+		if (ret >= 0)
+			ret = -EIO;
+		dev_err(sensor->dev, "I2C write error %d\n", ret);
 		return ret;
 	}
 
 	return 0;
 }
 
-static int ar0521_write_reg(struct ar0521_dev *sensor, u16 reg, u16 val)
+static int ar0521_write_reg(struct ar0521 *sensor, u16 reg, u16 val)
 {
-	__be16 buf[2] = {be(reg), be(val)};
+	__be16 buf[2] = { be(reg), be(val) };
 
 	return ar0521_write_regs(sensor, buf, 2);
 }
 
-static int ar0521_set_geometry(struct ar0521_dev *sensor)
+static int ar0521_read_reg(struct ar0521 *sensor, u16 reg, u16 *val)
 {
-	/* All dimensions are unsigned 12-bit integers */
-	u16 x = (AR0521_WIDTH_MAX - sensor->fmt.width) / 2;
-	u16 y = ((AR0521_HEIGHT_MAX - sensor->fmt.height) / 2) & ~1;
-	__be16 regs[] = {
-		be(AR0521_REG_FRAME_LENGTH_LINES),
-		be(sensor->total_height),
-		be(sensor->total_width),
-		be(x),
-		be(y),
-		be(x + sensor->fmt.width - 1),
-		be(y + sensor->fmt.height - 1),
-		be(sensor->fmt.width),
-		be(sensor->fmt.height)
-	};
-
-	return ar0521_write_regs(sensor, regs, ARRAY_SIZE(regs));
-}
-
-static int ar0521_set_gains(struct ar0521_dev *sensor)
-{
-	int green = sensor->ctrls.gain->val;
-	int red = max(green + sensor->ctrls.red_balance->val, 0);
-	int blue = max(green + sensor->ctrls.blue_balance->val, 0);
-	unsigned int gain = min(red, min(green, blue));
-	unsigned int analog = min(gain, 64u); /* range is 0 - 127 */
-	__be16 regs[5];
-
-	red   = min(red   - analog + 64, 511u);
-	green = min(green - analog + 64, 511u);
-	blue  = min(blue  - analog + 64, 511u);
-	regs[0] = be(AR0521_REG_GREEN1_GAIN);
-	regs[1] = be(green << 7 | analog);
-	regs[2] = be(blue  << 7 | analog);
-	regs[3] = be(red   << 7 | analog);
-	regs[4] = be(green << 7 | analog);
-
-	return ar0521_write_regs(sensor, regs, ARRAY_SIZE(regs));
-}
-
-static u32 calc_pll(struct ar0521_dev *sensor, int num, u32 freq, u16 *pre_ptr,
-		    u16 *mult_ptr)
-{
-	u16 pre = 1, mult = 1, new_pre;
-	u32 pll = AR0521_PLL_MAX + 1;
-
-	for (new_pre = 1; new_pre < 64; new_pre++) {
-		u32 new_pll;
-		u32 new_mult = div64_round_up((u64)freq * new_pre,
-					      sensor->extclk_freq);
-
-		if (new_mult < 32)
-			continue; /* Minimum value */
-		if (new_mult > 254)
-			break; /* Maximum, larger pre won't work either */
-		if (sensor->extclk_freq * (u64)new_mult < AR0521_PLL_MIN *
-		    new_pre)
-			continue;
-		if (sensor->extclk_freq * (u64)new_mult > AR0521_PLL_MAX *
-		    new_pre)
-			break; /* Larger pre won't work either */
-		new_pll = div64_round_up(sensor->extclk_freq * (u64)new_mult,
-					 new_pre);
-		if (new_pll < pll) {
-			pll = new_pll;
-			pre = new_pre;
-			mult = new_mult;
-		}
-	}
-
-	pll = div64_round(sensor->extclk_freq * (u64)mult, pre);
-	*pre_ptr = pre;
-	*mult_ptr = mult;
-	return pll;
-}
-
-#define DIV 4
-static void ar0521_calc_mode(struct ar0521_dev *sensor)
-{
-	unsigned int speed_mod = 4 / sensor->lane_count; /* 1 with 4 DDR lanes */
-	u16 total_width = max(sensor->fmt.width + AR0521_WIDTH_BLANKING_MIN,
-			      AR0521_TOTAL_WIDTH_MIN);
-	u16 total_height = sensor->fmt.height + AR0521_HEIGHT_BLANKING_MIN;
-
-	/* Calculate approximate pixel clock first */
-	u64 pix_clk = AR0521_PIXEL_CLOCK_RATE;
-
-	/* PLL1 drives pixel clock - dual rate */
-	pix_clk = calc_pll(sensor, 1, pix_clk * (DIV / 2), &sensor->pll_pre,
-			   &sensor->pll_mult);
-	pix_clk = div64_round(pix_clk, (DIV / 2));
-	calc_pll(sensor, 2, pix_clk * (DIV / 2) * speed_mod, &sensor->pll_pre2,
-		 &sensor->pll_mult2);
-
-	sensor->total_width = total_width;
-	sensor->total_height = total_height;
-}
-
-static int ar0521_write_mode(struct ar0521_dev *sensor)
-{
-	__be16 pll_regs[] = {
-		be(AR0521_REG_VT_PIX_CLK_DIV),
-		/* 0x300 */ be(4), /* vt_pix_clk_div = number of bits / 2 */
-		/* 0x302 */ be(1), /* vt_sys_clk_div */
-		/* 0x304 */ be((sensor->pll_pre2 << 8) | sensor->pll_pre),
-		/* 0x306 */ be((sensor->pll_mult2 << 8) | sensor->pll_mult),
-		/* 0x308 */ be(8), /* op_pix_clk_div = 2 * vt_pix_clk_div */
-		/* 0x30A */ be(1)  /* op_sys_clk_div */
+	struct i2c_client *client = sensor->client;
+	__be16 addr = be(reg);
+	__be16 data = 0;
+	struct i2c_msg msgs[2] = {
+		{
+			.addr = client->addr,
+			.flags = client->flags,
+			.len = sizeof(addr),
+			.buf = (u8 *)&addr,
+		},
+		{
+			.addr = client->addr,
+			.flags = client->flags | I2C_M_RD,
+			.len = sizeof(data),
+			.buf = (u8 *)&data,
+		},
 	};
 	int ret;
 
-	/* Stop streaming for just a moment */
-	ret = ar0521_write_reg(sensor, AR0521_REG_RESET,
-			       AR0521_REG_RESET_DEFAULTS);
+	ret = i2c_transfer(client->adapter, msgs, 2);
+	if (ret != 2) {
+		if (ret >= 0)
+			ret = -EIO;
+		dev_err(sensor->dev, "I2C read 0x%04x failed: %d\n", reg, ret);
+		return ret;
+	}
+
+	*val = be16_to_cpu(data);
+	return 0;
+}
+
+static int ar0521_update_bits(struct ar0521 *sensor, u16 reg, u16 mask, u16 val)
+{
+	u16 cur;
+	int ret;
+
+	ret = ar0521_read_reg(sensor, reg, &cur);
 	if (ret)
 		return ret;
 
+	cur = (cur & ~mask) | (val & mask);
+	return ar0521_write_reg(sensor, reg, cur);
+}
+
+static int ar0521_group_hold(struct ar0521 *sensor, bool hold)
+{
+	/* SMIA grouped_parameter_hold alias; avoids whole-word 0x301A writes. */
+	return ar0521_write_reg(sensor, AR0521_REG_GROUPED_PARAMETER_HOLD,
+				hold ? 1 : 0);
+}
+
+static u32 ar0521_mbus_code(const struct ar0521 *sensor)
+{
+	unsigned int i = 0;
+
+	if (sensor->vflip && sensor->hflip)
+		i = (sensor->vflip->val ? 2 : 0) | (sensor->hflip->val ? 1 : 0);
+
+	return ar0521_mbus_codes[i];
+}
+
+static u32 ar0521_total_width_locked(const struct ar0521 *sensor)
+{
+	u32 width = sensor->format.width;
+	u32 hblank = sensor->hblank ? sensor->hblank->val :
+				      AR0521_WIDTH_BLANKING_MIN;
+
+	return max(width + hblank, AR0521_TOTAL_WIDTH_MIN);
+}
+
+static u32 ar0521_total_height_locked(const struct ar0521 *sensor)
+{
+	u32 height = sensor->format.height;
+	u32 vblank = sensor->vblank ? sensor->vblank->val :
+				      AR0521_HEIGHT_BLANKING_MIN;
+
+	return min_t(u32, height + vblank, AR0521_TOTAL_HEIGHT_MAX);
+}
+
+static u64 ar0521_line_period_ns(const struct ar0521 *sensor)
+{
+	u32 total_width = ar0521_total_width_locked(sensor);
+
+	/*
+	 * 0x0342 is programmed with total_width (3164 at full FOV). That
+	 * value is "twice the pixel-clocks-per-line" in the RR, so line
+	 * time is total_width / (2 * vt) = total_width / PIXEL_RATE.
+	 */
+	return DIV_ROUND_CLOSEST_ULL((u64)total_width * 1000000000ULL,
+				     AR0521_PIXEL_RATE);
+}
+
+static u32 ar0521_lines_to_exposure_us(const struct ar0521 *sensor, u32 lines)
+{
+	u64 exposure_ns = (u64)lines * ar0521_line_period_ns(sensor);
+
+	return max_t(u32, 1, DIV_ROUND_CLOSEST_ULL(exposure_ns, 1000));
+}
+
+static u32 ar0521_exposure_us_to_lines_locked(struct ar0521 *sensor,
+					      u32 exposure_us, u32 frame_lines)
+{
+	u64 request_ns = (u64)exposure_us * 1000ULL;
+	u64 line_ns = ar0521_line_period_ns(sensor);
+	u32 lines;
+	u32 max_lines;
+
+	max_lines = frame_lines > AR0521_CIT_MARGIN ?
+		    frame_lines - AR0521_CIT_MARGIN : 1;
+	lines = max_t(u32, 1, DIV_ROUND_CLOSEST_ULL(request_ns, line_ns));
+	return clamp_t(u32, lines, 1, max_lines);
+}
+
+static void ar0521_update_free_run_exposure_range_locked(struct ar0521 *sensor,
+							 u32 vblank)
+{
+	u32 frame_lines = sensor->format.height + vblank;
+	u32 max_lines = frame_lines > AR0521_CIT_MARGIN ?
+			frame_lines - AR0521_CIT_MARGIN : 1;
+	u32 min_us;
+	u32 max_us;
+	u32 def_us;
+
+	if (!sensor->exposure)
+		return;
+
+	min_us = ar0521_lines_to_exposure_us(sensor, 1);
+	max_us = ar0521_lines_to_exposure_us(sensor, max_lines);
+	def_us = clamp_val(ar0521_lines_to_exposure_us(sensor, 360),
+			   min_us, max_us);
+	__v4l2_ctrl_modify_range(sensor->exposure, min_us, max_us, 1, def_us);
+}
+
+static void ar0521_setup_hblank(struct ar0521 *sensor, unsigned int width)
+{
+	unsigned int min_total = max(width + AR0521_WIDTH_BLANKING_MIN,
+				     AR0521_TOTAL_WIDTH_MIN);
+	unsigned int hblank = min_total - width;
+
+	if (!sensor->hblank) {
+		sensor->hblank = v4l2_ctrl_new_std(&sensor->ctrls, NULL,
+						   V4L2_CID_HBLANK, hblank,
+						   hblank, 1, hblank);
+		if (sensor->hblank)
+			sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	} else {
+		__v4l2_ctrl_modify_range(sensor->hblank, hblank, hblank, 1,
+					 hblank);
+	}
+}
+
+static void ar0521_update_ctrl_visibility_locked(struct ar0521 *sensor,
+						 enum ar0521_op_mode mode)
+{
+	/* Exposure/VBLANK apply in both FREE_RUN and TRIGGER. */
+	if (sensor->exposure)
+		v4l2_ctrl_activate(sensor->exposure, true);
+	if (sensor->vblank)
+		v4l2_ctrl_activate(sensor->vblank, true);
+}
+
+static struct v4l2_rect *
+ar0521_get_pad_crop(struct ar0521 *sensor, struct v4l2_subdev_state *state,
+		    unsigned int pad, enum v4l2_subdev_format_whence which)
+{
+	switch (which) {
+	case V4L2_SUBDEV_FORMAT_TRY:
+		return v4l2_subdev_get_try_crop(&sensor->sd, state, pad);
+	case V4L2_SUBDEV_FORMAT_ACTIVE:
+		return &sensor->crop;
+	}
+
+	return NULL;
+}
+
+static struct v4l2_mbus_framefmt *
+ar0521_get_pad_format(struct ar0521 *sensor, struct v4l2_subdev_state *state,
+		      unsigned int pad, enum v4l2_subdev_format_whence which)
+{
+	switch (which) {
+	case V4L2_SUBDEV_FORMAT_TRY:
+		return v4l2_subdev_get_try_format(&sensor->sd, state, pad);
+	case V4L2_SUBDEV_FORMAT_ACTIVE:
+		return &sensor->format;
+	}
+
+	return NULL;
+}
+
+static void ar0521_get_module_inf(struct ar0521 *sensor, struct rkmodule_inf *inf)
+{
+	memset(inf, 0, sizeof(*inf));
+	strscpy(inf->base.sensor, AR0521_NAME, sizeof(inf->base.sensor));
+	strscpy(inf->base.module, sensor->module_name, sizeof(inf->base.module));
+	strscpy(inf->base.lens, sensor->len_name, sizeof(inf->base.lens));
+}
+
+static int ar0521_set_geometry(struct ar0521 *sensor)
+{
+	u16 x = sensor->crop.left;
+	u16 y = sensor->crop.top;
+	u16 width = sensor->format.width;
+	u16 height = sensor->format.height;
+	u16 total_width = ar0521_total_width_locked(sensor);
+	u16 total_height = height + (sensor->vblank ? sensor->vblank->val :
+						      AR0521_HEIGHT_BLANKING_MIN);
+	__be16 regs[] = {
+		be(AR0521_REG_FRAME_LENGTH_LINES),
+		be(total_height),
+		be(total_width),
+		be(x),
+		be(y),
+		be(x + width - 1),
+		be(y + height - 1),
+		be(width),
+		be(height)
+	};
+
+	return ar0521_write_regs(sensor, regs, ARRAY_SIZE(regs));
+}
+
+static int ar0521_write_pll(struct ar0521 *sensor)
+{
+	/* Table 5 RAW10 Full: 0x0304=0x0303, 0x0306=0x7359 (odd M as-is). */
+	__be16 pll_regs[] = {
+		be(AR0521_REG_VT_PIX_CLK_DIV),
+		be(AR0521_VT_PIX_CLK_DIV),
+		be(AR0521_VT_SYS_CLK_DIV),
+		be((AR0521_PLL_PRE << 8) | AR0521_PLL_PRE),
+		be((AR0521_PLL2_MULT_REG << 8) | AR0521_PLL1_MULT_REG),
+		be(AR0521_OP_PIX_CLK_DIV),
+		be(AR0521_OP_SYS_CLK_DIV)
+	};
+
+	return ar0521_write_regs(sensor, pll_regs, ARRAY_SIZE(pll_regs));
+}
+
+static u16 ar0521_q8_to_global_gain(u32 gain_q8)
+{
+	u32 coarse;
+	u32 remainder_q8;
+	u32 fine;
+
+	gain_q8 = clamp_t(u32, gain_q8, AR0521_ANA_GAIN_MIN, AR0521_ANA_GAIN_MAX);
+
+	/*
+	 * Analog coarse is a power-of-two stage (1/2/4/8/16). Fine is a
+	 * 4-bit linear fraction of that stage. Digital stays at 1x (0x40).
+	 * Integer stages match AND9573 Table 2 with digital = 1x:
+	 * 1x=0x2000, 2x=0x2010, 4x=0x2020, 8x=0x2030, 16x=0x2040.
+	 */
+	if (gain_q8 >= 4096)
+		coarse = 4;
+	else if (gain_q8 >= 2048)
+		coarse = 3;
+	else if (gain_q8 >= 1024)
+		coarse = 2;
+	else if (gain_q8 >= 512)
+		coarse = 1;
+	else
+		coarse = 0;
+
+	remainder_q8 = gain_q8 - (256U << coarse);
+	fine = DIV_ROUND_CLOSEST(remainder_q8 << 4, 256U << coarse);
+	if (fine > AR0521_GLOBAL_GAIN_FINE_MASK) {
+		if (coarse < AR0521_GLOBAL_GAIN_COARSE_MASK) {
+			coarse++;
+			fine = 0;
+		} else {
+			fine = AR0521_GLOBAL_GAIN_FINE_MASK;
+		}
+	}
+
+	return (AR0521_GLOBAL_GAIN_DG_1X << AR0521_GLOBAL_GAIN_DG_SHIFT) |
+	       ((coarse & AR0521_GLOBAL_GAIN_COARSE_MASK) <<
+		AR0521_GLOBAL_GAIN_COARSE_SHIFT) |
+	       (fine & AR0521_GLOBAL_GAIN_FINE_MASK);
+}
+
+static int ar0521_apply_analog_gain_locked(struct ar0521 *sensor, u32 value)
+{
+	return ar0521_write_reg(sensor, AR0521_REG_GLOBAL_GAIN,
+				ar0521_q8_to_global_gain(value));
+}
+
+static int ar0521_apply_flip_locked(struct ar0521 *sensor)
+{
+	u16 val = 0;
+
+	if (sensor->vflip && sensor->vflip->val)
+		val |= AR0521_REG_READ_MODE_VERT_FLIP;
+	if (sensor->hflip && sensor->hflip->val)
+		val |= AR0521_REG_READ_MODE_HORIZ_MIRROR;
+
+	return ar0521_update_bits(sensor, AR0521_REG_READ_MODE,
+				  AR0521_REG_READ_MODE_VERT_FLIP |
+				  AR0521_REG_READ_MODE_HORIZ_MIRROR, val);
+}
+
+static int ar0521_apply_test_pattern_locked(struct ar0521 *sensor, u32 value)
+{
+	return ar0521_write_reg(sensor, AR0521_REG_TEST_PATTERN_MODE, value);
+}
+
+static int ar0521_apply_vblank_locked(struct ar0521 *sensor, u32 vblank)
+{
+	u16 total_height = sensor->format.height + vblank;
+
+	return ar0521_write_reg(sensor, AR0521_REG_FRAME_LENGTH_LINES,
+				total_height);
+}
+
+static int ar0521_apply_exposure_locked(struct ar0521 *sensor, u32 exposure_us)
+{
+	u32 frame_lines = sensor->format.height +
+			  (sensor->vblank ? sensor->vblank->val :
+					    AR0521_HEIGHT_BLANKING_MIN);
+	u32 lines = ar0521_exposure_us_to_lines_locked(sensor, exposure_us,
+						       frame_lines);
+	u32 min_fll = lines + AR0521_CIT_MARGIN;
+	int ret;
+
+	if (frame_lines < min_fll) {
+		frame_lines = min_fll;
+		ret = ar0521_write_reg(sensor, AR0521_REG_FRAME_LENGTH_LINES,
+				       frame_lines);
+		if (ret)
+			return ret;
+	}
+
+	return ar0521_write_reg(sensor, AR0521_REG_COARSE_INTEGRATION_TIME,
+				lines);
+}
+
+static int ar0521_stream_bit(struct ar0521 *sensor, bool on)
+{
+	return ar0521_update_bits(sensor, AR0521_REG_RESET,
+				  AR0521_REG_RESET_STREAM,
+				  on ? AR0521_REG_RESET_STREAM : 0);
+}
+
+static int ar0521_restore_slave_backup_locked(struct ar0521 *sensor)
+{
+	int ret;
+
+	if (!sensor->slave_backup_valid)
+		return 0;
+
+	ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_GPO_1,
+			       sensor->saved_gpio_gpo_1);
+	if (ret)
+		return ret;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_CTRL2,
+			       sensor->saved_gpio_ctrl2);
+	if (ret)
+		return ret;
+	ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME,
+			       sensor->saved_vd_trig);
+	if (ret)
+		return ret;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
+			       sensor->saved_global_seq);
+	if (ret)
+		return ret;
+
+	return ar0521_update_bits(sensor, AR0521_REG_RESET,
+				  AR0521_REG_RESET_GPI,
+				  sensor->saved_reset & AR0521_REG_RESET_GPI);
+}
+
+static int ar0521_enter_slave_locked(struct ar0521 *sensor)
+{
+	int ret;
+
+	ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_GPO_1,
+			      &sensor->saved_gpio_gpo_1);
+	if (ret)
+		return ret;
+	ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_CTRL2,
+			      &sensor->saved_gpio_ctrl2);
+	if (ret)
+		return ret;
+	ret = ar0521_read_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME,
+			      &sensor->saved_vd_trig);
+	if (ret)
+		return ret;
+	ret = ar0521_read_reg(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
+			      &sensor->saved_global_seq);
+	if (ret)
+		return ret;
+	ret = ar0521_read_reg(sensor, AR0521_REG_RESET, &sensor->saved_reset);
+	if (ret)
+		return ret;
+	sensor->slave_backup_valid = true;
+
+	/* AND9573 slave trigger: stop stream, then GPI/VD/GRR, then stream. */
+	ret = ar0521_stream_bit(sensor, false);
+	if (ret)
+		goto rollback;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_GPO_1,
+			       AR0521_SLAVE_GPIO_GPO_1);
+	if (ret)
+		goto rollback;
+	ret = ar0521_update_bits(sensor, AR0521_REG_RESET,
+				 AR0521_REG_RESET_GPI, AR0521_REG_RESET_GPI);
+	if (ret)
+		goto rollback;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_CTRL2,
+			       AR0521_SLAVE_GPIO_CTRL2);
+	if (ret)
+		goto rollback;
+	ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME,
+			       AR0521_SLAVE_VD_TRIG);
+	if (ret)
+		goto rollback;
+	ret = ar0521_update_bits(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
+				 AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR,
+				 AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR);
+	if (ret)
+		goto rollback;
+
+	ret = ar0521_stream_bit(sensor, true);
+	if (ret)
+		goto rollback;
+	return 0;
+
+rollback:
+	ar0521_restore_slave_backup_locked(sensor);
+	sensor->slave_backup_valid = false;
+	return ret;
+}
+
+static int ar0521_exit_slave_locked(struct ar0521 *sensor)
+{
+	int ret;
+
+	if (!sensor->slave_backup_valid)
+		return 0;
+
+	ret = ar0521_stream_bit(sensor, false);
+	if (ret)
+		return ret;
+
+	ret = ar0521_restore_slave_backup_locked(sensor);
+	if (ret)
+		return ret;
+
+	sensor->slave_backup_valid = false;
+	return 0;
+}
+
+static int ar0521_apply_mode_regs_locked(struct ar0521 *sensor,
+					 enum ar0521_op_mode mode)
+{
+	if (mode == AR0521_TRIGGER_ONE_SHOT)
+		return ar0521_enter_slave_locked(sensor);
+
+	return ar0521_exit_slave_locked(sensor);
+}
+
+static int ar0521_restore_ctrls_for_mode_locked(struct ar0521 *sensor,
+						enum ar0521_op_mode mode)
+{
+	int ret;
+
+	ret = ar0521_group_hold(sensor, true);
+	if (ret)
+		return ret;
+
+	ret = ar0521_apply_analog_gain_locked(sensor, sensor->anal_gain->val);
+	if (ret)
+		goto out;
+	ret = ar0521_apply_flip_locked(sensor);
+	if (ret)
+		goto out;
+	ret = ar0521_apply_test_pattern_locked(sensor,
+					       sensor->test_pattern->val);
+	if (ret)
+		goto out;
 	ret = ar0521_set_geometry(sensor);
 	if (ret)
-		return ret;
+		goto out;
+	ar0521_update_free_run_exposure_range_locked(sensor,
+						     sensor->vblank->val);
+	ret = ar0521_apply_vblank_locked(sensor, sensor->vblank->val);
+	if (ret)
+		goto out;
+	ret = ar0521_apply_exposure_locked(sensor, sensor->exposure->val);
 
-	ret = ar0521_write_regs(sensor, pll_regs, ARRAY_SIZE(pll_regs));
+out:
+	{
+		int hold_ret = ar0521_group_hold(sensor, false);
+
+		if (!ret)
+			ret = hold_ret;
+	}
+	return ret;
+}
+
+static int ar0521_exit_lp11_locked(struct ar0521 *sensor)
+{
+	int ret;
+
+	/*
+	 * power_on programs HISPI_TEST_MODE LP11 for PHY bring-up
+	 * (4-lane readback 0x03C4). Clear the test-mode word before
+	 * FS/FE so lanes leave LP11 test. RR: 0x3066 is lane/test.
+	 */
+	ret = ar0521_write_reg(sensor, AR0521_REG_HISPI_TEST_MODE, 0x0000);
 	if (ret)
 		return ret;
 
-	ret = ar0521_write_reg(sensor, AR0521_REG_COARSE_INTEGRATION_TIME,
-			       sensor->ctrls.exposure->val);
+	/*
+	 * RK DTS has no clock-noncontinuous; CSI expects a continuous
+	 * clock. Keep other 0x31BC timing bits; set cont_tx_clk only
+	 * (0x068C -> 0x868C).
+	 */
+	ret = ar0521_update_bits(sensor, AR0521_REG_HISPI_TIMING,
+				 AR0521_REG_HISPI_TIMING_CONT_TX_CLK,
+				 AR0521_REG_HISPI_TIMING_CONT_TX_CLK);
 	if (ret)
 		return ret;
 
+	return ar0521_write_reg(sensor, AR0521_REG_HISPI_CONTROL_STATUS, 0);
+}
+
+static int ar0521_stream_on_bits(struct ar0521 *sensor)
+{
+	int ret;
+
+	ret = ar0521_exit_lp11_locked(sensor);
+	if (ret)
+		return ret;
+
+	/*
+	 * Mainline AR0521 writes RESET_DEFAULTS|STREAM as a whole word
+	 * rather than OR-ing STREAM onto whatever RESET currently holds.
+	 * Leaving leftover RESET bits (INIT/RESTART/GROUP_HOLD) can keep
+	 * MIPI in LP-11 / no FS-FE.
+	 */
 	ret = ar0521_write_reg(sensor, AR0521_REG_RESET,
 			       AR0521_REG_RESET_DEFAULTS |
 			       AR0521_REG_RESET_STREAM);
 	if (ret)
 		return ret;
 
-	ret = ar0521_write_reg(sensor, AR0521_REG_TEST_PATTERN_MODE,
-			       sensor->ctrls.test_pattern->val);
-	return ret;
+	__v4l2_ctrl_grab(sensor->vflip, 1);
+	__v4l2_ctrl_grab(sensor->hflip, 1);
+	return 0;
 }
 
-static int ar0521_set_stream(struct ar0521_dev *sensor, bool on)
+static int ar0521_stream_off_bits(struct ar0521 *sensor)
 {
 	int ret;
 
-	if (on) {
-		ret = pm_runtime_resume_and_get(&sensor->i2c_client->dev);
-		if (ret < 0)
-			return ret;
-
-		ar0521_calc_mode(sensor);
-		ret = ar0521_write_mode(sensor);
-		if (ret)
-			goto err;
-
-		ret = ar0521_set_gains(sensor);
-		if (ret)
-			goto err;
-
-		/* Exit LP-11 mode on clock and data lanes */
-		ret = ar0521_write_reg(sensor, AR0521_REG_HISPI_CONTROL_STATUS,
-				       0);
-		if (ret)
-			goto err;
-
-		/* Start streaming */
-		ret = ar0521_write_reg(sensor, AR0521_REG_RESET,
-				       AR0521_REG_RESET_DEFAULTS |
-				       AR0521_REG_RESET_STREAM);
-		if (ret)
-			goto err;
-
-		return 0;
-
-err:
-		pm_runtime_put(&sensor->i2c_client->dev);
+	ret = ar0521_stream_bit(sensor, false);
+	if (ret)
 		return ret;
 
-	} else {
-		/*
-		 * Reset gain, the sensor may produce all white pixels without
-		 * this
-		 */
-		ret = ar0521_write_reg(sensor, AR0521_REG_GLOBAL_GAIN, 0x2000);
-		if (ret)
-			return ret;
-
-		/* Stop streaming */
-		ret = ar0521_write_reg(sensor, AR0521_REG_RESET,
-				       AR0521_REG_RESET_DEFAULTS);
-		if (ret)
-			return ret;
-
-		pm_runtime_put(&sensor->i2c_client->dev);
-		return 0;
-	}
-}
-
-static void ar0521_adj_fmt(struct v4l2_mbus_framefmt *fmt)
-{
-	fmt->width = clamp(ALIGN(fmt->width, 4), AR0521_WIDTH_MIN,
-			   AR0521_WIDTH_MAX);
-	fmt->height = clamp(ALIGN(fmt->height, 4), AR0521_HEIGHT_MIN,
-			    AR0521_HEIGHT_MAX);
-	fmt->code = MEDIA_BUS_FMT_SGRBG8_1X8;
-	fmt->field = V4L2_FIELD_NONE;
-	fmt->colorspace = V4L2_COLORSPACE_SRGB;
-	fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	fmt->xfer_func = V4L2_XFER_FUNC_DEFAULT;
-}
-
-static int ar0521_get_fmt(struct v4l2_subdev *sd,
-			  struct v4l2_subdev_state *sd_state,
-			  struct v4l2_subdev_format *format)
-{
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
-	struct v4l2_mbus_framefmt *fmt;
-
-	mutex_lock(&sensor->lock);
-
-	if (format->which == V4L2_SUBDEV_FORMAT_TRY)
-		fmt = v4l2_subdev_get_try_format(&sensor->sd, sd_state, 0
-						 /* pad */);
-	else
-		fmt = &sensor->fmt;
-
-	format->format = *fmt;
-
-	mutex_unlock(&sensor->lock);
+	__v4l2_ctrl_grab(sensor->vflip, 0);
+	__v4l2_ctrl_grab(sensor->hflip, 0);
 	return 0;
 }
 
-static int ar0521_set_fmt(struct v4l2_subdev *sd,
-			  struct v4l2_subdev_state *sd_state,
-			  struct v4l2_subdev_format *format)
+static int ar0521_quick_stream(struct ar0521 *sensor, bool on)
 {
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
-
-	ar0521_adj_fmt(&format->format);
-
-	mutex_lock(&sensor->lock);
-
-	if (format->which == V4L2_SUBDEV_FORMAT_TRY) {
-		struct v4l2_mbus_framefmt *fmt;
-
-		fmt = v4l2_subdev_get_try_format(sd, sd_state, 0 /* pad */);
-		*fmt = format->format;
-	} else {
-		sensor->fmt = format->format;
-		ar0521_calc_mode(sensor);
-	}
-
-	mutex_unlock(&sensor->lock);
-	return 0;
-}
-
-static int ar0521_s_ctrl(struct v4l2_ctrl *ctrl)
-{
-	struct v4l2_subdev *sd = ctrl_to_sd(ctrl);
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
 	int ret;
 
-	/* v4l2_ctrl_lock() locks our own mutex */
+	if (!sensor->streaming || !pm_runtime_active(sensor->dev))
+		return -EINVAL;
 
-	switch (ctrl->id) {
-	case V4L2_CID_HBLANK:
-	case V4L2_CID_VBLANK:
-		sensor->total_width = sensor->fmt.width +
-			sensor->ctrls.hblank->val;
-		sensor->total_height = sensor->fmt.width +
-			sensor->ctrls.vblank->val;
-		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
-
-	/* access the sensor only if it's powered up */
-	if (!pm_runtime_get_if_in_use(&sensor->i2c_client->dev))
+	if (on) {
+		ret = ar0521_exit_lp11_locked(sensor);
+		if (ret)
+			return ret;
+		if (sensor->active_mode == AR0521_TRIGGER_ONE_SHOT) {
+			ret = ar0521_update_bits(sensor, AR0521_REG_RESET,
+						 AR0521_REG_RESET_GPI,
+						 AR0521_REG_RESET_GPI);
+			if (ret)
+				return ret;
+		}
+		ret = ar0521_stream_bit(sensor, true);
+		if (ret)
+			return ret;
+		if (sensor->active_mode == AR0521_FREE_RUN &&
+		    sensor->light_source_enabled)
+			ar0521_light_source_set_locked(sensor, true);
 		return 0;
-
-	switch (ctrl->id) {
-	case V4L2_CID_HBLANK:
-	case V4L2_CID_VBLANK:
-		ret = ar0521_set_geometry(sensor);
-		break;
-	case V4L2_CID_GAIN:
-	case V4L2_CID_RED_BALANCE:
-	case V4L2_CID_BLUE_BALANCE:
-		ret = ar0521_set_gains(sensor);
-		break;
-	case V4L2_CID_EXPOSURE:
-		ret = ar0521_write_reg(sensor,
-				       AR0521_REG_COARSE_INTEGRATION_TIME,
-				       ctrl->val);
-		break;
-	case V4L2_CID_TEST_PATTERN:
-		ret = ar0521_write_reg(sensor, AR0521_REG_TEST_PATTERN_MODE,
-				       ctrl->val);
-		break;
 	}
 
-	pm_runtime_put(&sensor->i2c_client->dev);
+	ar0521_light_source_set_locked(sensor, false);
+	return ar0521_stream_bit(sensor, false);
+}
+
+static int ar0521_trigger_once_locked(struct ar0521 *sensor)
+{
+	struct pwm_state state;
+	u64 duty_ns;
+	u32 pulse_us;
+	u32 advance_us;
+	u32 off_delay_us;
+	int ret;
+
+	if (!sensor->trigger_pwm)
+		return -ENODEV;
+
+	pulse_us = clamp_t(u32, sensor->trigger_pulse_us,
+			   AR0521_TRIGGER_PULSE_US_MIN,
+			   AR0521_TRIGGER_PULSE_US_MAX);
+	duty_ns = (u64)pulse_us * 1000ULL;
+	advance_us = sensor->light_source_enabled ?
+		     sensor->light_source_advance_us : 0;
+	off_delay_us = sensor->light_source_enabled ?
+		       sensor->light_source_off_delay_us : 0;
+
+	if (sensor->light_source_enabled && sensor->light_source_gpio) {
+		ar0521_light_source_set_locked(sensor, true);
+		ar0521_sleep_us(advance_us);
+	}
+
+	pwm_get_state(sensor->trigger_pwm, &state);
+	state.period = ar0521_trigger_period_ns(duty_ns,
+						ar0521_pwm_period_ns(sensor->trigger_pwm));
+	state.duty_cycle = duty_ns;
+	state.polarity = PWM_POLARITY_NORMAL;
+	state.enabled = true;
+
+	ret = pwm_apply_state(sensor->trigger_pwm, &state);
+	if (ret)
+		goto out_light;
+
+	ar0521_sleep_us(pulse_us);
+
+	state.duty_cycle = 0;
+	state.enabled = false;
+	ret = pwm_apply_state(sensor->trigger_pwm, &state);
+	if (ret)
+		goto out_light;
+
+	dev_info(sensor->dev,
+		 "trigger pulse emitted: width=%u us idle=low active=high mode=%s streaming=%u\n",
+		 pulse_us,
+		 ar0521_op_mode_name(sensor->streaming ?
+				     sensor->active_mode :
+				     sensor->pending_mode),
+		 sensor->streaming);
+
+	if (sensor->streaming && sensor->active_mode != AR0521_TRIGGER_ONE_SHOT)
+		dev_warn(sensor->dev,
+			 "trigger pulse was emitted while active mode is %s; switch run_mode to master_fast_trigger for one-shot capture\n",
+			 ar0521_op_mode_name(sensor->active_mode));
+
+out_light:
+	if (sensor->light_source_enabled && sensor->light_source_gpio) {
+		ar0521_sleep_us(off_delay_us);
+		ar0521_light_source_set_locked(sensor, false);
+	}
+
 	return ret;
 }
+
+static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl);
+static int ar0521_mode_switch(struct ar0521 *sensor, enum ar0521_op_mode new_mode);
 
 static const struct v4l2_ctrl_ops ar0521_ctrl_ops = {
-	.s_ctrl = ar0521_s_ctrl,
+	.s_ctrl = ar0521_set_ctrl,
 };
 
-static const char * const test_pattern_menu[] = {
-	"Disabled",
-	"Solid color",
-	"Color bars",
-	"Faded color bars"
+static const struct v4l2_ctrl_config ar0521_op_mode_ctrl_cfg = {
+	.ops = &ar0521_ctrl_ops,
+	.id = V4L2_CID_AR0521_OP_MODE,
+	.type = V4L2_CTRL_TYPE_MENU,
+	.name = "ar0521_mode",
+	.min = AR0521_FREE_RUN,
+	.max = AR0521_TRIGGER_ONE_SHOT,
+	.def = AR0521_FREE_RUN,
+	.qmenu = ar0521_op_mode_menu,
 };
 
-static int ar0521_init_controls(struct ar0521_dev *sensor)
+static const struct v4l2_ctrl_config ar0521_light_source_enable_cfg = {
+	.ops = &ar0521_ctrl_ops,
+	.id = V4L2_CID_AR0521_LIGHT_SOURCE_ENABLE,
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.name = "light_source_enable",
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config ar0521_light_source_active_level_cfg = {
+	.ops = &ar0521_ctrl_ops,
+	.id = V4L2_CID_AR0521_LIGHT_SOURCE_ACTIVE_LEVEL,
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.name = "light_source_active_level",
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config ar0521_light_source_advance_us_cfg = {
+	.ops = &ar0521_ctrl_ops,
+	.id = V4L2_CID_AR0521_LIGHT_SOURCE_ADVANCE_US,
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.name = "light_source_advance_us",
+	.min = 0,
+	.max = 100000,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config ar0521_light_source_off_delay_us_cfg = {
+	.ops = &ar0521_ctrl_ops,
+	.id = V4L2_CID_AR0521_LIGHT_SOURCE_OFF_DELAY_US,
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.name = "light_source_off_delay_us",
+	.min = 0,
+	.max = 1000000,
+	.step = 1,
+	.def = 0,
+};
+
+static ssize_t run_mode_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
 {
-	const struct v4l2_ctrl_ops *ops = &ar0521_ctrl_ops;
-	struct ar0521_ctrls *ctrls = &sensor->ctrls;
-	struct v4l2_ctrl_handler *hdl = &ctrls->handler;
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf,
+			 "pending=%s\nactive=%s\nstreaming=%u\navailable=free_run master_fast_trigger\n",
+			 ar0521_op_mode_name(sensor->pending_mode),
+			 ar0521_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+
+static ssize_t run_mode_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	enum ar0521_op_mode mode;
 	int ret;
 
-	v4l2_ctrl_handler_init(hdl, 32);
+	if (!sensor || !sensor->op_mode_ctrl)
+		return -ENODEV;
 
-	/* We can use our own mutex for the ctrl lock */
-	hdl->lock = &sensor->lock;
+	ret = ar0521_parse_run_mode(buf, &mode);
+	if (ret)
+		return ret;
 
-	/* Manual gain */
-	ctrls->gain = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_GAIN, 0, 511, 1, 0);
-	ctrls->red_balance = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_RED_BALANCE,
-					       -512, 511, 1, 0);
-	ctrls->blue_balance = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_BLUE_BALANCE,
-						-512, 511, 1, 0);
-	v4l2_ctrl_cluster(3, &ctrls->gain);
+	ret = v4l2_ctrl_s_ctrl(sensor->op_mode_ctrl, mode);
+	if (ret)
+		return ret;
 
-	ctrls->hblank = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_HBLANK,
-					  AR0521_WIDTH_BLANKING_MIN, 4094, 1,
-					  AR0521_WIDTH_BLANKING_MIN);
-	ctrls->vblank = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_VBLANK,
-					  AR0521_HEIGHT_BLANKING_MIN, 4094, 2,
-					  AR0521_HEIGHT_BLANKING_MIN);
-	v4l2_ctrl_cluster(2, &ctrls->hblank);
+	mutex_lock(&sensor->mutex);
+	if (sensor->pending_mode != mode)
+		dev_warn(dev,
+			 "run mode request=%s but state is pending=%s active=%s streaming=%u\n",
+			 ar0521_op_mode_name(mode),
+			 ar0521_op_mode_name(sensor->pending_mode),
+			 ar0521_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	else
+		dev_info(dev,
+			 "run mode request=%s pending=%s active=%s streaming=%u\n",
+			 ar0521_op_mode_name(mode),
+			 ar0521_op_mode_name(sensor->pending_mode),
+			 ar0521_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	mutex_unlock(&sensor->mutex);
 
-	/* Read-only */
-	ctrls->pixrate = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_PIXEL_RATE,
-					   AR0521_PIXEL_CLOCK_MIN,
-					   AR0521_PIXEL_CLOCK_MAX, 1,
-					   AR0521_PIXEL_CLOCK_RATE);
+	return count;
+}
 
-	/* Manual exposure time */
-	ctrls->exposure = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_EXPOSURE, 0,
-					    65535, 1, 360);
+static DEVICE_ATTR_RW(run_mode);
 
-	ctrls->test_pattern = v4l2_ctrl_new_std_menu_items(hdl, ops,
-					V4L2_CID_TEST_PATTERN,
-					ARRAY_SIZE(test_pattern_menu) - 1,
-					0, 0, test_pattern_menu);
+static ssize_t trigger_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	ssize_t len;
 
-	if (hdl->error) {
-		ret = hdl->error;
-		goto free_ctrls;
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf,
+			 "available=echo 1 > trigger\npulse_us=%u\nidle=low\nactive=high\npwm_present=%u\npending=%s\nactive_mode=%s\nstreaming=%u\n",
+			 sensor->trigger_pulse_us,
+			 !!sensor->trigger_pwm,
+			 ar0521_op_mode_name(sensor->pending_mode),
+			 ar0521_op_mode_name(sensor->active_mode),
+			 sensor->streaming);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+
+static ssize_t trigger_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	unsigned int val;
+	int ret;
+
+	if (!sensor)
+		return -ENODEV;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	if (!val)
+		return count;
+	if (val != 1)
+		return -EINVAL;
+
+	mutex_lock(&sensor->mutex);
+	ret = ar0521_trigger_once_locked(sensor);
+	mutex_unlock(&sensor->mutex);
+
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(trigger);
+
+static ssize_t trigger_pulse_us_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	ssize_t len;
+
+	if (!sensor)
+		return -ENODEV;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf, "%u\n", sensor->trigger_pulse_us);
+	mutex_unlock(&sensor->mutex);
+
+	return len;
+}
+
+static ssize_t trigger_pulse_us_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	unsigned int pulse_us;
+
+	if (!sensor)
+		return -ENODEV;
+
+	if (kstrtouint(buf, 0, &pulse_us))
+		return -EINVAL;
+	if (pulse_us < AR0521_TRIGGER_PULSE_US_MIN ||
+	    pulse_us > AR0521_TRIGGER_PULSE_US_MAX)
+		return -ERANGE;
+
+	mutex_lock(&sensor->mutex);
+	sensor->trigger_pulse_us = pulse_us;
+	mutex_unlock(&sensor->mutex);
+
+	dev_info(dev, "trigger pulse width set to %u us\n", pulse_us);
+	return count;
+}
+
+static DEVICE_ATTR_RW(trigger_pulse_us);
+
+static struct attribute *ar0521_attrs[] = {
+	&dev_attr_run_mode.attr,
+	&dev_attr_trigger.attr,
+	&dev_attr_trigger_pulse_us.attr,
+	NULL
+};
+
+static const struct attribute_group ar0521_attr_group = {
+	.attrs = ar0521_attrs,
+};
+
+static int ar0521_ctrls_init(struct ar0521 *sensor)
+{
+	struct v4l2_fwnode_device_properties props;
+	struct v4l2_ctrl_handler *handler = &sensor->ctrls;
+	u32 def_exposure_us;
+	int ret;
+
+	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
+	if (ret < 0)
+		return ret;
+
+	ret = v4l2_ctrl_handler_init(handler, 20);
+	if (ret)
+		return ret;
+
+	handler->lock = &sensor->mutex;
+
+	def_exposure_us = ar0521_lines_to_exposure_us(sensor, 360);
+	sensor->exposure = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
+					     V4L2_CID_EXPOSURE, 1, 2000000, 1,
+					     def_exposure_us);
+	sensor->anal_gain = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
+					      V4L2_CID_ANALOGUE_GAIN,
+					      AR0521_ANA_GAIN_MIN,
+					      AR0521_ANA_GAIN_MAX,
+					      AR0521_ANA_GAIN_STEP,
+					      AR0521_ANA_GAIN_DEFAULT);
+
+	sensor->hflip = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
+					  V4L2_CID_HFLIP, 0, 1, 1, 0);
+	if (sensor->hflip)
+		sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+
+	sensor->vflip = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
+					  V4L2_CID_VFLIP, 0, 1, 1, 0);
+	if (sensor->vflip)
+		sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+
+	ar0521_setup_hblank(sensor, AR0521_WIDTH_MAX);
+
+	sensor->vblank = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
+					   V4L2_CID_VBLANK,
+					   AR0521_HEIGHT_BLANKING_MIN,
+					   AR0521_TOTAL_HEIGHT_MAX -
+					   AR0521_HEIGHT_MAX, 2,
+					   AR0521_HEIGHT_BLANKING_DEFAULT);
+
+	sensor->link_freq = v4l2_ctrl_new_int_menu(handler, NULL,
+						   V4L2_CID_LINK_FREQ,
+						   ARRAY_SIZE(ar0521_link_freq_menu) - 1,
+						   0, ar0521_link_freq_menu);
+	if (sensor->link_freq)
+		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	sensor->pixel_rate = v4l2_ctrl_new_std(handler, NULL,
+					       V4L2_CID_PIXEL_RATE,
+					       AR0521_PIXEL_RATE_MIN,
+					       AR0521_PIXEL_RATE_MAX, 1,
+					       AR0521_PIXEL_RATE);
+	if (sensor->pixel_rate)
+		sensor->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	sensor->test_pattern =
+		v4l2_ctrl_new_std_menu_items(handler, &ar0521_ctrl_ops,
+					     V4L2_CID_TEST_PATTERN,
+					     ARRAY_SIZE(ar0521_test_pattern_menu) - 1,
+					     0, 0, ar0521_test_pattern_menu);
+	sensor->op_mode_ctrl = v4l2_ctrl_new_custom(handler,
+						    &ar0521_op_mode_ctrl_cfg,
+						    NULL);
+	sensor->light_source_enable_ctrl =
+		v4l2_ctrl_new_custom(handler, &ar0521_light_source_enable_cfg,
+				     NULL);
+	sensor->light_source_active_level_ctrl =
+		v4l2_ctrl_new_custom(handler,
+				     &ar0521_light_source_active_level_cfg, NULL);
+	sensor->light_source_advance_us_ctrl =
+		v4l2_ctrl_new_custom(handler, &ar0521_light_source_advance_us_cfg,
+				     NULL);
+	sensor->light_source_off_delay_us_ctrl =
+		v4l2_ctrl_new_custom(handler,
+				     &ar0521_light_source_off_delay_us_cfg, NULL);
+
+	v4l2_ctrl_new_fwnode_properties(handler, &ar0521_ctrl_ops, &props);
+
+	if (handler->error) {
+		ret = handler->error;
+		dev_err(sensor->dev, "failed to add controls (%d)\n", ret);
+		v4l2_ctrl_handler_free(handler);
+		return ret;
 	}
 
-	sensor->sd.ctrl_handler = hdl;
-	return 0;
+	if (sensor->op_mode_ctrl) {
+		mutex_lock(&sensor->mutex);
+		ret = __v4l2_ctrl_s_ctrl(sensor->op_mode_ctrl,
+					 sensor->pending_mode);
+		mutex_unlock(&sensor->mutex);
+		if (ret < 0) {
+			dev_err(sensor->dev,
+				"failed to sync default run mode control (%d)\n",
+				ret);
+			v4l2_ctrl_handler_free(handler);
+			return ret;
+		}
+	}
 
-free_ctrls:
-	v4l2_ctrl_handler_free(hdl);
-	return ret;
+	sensor->sd.ctrl_handler = handler;
+	ar0521_update_free_run_exposure_range_locked(sensor,
+						     sensor->vblank->val);
+	ar0521_update_ctrl_visibility_locked(sensor, sensor->pending_mode);
+	return 0;
 }
 
 #define REGS_ENTRY(a)	{(a), ARRAY_SIZE(a)}
@@ -549,7 +1551,7 @@ static const struct initial_reg {
 	const __be16 *data; /* data[0] is register address */
 	unsigned int count;
 } initial_regs[] = {
-	REGS(be(0x0112), be(0x0808)), /* 8-bit/8-bit mode */
+	REGS(be(0x0112), be(0x0A0A)), /* RAW10/RAW10; ADC 10-bit via 0x3F3E */
 
 	/* PEDESTAL+2 :+2 is a workaround for 10bit mode +0.5 rounding */
 	REGS(be(0x301E), be(0x00AA)),
@@ -709,51 +1711,70 @@ static const struct initial_reg {
 	     be(0x0707)), /* 3F44: couple k factor 2 */
 };
 
-static int ar0521_power_off(struct device *dev)
+static void ar0521_power_off_partial(struct ar0521 *sensor, int n_supplies,
+				     bool clk_on)
 {
-	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
 	int i;
 
-	clk_disable_unprepare(sensor->extclk);
+	if (clk_on && sensor->extclk)
+		clk_disable_unprepare(sensor->extclk);
 
 	if (sensor->reset_gpio)
-		gpiod_set_value(sensor->reset_gpio, 1); /* assert RESET signal */
+		gpiod_set_value(sensor->reset_gpio, 1);
 
-	for (i = ARRAY_SIZE(ar0521_supply_names) - 1; i >= 0; i--) {
+	for (i = n_supplies - 1; i >= 0; i--) {
 		if (sensor->supplies[i])
 			regulator_disable(sensor->supplies[i]);
 	}
+
+	if (!IS_ERR_OR_NULL(sensor->pinctrl) && sensor->pins_sleep)
+		pinctrl_select_state(sensor->pinctrl, sensor->pins_sleep);
+}
+
+static int ar0521_power_off(struct ar0521 *sensor)
+{
+	ar0521_power_off_partial(sensor, ARRAY_SIZE(ar0521_supply_names),
+				 true);
 	return 0;
 }
 
-static int ar0521_power_on(struct device *dev)
+static int ar0521_power_on(struct ar0521 *sensor)
 {
-	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
 	unsigned int cnt;
+	unsigned int enabled = 0;
+	bool clk_on = false;
 	int ret;
 
-	for (cnt = 0; cnt < ARRAY_SIZE(ar0521_supply_names); cnt++)
-		if (sensor->supplies[cnt]) {
-			ret = regulator_enable(sensor->supplies[cnt]);
-			if (ret < 0)
-				goto off;
-
-			usleep_range(1000, 1500); /* min 1 ms */
-		}
-
-	ret = clk_prepare_enable(sensor->extclk);
-	if (ret < 0) {
-		v4l2_err(&sensor->sd, "error enabling sensor clock\n");
-		goto off;
+	if (!IS_ERR_OR_NULL(sensor->pinctrl)) {
+		ret = ar0521_light_source_apply_pinctrl_locked(sensor);
+		if (ret < 0)
+			dev_dbg(sensor->dev, "could not set light source pin state\n");
 	}
-	usleep_range(1000, 1500); /* min 1 ms */
+
+	for (cnt = 0; cnt < ARRAY_SIZE(ar0521_supply_names); cnt++) {
+		if (!sensor->supplies[cnt])
+			continue;
+		ret = regulator_enable(sensor->supplies[cnt]);
+		if (ret < 0)
+			goto off;
+		enabled = cnt + 1;
+		usleep_range(1000, 1500);
+	}
+
+	if (sensor->extclk) {
+		ret = clk_prepare_enable(sensor->extclk);
+		if (ret < 0) {
+			dev_err(sensor->dev, "error enabling sensor clock\n");
+			goto off;
+		}
+		clk_on = true;
+	}
+	usleep_range(1000, 1500);
 
 	if (sensor->reset_gpio)
-		/* deassert RESET signal */
 		gpiod_set_value(sensor->reset_gpio, 0);
-	usleep_range(4500, 5000); /* min 45000 clocks */
+	/* Datasheet: >= 45000 extclk cycles after RESET_N deassert. */
+	usleep_range(2000, 2500);
 
 	for (cnt = 0; cnt < ARRAY_SIZE(initial_regs); cnt++) {
 		ret = ar0521_write_regs(sensor, initial_regs[cnt].data,
@@ -768,153 +1789,887 @@ static int ar0521_power_on(struct device *dev)
 	if (ret)
 		goto off;
 
-	/* set MIPI test mode - disabled for now */
 	ret = ar0521_write_reg(sensor, AR0521_REG_HISPI_TEST_MODE,
 			       ((0x40 << sensor->lane_count) - 0x40) |
 			       AR0521_REG_HISPI_TEST_MODE_LP11);
 	if (ret)
 		goto off;
 
-	ret = ar0521_write_reg(sensor, AR0521_REG_ROW_SPEED, 0x110 |
-			       4 / sensor->lane_count);
+	ret = ar0521_write_reg(sensor, AR0521_REG_ROW_SPEED,
+			       0x110 | (4 / sensor->lane_count));
 	if (ret)
 		goto off;
 
 	return 0;
 off:
-	ar0521_power_off(dev);
+	ar0521_power_off_partial(sensor, enabled, clk_on);
 	return ret;
 }
 
-static int ar0521_enum_mbus_code(struct v4l2_subdev *sd,
-				 struct v4l2_subdev_state *sd_state,
-				 struct v4l2_subdev_mbus_code_enum *code)
+static int ar0521_identify(struct ar0521 *sensor)
 {
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
+	u16 model;
+	u16 rev;
+	int ret;
 
-	if (code->index)
-		return -EINVAL;
+	ret = ar0521_read_reg(sensor, AR0521_REG_MODEL_ID, &model);
+	if (ret)
+		return ret;
 
-	code->code = sensor->fmt.code;
+	dev_info(sensor->dev, "model_id 0x%04x at 0x3000\n", model);
+	if (model != AR0521_MODEL_ID) {
+		dev_err(sensor->dev, "unexpected model_id 0x%04x, want 0x%04x\n",
+			model, AR0521_MODEL_ID);
+		return -ENODEV;
+	}
+
+	ret = ar0521_read_reg(sensor, AR0521_REG_REVISION, &rev);
+	if (ret)
+		return ret;
+
+	dev_info(sensor->dev, "identified AR0521 model_id=0x%04x revision=0x%04x\n",
+		 model, rev);
 	return 0;
 }
 
-static int ar0521_pre_streamon(struct v4l2_subdev *sd, u32 flags)
+static int ar0521_setup(struct ar0521 *sensor)
 {
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
 	int ret;
 
-	if (!(flags & V4L2_SUBDEV_PRE_STREAMON_FL_MANUAL_LP))
-		return -EACCES;
+	ret = ar0521_write_pll(sensor);
+	if (ret)
+		return ret;
 
-	ret = pm_runtime_resume_and_get(&sensor->i2c_client->dev);
+	ret = ar0521_set_geometry(sensor);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int ar0521_mode_switch(struct ar0521 *sensor, enum ar0521_op_mode new_mode)
+{
+	enum ar0521_op_mode old_pending = sensor->pending_mode;
+	enum ar0521_op_mode old_active = sensor->active_mode;
+	bool old_streaming = sensor->streaming;
+	int ret = 0;
+	int rec_ret;
+
+	if (new_mode > AR0521_TRIGGER_ONE_SHOT)
+		return -EINVAL;
+
+	if (!old_streaming) {
+		sensor->pending_mode = new_mode;
+		ar0521_update_ctrl_visibility_locked(sensor, new_mode);
+		return 0;
+	}
+
+	if (old_active == new_mode) {
+		sensor->pending_mode = new_mode;
+		ar0521_update_ctrl_visibility_locked(sensor, new_mode);
+		return 0;
+	}
+
+	ret = pm_runtime_resume_and_get(sensor->dev);
 	if (ret < 0)
 		return ret;
 
-	/* Set LP-11 on clock and data lanes */
-	ret = ar0521_write_reg(sensor, AR0521_REG_HISPI_CONTROL_STATUS,
-			AR0521_REG_HISPI_CONTROL_STATUS_FRAMER_TEST_MODE_ENABLE);
-	if (ret)
-		goto err;
+	sensor->pending_mode = new_mode;
+	ar0521_update_ctrl_visibility_locked(sensor, new_mode);
 
-	/* Start streaming LP-11 */
-	ret = ar0521_write_reg(sensor, AR0521_REG_RESET,
-			       AR0521_REG_RESET_DEFAULTS |
-			       AR0521_REG_RESET_STREAM);
+	ret = ar0521_stream_off_bits(sensor);
 	if (ret)
-		goto err;
+		goto restore;
+
+	if (old_active == AR0521_TRIGGER_ONE_SHOT) {
+		ret = ar0521_exit_slave_locked(sensor);
+		if (ret)
+			goto restore;
+	}
+
+	ret = ar0521_apply_mode_regs_locked(sensor, new_mode);
+	if (ret)
+		goto restore;
+
+	ret = ar0521_restore_ctrls_for_mode_locked(sensor, new_mode);
+	if (ret)
+		goto restore;
+
+	if (new_mode == AR0521_FREE_RUN) {
+		ret = ar0521_stream_on_bits(sensor);
+		if (ret)
+			goto restore;
+	} else {
+		ret = ar0521_exit_lp11_locked(sensor);
+		if (ret)
+			goto restore;
+		__v4l2_ctrl_grab(sensor->vflip, 1);
+		__v4l2_ctrl_grab(sensor->hflip, 1);
+	}
+
+	sensor->active_mode = new_mode;
+	sensor->streaming = true;
+	pm_runtime_put(sensor->dev);
 	return 0;
 
-err:
-	pm_runtime_put(&sensor->i2c_client->dev);
-	return ret;
+restore:
+	sensor->pending_mode = old_pending;
+	ar0521_update_ctrl_visibility_locked(sensor, old_pending);
+
+	rec_ret = ar0521_apply_mode_regs_locked(sensor, old_active);
+	if (!rec_ret)
+		rec_ret = ar0521_restore_ctrls_for_mode_locked(sensor, old_active);
+	if (!rec_ret) {
+		if (old_active == AR0521_FREE_RUN)
+			rec_ret = ar0521_stream_on_bits(sensor);
+		else
+			rec_ret = ar0521_exit_lp11_locked(sensor);
+	}
+
+	if (!rec_ret && old_streaming) {
+		sensor->active_mode = old_active;
+		sensor->streaming = true;
+		if (old_active == AR0521_TRIGGER_ONE_SHOT) {
+			__v4l2_ctrl_grab(sensor->vflip, 1);
+			__v4l2_ctrl_grab(sensor->hflip, 1);
+		}
+		pm_runtime_put(sensor->dev);
+		return ret;
+	}
+
+	/* Recovery failed: stay stopped and drop the original stream PM ref. */
+	sensor->streaming = false;
+	sensor->active_mode = old_pending;
+	ar0521_light_source_set_locked(sensor, false);
+	__v4l2_ctrl_grab(sensor->vflip, 0);
+	__v4l2_ctrl_grab(sensor->hflip, 0);
+	pm_runtime_put(sensor->dev);
+	pm_runtime_mark_last_busy(sensor->dev);
+	pm_runtime_put_autosuspend(sensor->dev);
+	return rec_ret ? rec_ret : ret;
 }
 
-static int ar0521_post_streamoff(struct v4l2_subdev *sd)
+static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 {
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
+	struct ar0521 *sensor = container_of(ctrl->handler, struct ar0521, ctrls);
+	int ret = 0;
 
-	pm_runtime_put(&sensor->i2c_client->dev);
-	return 0;
+	if (ctrl->id == V4L2_CID_AR0521_OP_MODE)
+		return ar0521_mode_switch(sensor, ctrl->val);
+
+	switch (ctrl->id) {
+	case V4L2_CID_VBLANK:
+		ar0521_update_free_run_exposure_range_locked(sensor, ctrl->val);
+		break;
+	case V4L2_CID_AR0521_LIGHT_SOURCE_ENABLE:
+		sensor->light_source_enabled = !!ctrl->val;
+		break;
+	case V4L2_CID_AR0521_LIGHT_SOURCE_ACTIVE_LEVEL:
+		sensor->light_source_active_level = !!ctrl->val;
+		break;
+	case V4L2_CID_AR0521_LIGHT_SOURCE_ADVANCE_US:
+		sensor->light_source_advance_us = ctrl->val;
+		break;
+	case V4L2_CID_AR0521_LIGHT_SOURCE_OFF_DELAY_US:
+		sensor->light_source_off_delay_us = ctrl->val;
+		break;
+	default:
+		break;
+	}
+
+	if (!pm_runtime_get_if_in_use(sensor->dev))
+		return 0;
+
+	ret = ar0521_group_hold(sensor, true);
+	if (ret)
+		goto out_pm;
+
+	switch (ctrl->id) {
+	case V4L2_CID_EXPOSURE:
+		ret = ar0521_apply_exposure_locked(sensor, ctrl->val);
+		break;
+	case V4L2_CID_ANALOGUE_GAIN:
+		ret = ar0521_apply_analog_gain_locked(sensor, ctrl->val);
+		break;
+	case V4L2_CID_VBLANK:
+		ret = ar0521_apply_vblank_locked(sensor, ctrl->val);
+		break;
+	case V4L2_CID_HFLIP:
+	case V4L2_CID_VFLIP:
+		sensor->format.code = ar0521_mbus_code(sensor);
+		ret = ar0521_apply_flip_locked(sensor);
+		break;
+	case V4L2_CID_TEST_PATTERN:
+		ret = ar0521_apply_test_pattern_locked(sensor, ctrl->val);
+		break;
+	case V4L2_CID_AR0521_LIGHT_SOURCE_ENABLE:
+		if (sensor->streaming && sensor->active_mode == AR0521_FREE_RUN)
+			ar0521_light_source_set_locked(sensor,
+						       sensor->light_source_enabled);
+		break;
+	case V4L2_CID_AR0521_LIGHT_SOURCE_ACTIVE_LEVEL:
+		ret = ar0521_light_source_init_locked(sensor);
+		if (ret < 0)
+			break;
+		if (sensor->streaming && sensor->active_mode == AR0521_FREE_RUN)
+			ar0521_light_source_set_locked(sensor,
+						       sensor->light_source_enabled);
+		break;
+	case V4L2_CID_HBLANK:
+		ret = ar0521_set_geometry(sensor);
+		break;
+	default:
+		break;
+	}
+
+	{
+		int hold_ret = ar0521_group_hold(sensor, false);
+
+		if (!ret)
+			ret = hold_ret;
+	}
+
+out_pm:
+	pm_runtime_put(sensor->dev);
+	return ret;
 }
 
 static int ar0521_s_stream(struct v4l2_subdev *sd, int enable)
 {
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
-	int ret;
+	struct ar0521 *sensor = to_ar0521(sd);
+	int ret = 0;
+	int rb;
 
-	mutex_lock(&sensor->lock);
+	mutex_lock(&sensor->mutex);
 
-	ret = ar0521_set_stream(sensor, enable);
-	if (!ret)
-		sensor->streaming = enable;
+	enable = !!enable;
+	if (enable == sensor->streaming)
+		goto unlock;
 
-	mutex_unlock(&sensor->lock);
+	if (!enable) {
+		if (sensor->active_mode == AR0521_TRIGGER_ONE_SHOT)
+			ret = ar0521_exit_slave_locked(sensor);
+		if (!ret)
+			ret = ar0521_stream_off_bits(sensor);
+		ar0521_light_source_set_locked(sensor, false);
+		if (!ret) {
+			sensor->streaming = false;
+			pm_runtime_mark_last_busy(sensor->dev);
+			pm_runtime_put_autosuspend(sensor->dev);
+		}
+		goto unlock;
+	}
+
+	ar0521_update_ctrl_visibility_locked(sensor, sensor->pending_mode);
+
+	ret = pm_runtime_resume_and_get(sensor->dev);
+	if (ret < 0)
+		goto unlock;
+
+	ret = ar0521_setup(sensor);
+	if (ret)
+		goto err_pm;
+
+	ret = ar0521_restore_ctrls_for_mode_locked(sensor, sensor->pending_mode);
+	if (ret)
+		goto err_pm;
+
+	if (sensor->pending_mode == AR0521_TRIGGER_ONE_SHOT) {
+		ret = ar0521_apply_mode_regs_locked(sensor,
+						    AR0521_TRIGGER_ONE_SHOT);
+		if (ret)
+			goto err_pm;
+		ret = ar0521_exit_lp11_locked(sensor);
+		if (ret)
+			goto err_pm;
+		__v4l2_ctrl_grab(sensor->vflip, 1);
+		__v4l2_ctrl_grab(sensor->hflip, 1);
+	} else {
+		ret = ar0521_apply_mode_regs_locked(sensor, AR0521_FREE_RUN);
+		if (ret)
+			goto err_pm;
+		ret = ar0521_stream_on_bits(sensor);
+		if (ret)
+			goto err_pm;
+	}
+
+	ret = ar0521_light_source_init_locked(sensor);
+	if (ret)
+		goto err_pm;
+
+	sensor->active_mode = sensor->pending_mode;
+	sensor->streaming = true;
+
+	if (sensor->active_mode == AR0521_FREE_RUN && sensor->light_source_enabled)
+		ar0521_light_source_set_locked(sensor, true);
+
+	goto unlock;
+
+err_pm:
+	ar0521_light_source_set_locked(sensor, false);
+	if (sensor->slave_backup_valid) {
+		rb = ar0521_exit_slave_locked(sensor);
+		if (rb) {
+			dev_err(sensor->dev,
+				"s_stream rollback exit_slave failed (%d)\n",
+				rb);
+			if (!ret)
+				ret = rb;
+		}
+	}
+	rb = ar0521_stream_off_bits(sensor);
+	if (rb) {
+		dev_err(sensor->dev,
+			"s_stream rollback stream off failed (%d)\n",
+			rb);
+		if (!ret)
+			ret = rb;
+	}
+	sensor->streaming = false;
+	pm_runtime_put_sync(sensor->dev);
+unlock:
+	mutex_unlock(&sensor->mutex);
 	return ret;
 }
 
-static const struct v4l2_subdev_core_ops ar0521_core_ops = {
-	.log_status = v4l2_ctrl_subdev_log_status,
-};
-
-static const struct v4l2_subdev_video_ops ar0521_video_ops = {
-	.s_stream = ar0521_s_stream,
-	.pre_streamon = ar0521_pre_streamon,
-	.post_streamoff = ar0521_post_streamoff,
-};
-
-static const struct v4l2_subdev_pad_ops ar0521_pad_ops = {
-	.enum_mbus_code = ar0521_enum_mbus_code,
-	.get_fmt = ar0521_get_fmt,
-	.set_fmt = ar0521_set_fmt,
-};
-
-static const struct v4l2_subdev_ops ar0521_subdev_ops = {
-	.core = &ar0521_core_ops,
-	.video = &ar0521_video_ops,
-	.pad = &ar0521_pad_ops,
-};
-
-static int __maybe_unused ar0521_suspend(struct device *dev)
+static int ar0521_s_power(struct v4l2_subdev *sd, int on)
 {
-	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
+	struct ar0521 *sensor = to_ar0521(sd);
+	int ret = 0;
 
-	if (sensor->streaming)
-		ar0521_set_stream(sensor, 0);
+	mutex_lock(&sensor->mutex);
+
+	if (sensor->power_on == !!on)
+		goto unlock;
+
+	if (on) {
+		ret = pm_runtime_get_sync(sensor->dev);
+		if (ret < 0) {
+			pm_runtime_put_noidle(sensor->dev);
+			goto unlock;
+		}
+		sensor->power_on = true;
+	} else {
+		pm_runtime_put(sensor->dev);
+		sensor->power_on = false;
+	}
+
+unlock:
+	mutex_unlock(&sensor->mutex);
+	return ret;
+}
+
+static int ar0521_g_frame_interval(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_frame_interval *fi)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	u32 total_height;
+	u32 total_width;
+
+	mutex_lock(&sensor->mutex);
+	total_width = ar0521_total_width_locked(sensor);
+	total_height = ar0521_total_height_locked(sensor);
+	fi->interval.numerator = total_height * total_width;
+	fi->interval.denominator = AR0521_PIXEL_RATE;
+	mutex_unlock(&sensor->mutex);
 
 	return 0;
 }
 
-static int __maybe_unused ar0521_resume(struct device *dev)
+static int ar0521_g_mbus_config(struct v4l2_subdev *sd, unsigned int pad_id,
+				struct v4l2_mbus_config *config)
 {
-	struct v4l2_subdev *sd = dev_get_drvdata(dev);
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
+	struct ar0521 *sensor = to_ar0521(sd);
 
-	if (sensor->streaming)
-		return ar0521_set_stream(sensor, 1);
+	config->type = V4L2_MBUS_CSI2_DPHY;
+	config->bus.mipi_csi2.num_data_lanes = sensor->lane_count;
+	return 0;
+}
 
+static long ar0521_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	u32 stream = 0;
+	u32 sync_mode = 0;
+	long ret = 0;
+
+	switch (cmd) {
+	case RKMODULE_GET_MODULE_INFO:
+		ar0521_get_module_inf(sensor, (struct rkmodule_inf *)arg);
+		break;
+	case RKMODULE_SET_QUICK_STREAM:
+		stream = *((u32 *)arg);
+		mutex_lock(&sensor->mutex);
+		ret = ar0521_quick_stream(sensor, !!stream);
+		mutex_unlock(&sensor->mutex);
+		break;
+	case RKMODULE_GET_SYNC_MODE:
+		*((u32 *)arg) = sensor->sync_mode;
+		break;
+	case RKMODULE_SET_SYNC_MODE:
+		sync_mode = *((u32 *)arg);
+		if (sync_mode != NO_SYNC_MODE &&
+		    sync_mode != INTERNAL_MASTER_MODE)
+			ret = -EINVAL;
+		else
+			sensor->sync_mode = INTERNAL_MASTER_MODE;
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
+		break;
+	}
+
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+static long ar0521_compat_ioctl32(struct v4l2_subdev *sd,
+				  unsigned int cmd, unsigned long arg)
+{
+	void __user *up = compat_ptr(arg);
+	struct rkmodule_inf *inf;
+	long ret;
+	u32 stream = 0;
+	u32 sync_mode = 0;
+
+	switch (cmd) {
+	case RKMODULE_GET_MODULE_INFO:
+		inf = kzalloc(sizeof(*inf), GFP_KERNEL);
+		if (!inf)
+			return -ENOMEM;
+		ret = ar0521_ioctl(sd, cmd, inf);
+		if (!ret && copy_to_user(up, inf, sizeof(*inf)))
+			ret = -EFAULT;
+		kfree(inf);
+		break;
+	case RKMODULE_SET_QUICK_STREAM:
+		if (copy_from_user(&stream, up, sizeof(stream)))
+			return -EFAULT;
+		ret = ar0521_ioctl(sd, cmd, &stream);
+		break;
+	case RKMODULE_GET_SYNC_MODE:
+		ret = ar0521_ioctl(sd, cmd, &sync_mode);
+		if (!ret && copy_to_user(up, &sync_mode, sizeof(sync_mode)))
+			ret = -EFAULT;
+		break;
+	case RKMODULE_SET_SYNC_MODE:
+		if (copy_from_user(&sync_mode, up, sizeof(sync_mode)))
+			return -EFAULT;
+		ret = ar0521_ioctl(sd, cmd, &sync_mode);
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
+		break;
+	}
+
+	return ret;
+}
+#endif
+static int ar0521_enum_mbus_code(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *state,
+				 struct v4l2_subdev_mbus_code_enum *code)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+
+	if (code->index != 0)
+		return -EINVAL;
+
+	code->code = ar0521_mbus_code(sensor);
+	return 0;
+}
+
+static int ar0521_enum_frame_size(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_frame_size_enum *fse)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+
+	if (fse->index >= 1 || fse->code != ar0521_mbus_code(sensor))
+		return -EINVAL;
+
+	fse->min_width = AR0521_WIDTH_MIN;
+	fse->max_width = AR0521_WIDTH_MAX;
+	fse->min_height = AR0521_HEIGHT_MIN;
+	fse->max_height = AR0521_HEIGHT_MAX;
+	return 0;
+}
+
+static void ar0521_clamp_crop_rect(struct v4l2_rect *rect)
+{
+	s32 max_left;
+	s32 max_top;
+	s32 left;
+	s32 top;
+
+	rect->width = clamp_t(unsigned int, ALIGN(rect->width, 4),
+			      AR0521_WIDTH_MIN, AR0521_WIDTH_MAX);
+	rect->height = clamp_t(unsigned int, ALIGN(rect->height, 4),
+			       AR0521_HEIGHT_MIN, AR0521_HEIGHT_MAX);
+	max_left = AR0521_NATIVE_LEFT + AR0521_NATIVE_WIDTH - rect->width;
+	max_top = AR0521_NATIVE_TOP + AR0521_NATIVE_HEIGHT - rect->height;
+	left = clamp_t(s32, rect->left, AR0521_NATIVE_LEFT, max_left);
+	top = clamp_t(s32, rect->top, AR0521_NATIVE_TOP, max_top);
+	rect->left = clamp_t(s32, ALIGN(left, 2), AR0521_NATIVE_LEFT, max_left);
+	rect->top = clamp_t(s32, ALIGN(top, 2), AR0521_NATIVE_TOP, max_top);
+}
+
+/*
+ * rkcif_create_dummy_buf() sizes VICAP dummy DMA from this pad op.
+ * Without it, max_size stays 0 and STREAMON fails with -ENOMEM.
+ */
+static int ar0521_enum_frame_interval(struct v4l2_subdev *sd,
+				      struct v4l2_subdev_state *state,
+				      struct v4l2_subdev_frame_interval_enum *fie)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	u32 total_width;
+	u32 total_height;
+
+	if (fie->index != 0)
+		return -EINVAL;
+	if (fie->code && fie->code != ar0521_mbus_code(sensor))
+		return -EINVAL;
+
+	mutex_lock(&sensor->mutex);
+	total_width = ar0521_total_width_locked(sensor);
+	total_height = ar0521_total_height_locked(sensor);
+	fie->code = ar0521_mbus_code(sensor);
+	fie->width = sensor->crop.width;
+	fie->height = sensor->crop.height;
+	fie->interval.numerator = total_height * total_width;
+	fie->interval.denominator = AR0521_PIXEL_RATE;
+	mutex_unlock(&sensor->mutex);
+	return 0;
+}
+
+static int ar0521_get_format(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *state,
+			     struct v4l2_subdev_format *fmt)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	struct v4l2_mbus_framefmt *format;
+
+	mutex_lock(&sensor->mutex);
+	format = ar0521_get_pad_format(sensor, state, fmt->pad, fmt->which);
+	format->code = ar0521_mbus_code(sensor);
+	fmt->format = *format;
+	mutex_unlock(&sensor->mutex);
+	return 0;
+}
+
+static int ar0521_set_format(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *state,
+			     struct v4l2_subdev_format *fmt)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	struct v4l2_mbus_framefmt *format;
+	struct v4l2_rect *crop;
+
+	mutex_lock(&sensor->mutex);
+	if (sensor->streaming && fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		mutex_unlock(&sensor->mutex);
+		return -EBUSY;
+	}
+
+	crop = ar0521_get_pad_crop(sensor, state, fmt->pad, fmt->which);
+	format = ar0521_get_pad_format(sensor, state, fmt->pad, fmt->which);
+
+	/*
+	 * media-ctl/set_fmt cannot grow output past the current crop, so a
+	 * leftover 1456x1088 ROI (camos) made 2592x1944 look stuck. Expand
+	 * the crop toward the default origin when a larger size is asked.
+	 * Smaller sizes keep the current origin (ROI).
+	 */
+	if (fmt->format.width > crop->width ||
+	    fmt->format.height > crop->height) {
+		struct v4l2_rect rect = *crop;
+
+		rect.width = max_t(u32, fmt->format.width, crop->width);
+		rect.height = max_t(u32, fmt->format.height, crop->height);
+		if (rect.width >= AR0521_WIDTH_MAX &&
+		    rect.height >= AR0521_HEIGHT_MAX) {
+			rect.left = AR0521_DEFAULT_LEFT;
+			rect.top = AR0521_DEFAULT_TOP;
+		}
+		ar0521_clamp_crop_rect(&rect);
+		*crop = rect;
+	}
+
+	format->width = crop->width;
+	format->height = crop->height;
+	format->code = ar0521_mbus_code(sensor);
+	format->field = V4L2_FIELD_NONE;
+	format->colorspace = V4L2_COLORSPACE_RAW;
+	format->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	format->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	format->xfer_func = V4L2_XFER_FUNC_NONE;
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		ar0521_setup_hblank(sensor, format->width);
+		ar0521_update_free_run_exposure_range_locked(sensor,
+							     sensor->vblank->val);
+	}
+
+	fmt->format = *format;
+	mutex_unlock(&sensor->mutex);
+	return 0;
+}
+
+static int ar0521_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+
+	mutex_lock(&sensor->mutex);
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+		sel->r = *ar0521_get_pad_crop(sensor, state, sel->pad, sel->which);
+		break;
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r.left = AR0521_DEFAULT_LEFT;
+		sel->r.top = AR0521_DEFAULT_TOP;
+		sel->r.width = AR0521_WIDTH_MAX;
+		sel->r.height = AR0521_HEIGHT_MAX;
+		break;
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = AR0521_NATIVE_LEFT;
+		sel->r.top = AR0521_NATIVE_TOP;
+		sel->r.width = AR0521_NATIVE_WIDTH;
+		sel->r.height = AR0521_NATIVE_HEIGHT;
+		break;
+	default:
+		mutex_unlock(&sensor->mutex);
+		return -EINVAL;
+	}
+	mutex_unlock(&sensor->mutex);
+	return 0;
+}
+
+static int ar0521_set_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	struct v4l2_mbus_framefmt *format;
+	struct v4l2_rect *crop;
+	struct v4l2_rect rect;
+
+	if (sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+
+	rect = sel->r;
+	ar0521_clamp_crop_rect(&rect);
+
+	mutex_lock(&sensor->mutex);
+	if (sensor->streaming && sel->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		mutex_unlock(&sensor->mutex);
+		return -EBUSY;
+	}
+
+	crop = ar0521_get_pad_crop(sensor, state, sel->pad, sel->which);
+	format = ar0521_get_pad_format(sensor, state, sel->pad, sel->which);
+	*crop = rect;
+	format->width = rect.width;
+	format->height = rect.height;
+	sel->r = rect;
+
+	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		ar0521_setup_hblank(sensor, format->width);
+		ar0521_update_free_run_exposure_range_locked(sensor,
+							     sensor->vblank->val);
+	}
+
+	mutex_unlock(&sensor->mutex);
+	return 0;
+}
+
+#ifdef CONFIG_VIDEO_V4L2_SUBDEV_API
+static int ar0521_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	struct v4l2_mbus_framefmt *try_fmt;
+	struct v4l2_rect *try_crop;
+
+	mutex_lock(&sensor->mutex);
+	try_fmt = v4l2_subdev_get_try_format(sd, fh->state, 0);
+	*try_fmt = sensor->format;
+	try_crop = v4l2_subdev_get_try_crop(sd, fh->state, 0);
+	*try_crop = sensor->crop;
+	mutex_unlock(&sensor->mutex);
+	return 0;
+}
+#endif
+
+static const struct v4l2_subdev_core_ops ar0521_subdev_core_ops = {
+	.s_power = ar0521_s_power,
+	.ioctl = ar0521_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl32 = ar0521_compat_ioctl32,
+#endif
+	.log_status = v4l2_ctrl_subdev_log_status,
+};
+
+static const struct v4l2_subdev_video_ops ar0521_subdev_video_ops = {
+	.s_stream = ar0521_s_stream,
+	.g_frame_interval = ar0521_g_frame_interval,
+};
+
+static const struct v4l2_subdev_pad_ops ar0521_subdev_pad_ops = {
+	.enum_mbus_code = ar0521_enum_mbus_code,
+	.enum_frame_size = ar0521_enum_frame_size,
+	.enum_frame_interval = ar0521_enum_frame_interval,
+	.get_fmt = ar0521_get_format,
+	.set_fmt = ar0521_set_format,
+	.get_selection = ar0521_get_selection,
+	.set_selection = ar0521_set_selection,
+	.get_mbus_config = ar0521_g_mbus_config,
+};
+
+static const struct v4l2_subdev_ops ar0521_subdev_ops = {
+	.core = &ar0521_subdev_core_ops,
+	.video = &ar0521_subdev_video_ops,
+	.pad = &ar0521_subdev_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops ar0521_internal_ops = {
+#ifdef CONFIG_VIDEO_V4L2_SUBDEV_API
+	.open = ar0521_open,
+#endif
+};
+
+static int ar0521_subdev_init(struct ar0521 *sensor)
+{
+	int ret;
+
+	v4l2_i2c_subdev_init(&sensor->sd, sensor->client, &ar0521_subdev_ops);
+	sensor->sd.internal_ops = &ar0521_internal_ops;
+
+	ret = ar0521_ctrls_init(sensor);
+	if (ret < 0)
+		return ret;
+
+	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+
+#if defined(CONFIG_MEDIA_CONTROLLER)
+	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
+	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
+	if (ret < 0) {
+		v4l2_ctrl_handler_free(&sensor->ctrls);
+		return ret;
+	}
+#endif
+	return 0;
+}
+
+static void ar0521_subdev_cleanup(struct ar0521 *sensor)
+{
+#if defined(CONFIG_MEDIA_CONTROLLER)
+	media_entity_cleanup(&sensor->sd.entity);
+#endif
+	v4l2_ctrl_handler_free(&sensor->ctrls);
+}
+
+static int __maybe_unused ar0521_runtime_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct ar0521 *sensor = to_ar0521(sd);
+
+	return ar0521_power_on(sensor);
+}
+
+static int __maybe_unused ar0521_runtime_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct ar0521 *sensor = to_ar0521(sd);
+
+	ar0521_power_off(sensor);
+	return 0;
+}
+
+static const struct dev_pm_ops ar0521_pm_ops = {
+	SET_RUNTIME_PM_OPS(ar0521_runtime_suspend, ar0521_runtime_resume, NULL)
+};
+
+static int ar0521_get_optional_supply(struct device *dev, const char *name,
+				      struct regulator **out)
+{
+	struct regulator *reg;
+
+	reg = devm_regulator_get_optional(dev, name);
+	if (IS_ERR(reg)) {
+		if (PTR_ERR(reg) == -ENODEV) {
+			*out = NULL;
+			return 0;
+		}
+		return PTR_ERR(reg);
+	}
+
+	*out = reg;
 	return 0;
 }
 
 static int ar0521_probe(struct i2c_client *client)
 {
+	struct device *dev = &client->dev;
+	struct device_node *node = dev->of_node;
 	struct v4l2_fwnode_endpoint ep = {
 		.bus_type = V4L2_MBUS_CSI2_DPHY
 	};
-	struct device *dev = &client->dev;
 	struct fwnode_handle *endpoint;
-	struct ar0521_dev *sensor;
-	unsigned int cnt;
+	const char *sync_mode_name = NULL;
+	struct v4l2_subdev *sd;
+	struct ar0521 *sensor;
+	char facing[2];
+	u32 trigger_mode = AR0521_FREE_RUN;
+	unsigned int i;
 	int ret;
+
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
+		return -EIO;
 
 	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
 	if (!sensor)
 		return -ENOMEM;
 
-	sensor->i2c_client = client;
-	sensor->fmt.width = AR0521_WIDTH_MAX;
-	sensor->fmt.height = AR0521_HEIGHT_MAX;
+	ret = of_property_read_u32(node, RKMODULE_CAMERA_MODULE_INDEX,
+				   &sensor->module_index);
+	ret |= of_property_read_string(node, RKMODULE_CAMERA_MODULE_FACING,
+				       &sensor->module_facing);
+	ret |= of_property_read_string(node, RKMODULE_CAMERA_MODULE_NAME,
+				       &sensor->module_name);
+	ret |= of_property_read_string(node, RKMODULE_CAMERA_LENS_NAME,
+				       &sensor->len_name);
+	if (ret) {
+		dev_err(dev, "could not get module information\n");
+		return -EINVAL;
+	}
+
+	sensor->dev = dev;
+	sensor->client = client;
+	sensor->sync_mode = INTERNAL_MASTER_MODE;
+	sensor->lane_count = AR0521_NUM_DATA_LANES;
+
+	ret = of_property_read_string(node, RKMODULE_CAMERA_SYNC_MODE,
+				      &sync_mode_name);
+	if (!ret) {
+		if (strcmp(sync_mode_name, RKMODULE_INTERNAL_MASTER_MODE) != 0)
+			dev_warn(dev,
+				 "sync-mode '%s' unsupported, forcing internal_master\n",
+				 sync_mode_name);
+	} else if (ret != -EINVAL) {
+		dev_warn(dev, "failed to read sync-mode (%d)\n", ret);
+	}
+
+	ret = of_property_read_u32(node, OF_AR0521_TRIGGER_MODE, &trigger_mode);
+	if (ret || trigger_mode > AR0521_TRIGGER_ONE_SHOT)
+		trigger_mode = AR0521_FREE_RUN;
+	sensor->pending_mode = trigger_mode;
+	sensor->active_mode = trigger_mode;
 
 	endpoint = fwnode_graph_get_endpoint_by_id(dev_fwnode(dev), 0, 0,
 						   FWNODE_GRAPH_ENDPOINT_NEXT);
@@ -945,15 +2700,20 @@ static int ar0521_probe(struct i2c_client *client)
 		dev_err(dev, "invalid number of MIPI data lanes\n");
 		return -EINVAL;
 	}
+	sensor->extclk = devm_clk_get_optional(dev, "extclk");
+	if (IS_ERR(sensor->extclk))
+		return dev_err_probe(dev, PTR_ERR(sensor->extclk),
+				     "failed to get extclk\n");
 
-	/* Get master clock (extclk) */
-	sensor->extclk = devm_clk_get(dev, "extclk");
-	if (IS_ERR(sensor->extclk)) {
-		dev_err(dev, "failed to get extclk\n");
-		return PTR_ERR(sensor->extclk);
+	if (sensor->extclk) {
+		sensor->extclk_freq = clk_get_rate(sensor->extclk);
+		if (!sensor->extclk_freq)
+			sensor->extclk_freq = AR0521_EXTCLK_DEFAULT;
+	} else {
+		sensor->extclk_freq = AR0521_EXTCLK_DEFAULT;
+		dev_info(dev, "no extclk, using on-module crystal default %u Hz\n",
+			 sensor->extclk_freq);
 	}
-
-	sensor->extclk_freq = clk_get_rate(sensor->extclk);
 
 	if (sensor->extclk_freq < AR0521_EXTCLK_MIN ||
 	    sensor->extclk_freq > AR0521_EXTCLK_MAX) {
@@ -962,91 +2722,229 @@ static int ar0521_probe(struct i2c_client *client)
 		return -EINVAL;
 	}
 
-	/* Request optional reset pin (usually active low) and assert it */
-	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
-						     GPIOD_OUT_HIGH);
+	if (sensor->extclk_freq != AR0521_EXTCLK_EXPECTED)
+		dev_warn(dev,
+			 "extclk %u Hz != expected %u Hz (Table5 27 MHz)\n",
+			 sensor->extclk_freq, AR0521_EXTCLK_EXPECTED);
 
-	v4l2_i2c_subdev_init(&sensor->sd, client, &ar0521_subdev_ops);
-
-	sensor->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
-	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
-	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
-	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
-	if (ret)
-		return ret;
-
-	for (cnt = 0; cnt < ARRAY_SIZE(ar0521_supply_names); cnt++) {
-		struct regulator *supply = devm_regulator_get(dev,
-						ar0521_supply_names[cnt]);
-
-		if (IS_ERR(supply)) {
-			dev_info(dev, "no %s regulator found: %li\n",
-				 ar0521_supply_names[cnt], PTR_ERR(supply));
-			return PTR_ERR(supply);
-		}
-		sensor->supplies[cnt] = supply;
+	for (i = 0; i < ARRAY_SIZE(ar0521_supply_names); i++) {
+		ret = ar0521_get_optional_supply(dev, ar0521_supply_names[i],
+						 &sensor->supplies[i]);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to get %s\n",
+					     ar0521_supply_names[i]);
 	}
 
-	mutex_init(&sensor->lock);
+	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+						     GPIOD_OUT_HIGH);
+	if (IS_ERR(sensor->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(sensor->reset_gpio),
+				     "failed to get reset-gpios\n");
 
-	ret = ar0521_init_controls(sensor);
+	sensor->trigger_pulse_us = AR0521_TRIGGER_PULSE_US_DEFAULT;
+	ret = of_property_read_u32(node, OF_AR0521_TRIGGER_PULSE_US,
+				   &trigger_mode);
+	if (!ret) {
+		if (trigger_mode < AR0521_TRIGGER_PULSE_US_MIN ||
+		    trigger_mode > AR0521_TRIGGER_PULSE_US_MAX)
+			dev_warn(dev,
+				 "trigger pulse width %u us out of range, default %u us\n",
+				 trigger_mode, AR0521_TRIGGER_PULSE_US_DEFAULT);
+		else
+			sensor->trigger_pulse_us = trigger_mode;
+	} else if (ret != -EINVAL) {
+		return dev_err_probe(dev, ret,
+				     "failed to read trigger pulse width\n");
+	}
+
+	sensor->light_source_gpio = devm_gpiod_get_optional(dev, "light-source",
+							    GPIOD_ASIS);
+	if (IS_ERR(sensor->light_source_gpio))
+		return dev_err_probe(dev, PTR_ERR(sensor->light_source_gpio),
+				     "failed to get light-source-gpios\n");
+	{
+		const char *active_level_name = NULL;
+
+		ret = of_property_read_string(node, "light-source-active-level",
+					      &active_level_name);
+		if (!ret && active_level_name) {
+			if (strcmp(active_level_name, "high") == 0)
+				sensor->light_source_active_level = true;
+			else if (strcmp(active_level_name, "low") != 0)
+				dev_warn(dev,
+					 "invalid light-source-active-level '%s', defaulting to low\n",
+					 active_level_name);
+		} else if (ret != -EINVAL) {
+			dev_warn(dev,
+				 "failed to read light-source-active-level (%d)\n",
+				 ret);
+		}
+	}
+
+	of_property_read_u32(node, "light-source-exposure-advance-us",
+			     &sensor->light_source_advance_us);
+	of_property_read_u32(node, "light-source-exposure-off-delay-us",
+			     &sensor->light_source_off_delay_us);
+	if (sensor->light_source_advance_us > 100000)
+		sensor->light_source_advance_us = 100000;
+	if (sensor->light_source_off_delay_us > 1000000)
+		sensor->light_source_off_delay_us = 1000000;
+
+	sensor->trigger_pwm = ar0521_devm_pwm_get_optional(dev, "trigger");
+	if (IS_ERR(sensor->trigger_pwm))
+		return dev_err_probe(dev, PTR_ERR(sensor->trigger_pwm),
+				     "failed to get trigger pwm\n");
+
+	sensor->pinctrl = devm_pinctrl_get(dev);
+	if (!IS_ERR(sensor->pinctrl)) {
+		sensor->pins_default =
+			pinctrl_lookup_state(sensor->pinctrl,
+					     OF_CAMERA_PINCTRL_STATE_DEFAULT);
+		if (IS_ERR(sensor->pins_default))
+			sensor->pins_default =
+				pinctrl_lookup_state(sensor->pinctrl, "default");
+		if (IS_ERR(sensor->pins_default))
+			sensor->pins_default = NULL;
+		sensor->pins_sleep =
+			pinctrl_lookup_state(sensor->pinctrl,
+					     OF_CAMERA_PINCTRL_STATE_SLEEP);
+		if (IS_ERR(sensor->pins_sleep))
+			sensor->pins_sleep = NULL;
+		sensor->pins_active_high =
+			pinctrl_lookup_state(sensor->pinctrl, "active-high");
+		if (IS_ERR(sensor->pins_active_high))
+			sensor->pins_active_high = NULL;
+	} else {
+		sensor->pinctrl = NULL;
+	}
+
+	mutex_init(&sensor->mutex);
+
+	ret = ar0521_init_trigger_pwm(sensor);
 	if (ret)
-		goto entity_cleanup;
+		goto err_destroy_mutex;
 
-	ar0521_adj_fmt(&sensor->fmt);
-
-	ret = v4l2_async_register_subdev(&sensor->sd);
+	ret = ar0521_power_on(sensor);
 	if (ret)
-		goto free_ctrls;
+		goto err_destroy_mutex;
 
-	/* Turn on the device and enable runtime PM */
-	ret = ar0521_power_on(&client->dev);
+	ret = ar0521_light_source_init_locked(sensor);
 	if (ret)
-		goto disable;
-	pm_runtime_set_active(&client->dev);
-	pm_runtime_enable(&client->dev);
-	pm_runtime_idle(&client->dev);
+		dev_warn(dev, "failed to initialize light source gpio (%d)\n",
+			 ret);
+
+	ret = ar0521_identify(sensor);
+	if (ret)
+		goto err_power;
+
+	sensor->crop.left = AR0521_DEFAULT_LEFT;
+	sensor->crop.top = AR0521_DEFAULT_TOP;
+	sensor->crop.width = AR0521_WIDTH_MAX;
+	sensor->crop.height = AR0521_HEIGHT_MAX;
+	sensor->format.width = AR0521_WIDTH_MAX;
+	sensor->format.height = AR0521_HEIGHT_MAX;
+	sensor->format.code = MEDIA_BUS_FMT_SGRBG10_1X10;
+	sensor->format.field = V4L2_FIELD_NONE;
+	sensor->format.colorspace = V4L2_COLORSPACE_RAW;
+	sensor->format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	sensor->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	sensor->format.xfer_func = V4L2_XFER_FUNC_NONE;
+
+	ret = ar0521_subdev_init(sensor);
+	if (ret)
+		goto err_power;
+
+	sd = &sensor->sd;
+	memset(facing, 0, sizeof(facing));
+	facing[0] = strcmp(sensor->module_facing, "back") == 0 ? 'b' : 'f';
+	snprintf(sd->name, sizeof(sd->name), "m%02d_%s_%s %s",
+		 sensor->module_index, facing, AR0521_NAME, dev_name(dev));
+
+	pm_runtime_set_active(dev);
+	pm_runtime_get_noresume(dev);
+	pm_runtime_enable(dev);
+
+	ret = v4l2_async_register_subdev_sensor(sd);
+	if (ret)
+		goto err_pm;
+
+	ret = device_add_group(dev, &ar0521_attr_group);
+	if (ret)
+		goto err_subdev;
+	sensor->sysfs_registered = true;
+
+	pm_runtime_set_autosuspend_delay(dev, 1000);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_put_autosuspend(dev);
+
+	dev_info(dev, "driver version: %02x.%02x.%02x, default mode: %s\n",
+		 DRIVER_VERSION >> 16,
+		 (DRIVER_VERSION & 0xff00) >> 8,
+		 DRIVER_VERSION & 0x00ff,
+		 ar0521_op_mode_name(sensor->pending_mode));
+	dev_info(dev,
+		 "PLL regs: extclk=%u pre=%u mult1=%u mult2=%u (odd M as written)\n",
+		 sensor->extclk_freq, AR0521_PLL_PRE,
+		 AR0521_PLL1_MULT_REG, AR0521_PLL2_MULT_REG);
+	dev_info(dev,
+		 "PLL eff: mult1=%u mult2=%u VCO1=%llu VCO2=%llu vt=%llu word=%llu\n",
+		 AR0521_PLL1_MULT_EFF, AR0521_PLL2_MULT_EFF,
+		 AR0521_PLL1_VCO_HZ, AR0521_PLL2_VCO_HZ,
+		 AR0521_VT_PIX_CLK_HZ, AR0521_WORD_CLK_HZ);
+	dev_info(dev,
+		 "MIPI: bitrate/lane=%llu link_freq=%lld pixel_rate=%llu lanes=%u RAW10\n",
+		 AR0521_MIPI_BITRATE_PER_LANE_HZ, AR0521_LINK_FREQ_HZ,
+		 AR0521_PIXEL_RATE, sensor->lane_count);
+	dev_info(dev, "sync mode: %s\n",
+		 ar0521_sync_mode_name(sensor->sync_mode));
+	if (sensor->trigger_pwm)
+		dev_info(dev,
+			 "trigger pwm ready: default high pulse=%u us idle-low\n",
+			 sensor->trigger_pulse_us);
+
 	return 0;
 
-disable:
-	v4l2_async_unregister_subdev(&sensor->sd);
-	media_entity_cleanup(&sensor->sd.entity);
-free_ctrls:
-	v4l2_ctrl_handler_free(&sensor->ctrls.handler);
-entity_cleanup:
-	media_entity_cleanup(&sensor->sd.entity);
-	mutex_destroy(&sensor->lock);
+err_subdev:
+	if (sensor->sysfs_registered)
+		device_remove_group(dev, &ar0521_attr_group);
+	v4l2_async_unregister_subdev(sd);
+err_pm:
+	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	ar0521_subdev_cleanup(sensor);
+err_power:
+	ar0521_power_off(sensor);
+err_destroy_mutex:
+	mutex_destroy(&sensor->mutex);
 	return ret;
 }
 
 static void ar0521_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct ar0521_dev *sensor = to_ar0521_dev(sd);
+	struct ar0521 *sensor = to_ar0521(sd);
 
-	v4l2_async_unregister_subdev(&sensor->sd);
-	media_entity_cleanup(&sensor->sd.entity);
-	v4l2_ctrl_handler_free(&sensor->ctrls.handler);
-	pm_runtime_disable(&client->dev);
-	if (!pm_runtime_status_suspended(&client->dev))
-		ar0521_power_off(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
-	mutex_destroy(&sensor->lock);
+	if (sensor->sysfs_registered)
+		device_remove_group(&client->dev, &ar0521_attr_group);
+	v4l2_async_unregister_subdev(sd);
+	ar0521_subdev_cleanup(sensor);
+	mutex_destroy(&sensor->mutex);
+
+	pm_runtime_disable(sensor->dev);
+	if (!pm_runtime_status_suspended(sensor->dev))
+		ar0521_power_off(sensor);
+	pm_runtime_set_suspended(sensor->dev);
 }
 
-static const struct dev_pm_ops ar0521_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(ar0521_suspend, ar0521_resume)
-	SET_RUNTIME_PM_OPS(ar0521_power_off, ar0521_power_on, NULL)
-};
 static const struct of_device_id ar0521_dt_ids[] = {
-	{.compatible = "onnn,ar0521"},
-	{}
+	{ .compatible = "onnn,ar0521" },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, ar0521_dt_ids);
 
 static struct i2c_driver ar0521_i2c_driver = {
 	.driver = {
-		.name  = "ar0521",
+		.name = AR0521_NAME,
 		.pm = &ar0521_pm_ops,
 		.of_match_table = ar0521_dt_ids,
 	},
