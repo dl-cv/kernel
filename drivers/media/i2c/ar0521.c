@@ -201,9 +201,52 @@
 #define AR0521_REG_VD_TRIG_NEW_FRAME		0x3158
 #define AR0521_REG_GLOBAL_SEQ_TRIGGER		0x315E
 #define   AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR	  BIT(0)
+#define   AR0521_REG_GLOBAL_SEQ_TRIGGER_BIT1	  BIT(1)
+#define   AR0521_REG_GLOBAL_SEQ_TRIGGER_SCALE_MASK (BIT(5) | BIT(4))
+#define AR0521_REG_GLOBAL_RST_END		0x3160
+#define AR0521_REG_GLOBAL_READ_START		0x3166
+#define AR0521_REG_GLOBAL_READ_START_HI		0x3168
+/*
+ * Non-bulb Triggered GRR: N_rst at 0x3160, 24-bit N_rd at 0x3166 +
+ * 0x3168[7:0]. Scale code 0 (bits[5:4]=0) is 512 VT clocks/count.
+ * Use VT pix 205.2 MHz, not the 410.4 MHz V4L2 pixel_rate.
+ */
+#define AR0521_GRR_N_RST			0x00EC
+#define AR0521_GRR_SCALE			512U
+#define AR0521_GRR_N_RD_MAX			0x00FFFFFFU
+#define AR0521_TRIGGER_EXPOSURE_US_MAX		2000000U
 
 #define AR0521_SLAVE_GPIO_GPO_1			0x0002
-#define AR0521_SLAVE_GPIO_CTRL2			0xFC70
+/*
+ * AND9484 R0x3026 gpi_status:
+ *   [15:13] standby_pin_select, [12:10] unused/RO, [9:7] trigger_pin_select,
+ *   [6:4] saddr_pin_select, [3:0] gpi3..gpi0 status (RO).
+ * Pin select encodings: 0=GPI0, 1=GPI1, 2=GPI2, 3=GPI3, 7=not controlled
+ * (trigger/saddr). Trigger is an active-high VD input.
+ *
+ * AND9573 Table 7/8 maps Flash=GPI0, Shutter=GPI1, Trigger=GPI2.
+ * AR0521/D pin table: FLASH package pin 39, TRIGGER package pin 51.
+ *
+ * Official recipes:
+ *   p24 slave (GPIO0/FLASH VD): 0xFC70 -> trigger_pin_select=0 (GPI0/pin39)
+ *   p23 GRR (TRIGGER pin VD):   0xFD70 -> trigger_pin_select=2 (GPI2/pin51)
+ *
+ * This board PWM (GPIO0_B5 / pwm1_ch1_m0) is wired to package pin 51
+ * TRIGGER=GPI2, so use 0xFD70, not the p24 FLASH/GPIO0 value.
+ */
+#define AR0521_GPI_PIN_GPI2			2
+#define AR0521_GPI_PIN_NONE			7
+#define AR0521_GPI_STANDBY_PIN_SELECT_SHIFT	13
+#define AR0521_GPI_UNUSED_SHIFT			10
+#define AR0521_GPI_TRIGGER_PIN_SELECT_SHIFT	7
+#define AR0521_GPI_SADDR_PIN_SELECT_SHIFT	4
+#define AR0521_SLAVE_GPIO_CTRL2			\
+	((AR0521_GPI_PIN_NONE << AR0521_GPI_STANDBY_PIN_SELECT_SHIFT) | \
+	 (AR0521_GPI_PIN_NONE << AR0521_GPI_UNUSED_SHIFT) | \
+	 (AR0521_GPI_PIN_GPI2 << AR0521_GPI_TRIGGER_PIN_SELECT_SHIFT) | \
+	 (AR0521_GPI_PIN_NONE << AR0521_GPI_SADDR_PIN_SELECT_SHIFT))
+static_assert(AR0521_SLAVE_GPIO_CTRL2 == 0xFD70,
+	      "slave gpi_status must be AND9573 p23 TRIGGER/GPI2 recipe");
 #define AR0521_SLAVE_VD_TRIG			0x8000
 
 #define OF_CAMERA_PINCTRL_STATE_DEFAULT		"rockchip,camera_default"
@@ -302,6 +345,9 @@ struct ar0521 {
 	u16 saved_vd_trig;
 	u16 saved_global_seq;
 	u16 saved_reset;
+	u16 saved_global_rst_end;
+	u16 saved_global_read_start;
+	u16 saved_global_read_start_hi;
 	bool slave_backup_valid;
 };
 
@@ -659,12 +705,71 @@ static u32 ar0521_exposure_us_to_lines_locked(struct ar0521 *sensor,
 	return clamp_t(u32, lines, 1, max_lines);
 }
 
-static void ar0521_update_free_run_exposure_range_locked(struct ar0521 *sensor,
-							 u32 vblank)
+static enum ar0521_op_mode ar0521_ctrl_mode_locked(const struct ar0521 *sensor)
 {
-	u32 frame_lines = sensor->format.height + vblank;
-	u32 max_lines = frame_lines > AR0521_CIT_MARGIN ?
-			frame_lines - AR0521_CIT_MARGIN : 1;
+	return sensor->streaming ? sensor->active_mode : sensor->pending_mode;
+}
+
+static u32 ar0521_grr_min_exposure_us(void)
+{
+	/* Smallest integer us whose rounded GRR delta is at least 1. */
+	return max_t(u32, 1,
+		     DIV_ROUND_UP_ULL((u64)AR0521_GRR_SCALE * 1000000ULL,
+				      2ULL * AR0521_VT_PIX_CLK_HZ));
+}
+
+static u32 ar0521_grr_exposure_us_to_n_rd(u32 exposure_us)
+{
+	u64 delta;
+	u32 span = AR0521_GRR_N_RD_MAX - AR0521_GRR_N_RST;
+
+	delta = DIV_ROUND_CLOSEST_ULL((u64)exposure_us * AR0521_VT_PIX_CLK_HZ,
+				      (u64)AR0521_GRR_SCALE * 1000000ULL);
+	if (delta < 1)
+		delta = 1;
+	if (delta > span)
+		return AR0521_GRR_N_RD_MAX;
+	return AR0521_GRR_N_RST + (u32)delta;
+}
+
+static int ar0521_write_grr_n_rd_locked(struct ar0521 *sensor, u32 n_rd)
+{
+	__be16 regs[] = {
+		be(AR0521_REG_GLOBAL_READ_START),
+		be(n_rd & 0xFFFF),
+		be((n_rd >> 16) & 0xFF)
+	};
+
+	return ar0521_write_regs(sensor, regs, ARRAY_SIZE(regs));
+}
+
+static int ar0521_apply_grr_timing_locked(struct ar0521 *sensor, u32 exposure_us)
+{
+	int ret;
+
+	ret = ar0521_write_reg(sensor, AR0521_REG_GLOBAL_RST_END,
+			       AR0521_GRR_N_RST);
+	if (ret)
+		return ret;
+	return ar0521_write_grr_n_rd_locked(sensor,
+					    ar0521_grr_exposure_us_to_n_rd(exposure_us));
+}
+
+static int ar0521_config_grr_seq_trigger_locked(struct ar0521 *sensor)
+{
+	u16 mask = AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR |
+		   AR0521_REG_GLOBAL_SEQ_TRIGGER_BIT1 |
+		   AR0521_REG_GLOBAL_SEQ_TRIGGER_SCALE_MASK;
+	u16 val = AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR;
+
+	return ar0521_update_bits(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
+				  mask, val);
+}
+
+static void ar0521_update_exposure_range_locked(struct ar0521 *sensor,
+						enum ar0521_op_mode mode,
+						u32 vblank)
+{
 	u32 min_us;
 	u32 max_us;
 	u32 def_us;
@@ -672,8 +777,18 @@ static void ar0521_update_free_run_exposure_range_locked(struct ar0521 *sensor,
 	if (!sensor->exposure)
 		return;
 
-	min_us = ar0521_lines_to_exposure_us(sensor, 1);
-	max_us = ar0521_lines_to_exposure_us(sensor, max_lines);
+	if (mode == AR0521_TRIGGER_ONE_SHOT) {
+		min_us = ar0521_grr_min_exposure_us();
+		max_us = AR0521_TRIGGER_EXPOSURE_US_MAX;
+	} else {
+		u32 frame_lines = sensor->format.height + vblank;
+		u32 max_lines = frame_lines > AR0521_CIT_MARGIN ?
+				frame_lines - AR0521_CIT_MARGIN : 1;
+
+		min_us = ar0521_lines_to_exposure_us(sensor, 1);
+		max_us = ar0521_lines_to_exposure_us(sensor, max_lines);
+	}
+
 	def_us = clamp_val(ar0521_lines_to_exposure_us(sensor, 360),
 			   min_us, max_us);
 	__v4l2_ctrl_modify_range(sensor->exposure, min_us, max_us, 1, def_us);
@@ -858,7 +973,9 @@ static int ar0521_apply_vblank_locked(struct ar0521 *sensor, u32 vblank)
 				total_height);
 }
 
-static int ar0521_apply_exposure_locked(struct ar0521 *sensor, u32 exposure_us)
+static int ar0521_apply_exposure_locked(struct ar0521 *sensor,
+					enum ar0521_op_mode mode,
+					u32 exposure_us)
 {
 	u32 frame_lines = sensor->format.height +
 			  (sensor->vblank ? sensor->vblank->val :
@@ -868,7 +985,8 @@ static int ar0521_apply_exposure_locked(struct ar0521 *sensor, u32 exposure_us)
 	u32 min_fll = lines + AR0521_CIT_MARGIN;
 	int ret;
 
-	if (frame_lines < min_fll) {
+	/* TRIGGER: keep 0x3012 inside current FLL-4; do not grow FLL. */
+	if (mode != AR0521_TRIGGER_ONE_SHOT && frame_lines < min_fll) {
 		frame_lines = min_fll;
 		ret = ar0521_write_reg(sensor, AR0521_REG_FRAME_LENGTH_LINES,
 				       frame_lines);
@@ -910,6 +1028,18 @@ static int ar0521_restore_slave_backup_locked(struct ar0521 *sensor)
 			       sensor->saved_global_seq);
 	if (ret)
 		return ret;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GLOBAL_RST_END,
+			       sensor->saved_global_rst_end);
+	if (ret)
+		return ret;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GLOBAL_READ_START,
+			       sensor->saved_global_read_start);
+	if (ret)
+		return ret;
+	ret = ar0521_write_reg(sensor, AR0521_REG_GLOBAL_READ_START_HI,
+			       sensor->saved_global_read_start_hi);
+	if (ret)
+		return ret;
 
 	return ar0521_update_bits(sensor, AR0521_REG_RESET,
 				  AR0521_REG_RESET_GPI,
@@ -919,29 +1049,47 @@ static int ar0521_restore_slave_backup_locked(struct ar0521 *sensor)
 static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 {
 	int ret;
+	int rb;
 
-	ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_GPO_1,
-			      &sensor->saved_gpio_gpo_1);
-	if (ret)
-		return ret;
-	ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_CTRL2,
-			      &sensor->saved_gpio_ctrl2);
-	if (ret)
-		return ret;
-	ret = ar0521_read_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME,
-			      &sensor->saved_vd_trig);
-	if (ret)
-		return ret;
-	ret = ar0521_read_reg(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
-			      &sensor->saved_global_seq);
-	if (ret)
-		return ret;
-	ret = ar0521_read_reg(sensor, AR0521_REG_RESET, &sensor->saved_reset);
-	if (ret)
-		return ret;
-	sensor->slave_backup_valid = true;
+	if (!sensor->slave_backup_valid) {
+		ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_GPO_1,
+				      &sensor->saved_gpio_gpo_1);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_CTRL2,
+				      &sensor->saved_gpio_ctrl2);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME,
+				      &sensor->saved_vd_trig);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
+				      &sensor->saved_global_seq);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_RESET,
+				      &sensor->saved_reset);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_GLOBAL_RST_END,
+				      &sensor->saved_global_rst_end);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_GLOBAL_READ_START,
+				      &sensor->saved_global_read_start);
+		if (ret)
+			return ret;
+		ret = ar0521_read_reg(sensor, AR0521_REG_GLOBAL_READ_START_HI,
+				      &sensor->saved_global_read_start_hi);
+		if (ret)
+			return ret;
+		sensor->slave_backup_valid = true;
+	}
 
-	/* AND9573 slave trigger: stop stream, then GPI/VD/GRR, then stream. */
+	/* AND9573 p23/p24: stop stream, then GPI/VD/GRR, then stream.
+	 * 0x3026 uses TRIGGER/GPI2 (0xFD70), not FLASH/GPI0 (0xFC70).
+	 */
 	ret = ar0521_stream_bit(sensor, false);
 	if (ret)
 		goto rollback;
@@ -961,9 +1109,10 @@ static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 			       AR0521_SLAVE_VD_TRIG);
 	if (ret)
 		goto rollback;
-	ret = ar0521_update_bits(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER,
-				 AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR,
-				 AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR);
+	ret = ar0521_config_grr_seq_trigger_locked(sensor);
+	if (ret)
+		goto rollback;
+	ret = ar0521_apply_grr_timing_locked(sensor, sensor->exposure->val);
 	if (ret)
 		goto rollback;
 
@@ -973,8 +1122,13 @@ static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 	return 0;
 
 rollback:
-	ar0521_restore_slave_backup_locked(sensor);
-	sensor->slave_backup_valid = false;
+	rb = ar0521_restore_slave_backup_locked(sensor);
+	if (rb) {
+		dev_err(sensor->dev,
+			"enter_slave rollback restore failed (%d)\n", rb);
+	} else {
+		sensor->slave_backup_valid = false;
+	}
 	return ret;
 }
 
@@ -1028,12 +1182,13 @@ static int ar0521_restore_ctrls_for_mode_locked(struct ar0521 *sensor,
 	ret = ar0521_set_geometry(sensor);
 	if (ret)
 		goto out;
-	ar0521_update_free_run_exposure_range_locked(sensor,
-						     sensor->vblank->val);
+	ar0521_update_exposure_range_locked(sensor, mode,
+					    sensor->vblank->val);
 	ret = ar0521_apply_vblank_locked(sensor, sensor->vblank->val);
 	if (ret)
 		goto out;
-	ret = ar0521_apply_exposure_locked(sensor, sensor->exposure->val);
+	ret = ar0521_apply_exposure_locked(sensor, mode,
+					   sensor->exposure->val);
 
 out:
 	{
@@ -1450,7 +1605,8 @@ static int ar0521_ctrls_init(struct ar0521 *sensor)
 
 	def_exposure_us = ar0521_lines_to_exposure_us(sensor, 360);
 	sensor->exposure = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
-					     V4L2_CID_EXPOSURE, 1, 2000000, 1,
+					     V4L2_CID_EXPOSURE, 1,
+					     AR0521_TRIGGER_EXPOSURE_US_MAX, 1,
 					     def_exposure_us);
 	sensor->anal_gain = v4l2_ctrl_new_std(handler, &ar0521_ctrl_ops,
 					      V4L2_CID_ANALOGUE_GAIN,
@@ -1538,8 +1694,8 @@ static int ar0521_ctrls_init(struct ar0521 *sensor)
 	}
 
 	sensor->sd.ctrl_handler = handler;
-	ar0521_update_free_run_exposure_range_locked(sensor,
-						     sensor->vblank->val);
+	ar0521_update_exposure_range_locked(sensor, sensor->pending_mode,
+					    sensor->vblank->val);
 	ar0521_update_ctrl_visibility_locked(sensor, sensor->pending_mode);
 	return 0;
 }
@@ -1716,6 +1872,9 @@ static void ar0521_power_off_partial(struct ar0521 *sensor, int n_supplies,
 {
 	int i;
 
+	/* POR discards on-sensor GRR/slave state; drop stale software backup. */
+	sensor->slave_backup_valid = false;
+
 	if (clk_on && sensor->extclk)
 		clk_disable_unprepare(sensor->extclk);
 
@@ -1861,12 +2020,16 @@ static int ar0521_mode_switch(struct ar0521 *sensor, enum ar0521_op_mode new_mod
 	if (!old_streaming) {
 		sensor->pending_mode = new_mode;
 		ar0521_update_ctrl_visibility_locked(sensor, new_mode);
+		ar0521_update_exposure_range_locked(sensor, new_mode,
+						    sensor->vblank->val);
 		return 0;
 	}
 
 	if (old_active == new_mode) {
 		sensor->pending_mode = new_mode;
 		ar0521_update_ctrl_visibility_locked(sensor, new_mode);
+		ar0521_update_exposure_range_locked(sensor, new_mode,
+						    sensor->vblank->val);
 		return 0;
 	}
 
@@ -1952,14 +2115,17 @@ restore:
 static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ar0521 *sensor = container_of(ctrl->handler, struct ar0521, ctrls);
+	enum ar0521_op_mode mode;
 	int ret = 0;
 
 	if (ctrl->id == V4L2_CID_AR0521_OP_MODE)
 		return ar0521_mode_switch(sensor, ctrl->val);
 
+	mode = ar0521_ctrl_mode_locked(sensor);
+
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
-		ar0521_update_free_run_exposure_range_locked(sensor, ctrl->val);
+		ar0521_update_exposure_range_locked(sensor, mode, ctrl->val);
 		break;
 	case V4L2_CID_AR0521_LIGHT_SOURCE_ENABLE:
 		sensor->light_source_enabled = !!ctrl->val;
@@ -1986,13 +2152,16 @@ static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
-		ret = ar0521_apply_exposure_locked(sensor, ctrl->val);
+		ret = ar0521_apply_exposure_locked(sensor, mode, ctrl->val);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
 		ret = ar0521_apply_analog_gain_locked(sensor, ctrl->val);
 		break;
 	case V4L2_CID_VBLANK:
 		ret = ar0521_apply_vblank_locked(sensor, ctrl->val);
+		if (ret)
+			break;
+		ret = ar0521_apply_exposure_locked(sensor, mode, sensor->exposure->val);
 		break;
 	case V4L2_CID_HFLIP:
 	case V4L2_CID_VFLIP:
@@ -2027,6 +2196,14 @@ static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 
 		if (!ret)
 			ret = hold_ret;
+	}
+	if (ctrl->id == V4L2_CID_EXPOSURE &&
+	    mode == AR0521_TRIGGER_ONE_SHOT &&
+	    sensor->slave_backup_valid) {
+		int grr_ret = ar0521_apply_grr_timing_locked(sensor, ctrl->val);
+
+		if (!ret)
+			ret = grr_ret;
 	}
 
 out_pm:
@@ -2406,8 +2583,9 @@ static int ar0521_set_format(struct v4l2_subdev *sd,
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
 		ar0521_setup_hblank(sensor, format->width);
-		ar0521_update_free_run_exposure_range_locked(sensor,
-							     sensor->vblank->val);
+		ar0521_update_exposure_range_locked(sensor,
+						    ar0521_ctrl_mode_locked(sensor),
+						    sensor->vblank->val);
 	}
 
 	fmt->format = *format;
@@ -2477,8 +2655,9 @@ static int ar0521_set_selection(struct v4l2_subdev *sd,
 
 	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
 		ar0521_setup_hblank(sensor, format->width);
-		ar0521_update_free_run_exposure_range_locked(sensor,
-							     sensor->vblank->val);
+		ar0521_update_exposure_range_locked(sensor,
+						    ar0521_ctrl_mode_locked(sensor),
+						    sensor->vblank->val);
 	}
 
 	mutex_unlock(&sensor->mutex);

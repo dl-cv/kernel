@@ -74,8 +74,13 @@
 		rockchip,camera-module-name = "AR0521-MIPI";
 		rockchip,camera-module-lens-name = "default";
 
-		/* 0 = FREE_RUN, 1 = TRIGGER_ONE_SHOT */
-		trigger-mode = <1>;
+		/*
+		 * 0 = FREE_RUN (default), 1 = TRIGGERED_GRR.
+		 * CAMOS switches to TRIGGERED_GRR at runtime; the DT default
+		 * stays FREE_RUN so the sensor streams autonomously before CAMOS
+		 * takes over trigger control.
+		 */
+		trigger-mode = <0>;
 
 		port {
 			ar0521_dcphy0_out: endpoint {
