@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) Rockchip Electronics Co., Ltd. */
 #include <linux/clk.h>
+#include <linux/pm_runtime.h>
 #include <linux/proc_fs.h>
 #include <linux/sem.h>
 #include <linux/seq_file.h>
+#include <linux/vmalloc.h>
 
 #include "dev.h"
 #include "procfs.h"
@@ -16,6 +18,9 @@
 #include "isp_params_v39.h"
 
 #ifdef CONFIG_PROC_FS
+
+/* Cap userspace proc write size; CamOS WB path only needs a few dozen bytes. */
+#define RKISP_PROC_WRITE_MAX	PAGE_SIZE
 
 static void isp20_show(struct rkisp_device *dev, struct seq_file *p)
 {
@@ -1377,20 +1382,51 @@ static void rkisp_proc_dump_mem(struct rkisp_device *dev)
 	}
 }
 
+static bool rkisp_proc_hw_ready_for_mmio(struct rkisp_device *dev)
+{
+	struct rkisp_hw_dev *hw = dev->hw_dev;
+
+	if (!hw || !hw->base_addr)
+		return false;
+	if (dev->is_suspend)
+		return false;
+	/*
+	 * ISP_START is set while the pipeline is streaming. Writing ISP
+	 * registers (FIL_AIQ/FIL_SW) while clocks/power are off, or during
+	 * teardown thrash, has been observed to raise Asynchronous SError
+	 * (python CamOS WB path: mode=0x100 / 400=0x6197) and panic the SoC.
+	 */
+	if (!(dev->isp_state & ISP_START))
+		return false;
+	return true;
+}
+
 static ssize_t rkisp_proc_write(struct file *file,
 				const char __user *user_buf,
 				size_t user_len, loff_t *pos)
 {
 	struct rkisp_device *dev = pde_data(file_inode(file));
-	char *tmp, *buf = vmalloc(user_len + 1);
+	struct device *pm_dev = NULL;
+	char *tmp, *buf;
 	u32 val, reg;
 	int ret;
+	int pm_ret = 0;
+	ssize_t out = user_len;
+	bool need_pm = false;
 
+	if (!dev)
+		return -ENODEV;
+	if (!user_len)
+		return 0;
+	if (user_len > RKISP_PROC_WRITE_MAX)
+		return -E2BIG;
+
+	buf = vmalloc(user_len + 1);
 	if (!buf)
 		return -ENOMEM;
 	if (copy_from_user(buf, user_buf, user_len) != 0) {
-		vfree(buf);
-		return -EFAULT;
+		out = -EFAULT;
+		goto free_buf;
 	}
 	if (buf[user_len - 1] == '\n')
 		buf[user_len - 1] = 0;
@@ -1401,8 +1437,10 @@ static ssize_t rkisp_proc_write(struct file *file,
 	if (tmp) {
 		tmp += 5;
 		ret = kstrtou32(tmp, 16, &val);
-		if (ret)
-			goto end;
+		if (ret) {
+			out = ret;
+			goto free_buf;
+		}
 		dev->procfs.mode = val;
 		if (val & RKISP_PROCFS_DUMP_MEM)
 			rkisp_proc_dump_mem(dev);
@@ -1410,13 +1448,57 @@ static ssize_t rkisp_proc_write(struct file *file,
 		   (RKISP_PROCFS_FIL_AIQ | RKISP_PROCFS_FIL_SW)) {
 		char *p_reg, *p_val;
 
+		if (!rkisp_proc_hw_ready_for_mmio(dev)) {
+			dev_warn_ratelimited(dev->dev,
+				"%s: skip MMIO (isp_state=0x%x suspend=%d mode=0x%x) cmd='%s'\n",
+				__func__, dev->isp_state, dev->is_suspend,
+				dev->procfs.mode, buf);
+			out = -ENODEV;
+			goto free_buf;
+		}
+
+		/*
+		 * Keep the HW powered for the whole register burst. On
+		 * multi-device ISP the vir device's RPM get pulls hw_dev.
+		 * Prefer hw_dev->dev when available (actual MMIO owner).
+		 */
+		pm_dev = dev->hw_dev->dev ? dev->hw_dev->dev : dev->dev;
+		pm_ret = pm_runtime_get_sync(pm_dev);
+		if (pm_ret < 0) {
+			pm_runtime_put_noidle(pm_dev);
+			dev_err_ratelimited(dev->dev,
+				"%s: pm_runtime_get_sync failed (%d), skip MMIO cmd='%s'\n",
+				__func__, pm_ret, buf);
+			out = pm_ret;
+			goto free_buf;
+		}
+		need_pm = true;
+
+		if (!rkisp_proc_hw_ready_for_mmio(dev)) {
+			dev_warn_ratelimited(dev->dev,
+				"%s: ISP left ready window after RPM get (state=0x%x), skip\n",
+				__func__, dev->isp_state);
+			out = -ENODEV;
+			goto put_pm;
+		}
+
 		p_reg = buf;
 		tmp = strstr(p_reg, "=");
 		while (tmp) {
 			*tmp = '\0';
 			ret = kstrtou32(p_reg, 16, &reg);
-			if (ret)
-				goto end;
+			if (ret) {
+				out = ret;
+				goto put_pm;
+			}
+			/* Refuse obviously out-of-range offsets into the ISP SW map. */
+			if (reg >= RKISP_ISP_SW_REG_SIZE || (reg & 0x3)) {
+				dev_warn_ratelimited(dev->dev,
+					"%s: reject bad reg 0x%x\n",
+					__func__, reg);
+				out = -EINVAL;
+				goto put_pm;
+			}
 			p_val = tmp + 1;
 			tmp = strstr(p_val, " ");
 			if (tmp) {
@@ -1424,8 +1506,10 @@ static ssize_t rkisp_proc_write(struct file *file,
 				p_reg = tmp + 1;
 			}
 			ret = kstrtou32(p_val, 16, &val);
-			if (ret)
-				goto end;
+			if (ret) {
+				out = ret;
+				goto put_pm;
+			}
 			if (dev->procfs.mode & RKISP_PROCFS_FIL_SW)
 				writel(val, dev->hw_dev->base_addr + reg);
 			else
@@ -1434,9 +1518,12 @@ static ssize_t rkisp_proc_write(struct file *file,
 			tmp = strstr(p_reg, "=");
 		}
 	}
-end:
+put_pm:
+	if (need_pm)
+		pm_runtime_put_sync(pm_dev);
+free_buf:
 	vfree(buf);
-	return user_len;
+	return out;
 }
 
 static int isp_open(struct inode *inode, struct file *file)

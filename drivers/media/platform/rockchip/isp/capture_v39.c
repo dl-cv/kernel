@@ -1033,12 +1033,14 @@ static int isp_frame_end(struct rkisp_stream *stream, u32 irq)
  * is processing and we should set up buffer for next-next frame,
  * otherwise it will overflow.
  */
+
 static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 {
 	struct rkisp_device *dev = stream->ispdev;
 	struct capture_fmt *isp_fmt = &stream->out_isp_fmt;
 	unsigned long lock_flags = 0;
 	struct rkisp_buffer *buf = NULL;
+	u64 sof_ns = dev->isp_sdev.frm_timestamp;
 	u32 i, seq;
 
 	if (stream->id == RKISP_STREAM_VIR)
@@ -1050,12 +1052,26 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		if (stream->id == RKISP_STREAM_MP && dev->cap_dev.wrap_line)
 			return 0;
 		spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+		/*
+		 * wait_line can fire very close to the normal MI frame interrupt.
+		 * If IRQ wins first, FRAME_WORK must not consume the next buffer;
+		 * if FRAME_WORK wins first, IRQ must only advance the queue.  The
+		 * SOF timestamp uniquely identifies both callbacks as one frame.
+		 */
+		if (sof_ns && stream->early_done_sof_ns == sof_ns) {
+			spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+			if (state == FRAME_IRQ)
+				goto end;
+			return 0;
+		}
 		if (state == FRAME_IRQ && stream->curr_buf)
 			stream->frame_early = false;
 		else
 			stream->frame_early = true;
 		buf = stream->curr_buf;
 		stream->curr_buf = NULL;
+		if (buf && sof_ns)
+			stream->early_done_sof_ns = sof_ns;
 		spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
 		if ((!stream->frame_early && state == FRAME_WORK) ||
 		    (stream->frame_early && state == FRAME_IRQ))
@@ -1071,8 +1087,81 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		struct vb2_buffer *vb2_buf = &buf->vb.vb2_buf;
 		struct rkisp_stream *vir = &dev->cap_dev.stream[RKISP_STREAM_VIR];
 		u64 ns = 0;
+		bool ft_diag = dev->cap_dev.is_done_early &&
+			       stream->id == RKISP_STREAM_MP;
 
+		if (stream->id == RKISP_STREAM_MP) {
+			u32 drop = READ_ONCE(dev->cap_dev.early_done_drop_left);
+			/*
+			 * 2026-08-12 #1009 (fix #1008 IRQ hole, ceiling-force doc §11):
+			 * mon→FT is ~100% ceiling-force. Quarantine order must be
+			 * drop → warm → pub_gate on BOTH early WORK and MI FE IRQ.
+			 *
+			 * #1008 bug: warm_drop required frame_early, so IRQ (early=0)
+			 * with warm>0 fell into gate_drop and burned pub_gate while
+			 * warm was still high; first mi_pub then landed mid-warm with
+			 * gate already 0 (line0 green). CamOS post residual cannot fix.
+			 *
+			 * #1009:
+			 *  - warm_drop: any MP complete while warm>0 (IRQ+WORK)
+			 *  - gate_drop: only after drop==0 && warm==0 (still covers IRQ)
+			 * CamOS SMARTCAM_TRIGGER_WARMUP must cover skip+drop+warm+gate.
+			 */
+			u32 warm = READ_ONCE(dev->cap_dev.early_done_warmup_left);
+			u32 gate = READ_ONCE(dev->cap_dev.early_done_pub_gate_left);
+			/* Warm quarantine is path-agnostic (IRQ and early WORK). */
+			bool warm_drop = ft_diag && warm;
+			/*
+			 * Gate starts only after drop+warm are exhausted. IRQ pubs
+			 * after warm still consume gate (#1006 r1); they must NOT
+			 * steal gate during warm (#1007 intent, restored for IRQ).
+			 */
+			bool gate_drop = ft_diag && gate && !drop && !warm;
+
+			if (drop || warm_drop || gate_drop) {
+				if (drop)
+					WRITE_ONCE(dev->cap_dev.early_done_drop_left,
+						   drop - 1);
+				/*
+				 * Consume warm on the publish path when early-done did
+				 * not already decrement it (IRQ / non-early completes).
+				 * early complete already did warm-- before mi_frame_end;
+				 * do not double-count those.
+				 */
+				if (warm_drop && !stream->frame_early)
+					WRITE_ONCE(dev->cap_dev.early_done_warmup_left,
+						   warm - 1);
+				if (gate_drop)
+					WRITE_ONCE(dev->cap_dev.early_done_pub_gate_left,
+						   gate - 1);
+				if (ft_diag) {
+					WRITE_ONCE(dev->cap_dev.early_done_diag_drop,
+						   READ_ONCE(dev->cap_dev.early_done_diag_drop) + 1);
+					rkisp_n1trace_info(&dev->v4l2_dev,
+						  "n1trace mi_drop state=%s left=%u warm=%u gate=%u cnt=%u early=%d sof=%llu t_ns=%llu\n",
+						  state == FRAME_WORK ? "WORK" :
+						  state == FRAME_IRQ ? "IRQ" : "OTH",
+						  READ_ONCE(dev->cap_dev.early_done_drop_left),
+						  READ_ONCE(dev->cap_dev.early_done_warmup_left),
+						  READ_ONCE(dev->cap_dev.early_done_pub_gate_left),
+						  READ_ONCE(dev->cap_dev.early_done_diag_drop),
+						  stream->frame_early, sof_ns,
+						  ktime_get_ns());
+				}
+				spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+				list_add_tail(&buf->queue, &stream->buf_queue);
+				spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+				goto end;
+			}
+		}
 		if (dev->skip_frame || stream->skip_frame) {
+			if (ft_diag)
+				rkisp_n1trace_info(&dev->v4l2_dev,
+					  "n1trace mi_skip_frame state=%s skip=%u dev_skip=%u sof=%llu t_ns=%llu\n",
+					  state == FRAME_WORK ? "WORK" :
+					  state == FRAME_IRQ ? "IRQ" : "OTH",
+					  stream->skip_frame, dev->skip_frame,
+					  sof_ns, ktime_get_ns());
 			spin_lock_irqsave(&stream->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &stream->buf_queue);
 			spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
@@ -1126,7 +1215,20 @@ static int mi_frame_end(struct rkisp_stream *stream, u32 state)
 		stream->dbg.delay = ns - dev->isp_sdev.frm_timestamp;
 		stream->dbg.timestamp = ns;
 		stream->dbg.id = seq;
-
+		if (ft_diag) {
+			WRITE_ONCE(dev->cap_dev.early_done_diag_pub,
+				   READ_ONCE(dev->cap_dev.early_done_diag_pub) + 1);
+			rkisp_n1trace_info(&dev->v4l2_dev,
+				  "n1trace mi_pub state=%s vb_seq=%u early=%d drop_left=%u warm=%u gate=%u pub=%u sof=%llu t_ns=%llu\n",
+				  state == FRAME_WORK ? "WORK" :
+				  state == FRAME_IRQ ? "IRQ" : "OTH",
+				  seq, stream->frame_early,
+				  READ_ONCE(dev->cap_dev.early_done_drop_left),
+				  READ_ONCE(dev->cap_dev.early_done_warmup_left),
+				  READ_ONCE(dev->cap_dev.early_done_pub_gate_left),
+				  READ_ONCE(dev->cap_dev.early_done_diag_pub),
+				  sof_ns, ns);
+		}
 		if (vir->streaming && vir->conn_id == stream->id) {
 			spin_lock_irqsave(&vir->vbq_lock, lock_flags);
 			list_add_tail(&buf->queue, &dev->cap_dev.vir_cpy.queue);
@@ -1490,6 +1592,7 @@ rkisp_start_streaming(struct vb2_queue *queue, unsigned int count)
 	}
 
 	memset(&stream->dbg, 0, sizeof(stream->dbg));
+	stream->early_done_sof_ns = 0;
 
 	atomic_inc(&dev->cap_dev.refcnt);
 	if (!dev->isp_inp || !stream->linked) {

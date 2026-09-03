@@ -13,6 +13,8 @@
  *   2. trigger-path: write to sysfs "echo 1 > ..." - fallback for software trigger
  * - Optional result LEDs: ok-led-gpios / ng-led-gpios; sysfs "result" (ok/ng/off),
  *   "result_led_enable"; each external trigger clears LEDs before camera action.
+ * - Runtime gate: sysfs "enable" (0/1). Disabling masks the input IRQ, cancels
+ *   queued work and drops pending triggers before returning.
  *
  * When trigger-output-gpios is set, keep a single owner for that output GPIO.
  * If another node already claims the same pin, remove one side in DT.
@@ -87,6 +89,11 @@ struct trigger_dev {
 	bool			mode_use_gpio;
 	struct mutex		mode_mutex;
 
+	/* 外部触发总门闩；默认开启，模式/ROI 切换期间由 sysfs enable 关闭 */
+	bool			enabled;
+	/* Serializes IRQ masking and pending-work cancellation. */
+	struct mutex		enable_mutex;
+
 	/* 结果指示灯：DT ok-led-gpios / ng-led-gpios；逻辑 0=inactive(灭) 1=active(亮) */
 	struct gpio_desc	*ok_led_gpiod;
 	struct gpio_desc	*ng_led_gpiod;
@@ -101,6 +108,7 @@ struct trigger_dev {
 	atomic64_t		irq_count;
 	atomic64_t		trigger_ok_count;
 	atomic64_t		trigger_fail_count;
+	atomic64_t		trigger_suppressed_count;
 	u32			max_pending;
 	u64			last_irq_ns;
 };
@@ -163,9 +171,13 @@ static int trigger_dev_set_input_mode(struct trigger_dev *tdev,
 				      enum trigger_dev_input_mode mode)
 {
 	unsigned int irq_type = trigger_dev_irq_type_for_mode(tdev, mode);
+	bool enabled;
 	int ret;
 
-	disable_irq(tdev->irq);
+	mutex_lock(&tdev->enable_mutex);
+	enabled = READ_ONCE(tdev->enabled);
+	if (enabled)
+		disable_irq(tdev->irq);
 	cancel_delayed_work_sync(&tdev->debounce_work);
 
 	ret = irq_set_irq_type(tdev->irq, irq_type);
@@ -175,7 +187,51 @@ static int trigger_dev_set_input_mode(struct trigger_dev *tdev,
 			WRITE_ONCE(tdev->input_mode, mode);
 	}
 
-	enable_irq(tdev->irq);
+	if (enabled)
+		enable_irq(tdev->irq);
+	mutex_unlock(&tdev->enable_mutex);
+	return ret;
+}
+
+static int trigger_dev_set_enabled(struct trigger_dev *tdev, bool enabled)
+{
+	int dropped;
+	int ret = 0;
+
+	mutex_lock(&tdev->enable_mutex);
+	if (enabled == READ_ONCE(tdev->enabled))
+		goto out;
+
+	if (!enabled) {
+		/* Publish the closed gate before waiting for any in-flight handler. */
+		WRITE_ONCE(tdev->enabled, false);
+		disable_irq(tdev->irq);
+		cancel_delayed_work_sync(&tdev->debounce_work);
+		cancel_work_sync(&tdev->trigger_work);
+
+		dropped = atomic_xchg(&tdev->trigger_pending, 0);
+		if (dropped > 0)
+			atomic64_add(dropped, &tdev->trigger_suppressed_count);
+
+		if (tdev->output_gpiod)
+			gpiod_set_value_cansleep(tdev->output_gpiod, 0);
+
+		if (tdev->pressed) {
+			tdev->pressed = false;
+			input_report_key(tdev->input, tdev->key_code, 0);
+			input_sync(tdev->input);
+		}
+	} else {
+		atomic_set(&tdev->trigger_pending, 0);
+		ret = trigger_dev_refresh_pressed_state(tdev);
+		if (ret)
+			goto out;
+		WRITE_ONCE(tdev->enabled, true);
+		enable_irq(tdev->irq);
+	}
+
+out:
+	mutex_unlock(&tdev->enable_mutex);
 	return ret;
 }
 
@@ -283,6 +339,11 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 
 	/* Drain pending triggers (presses) */
 	while (atomic_dec_if_positive(&tdev->trigger_pending) >= 0) {
+		if (!READ_ONCE(tdev->enabled)) {
+			atomic64_inc(&tdev->trigger_suppressed_count);
+			continue;
+		}
+
 		mutex_lock(&tdev->led_mutex);
 		if (tdev->result_led_enable)
 			trigger_dev_leds_off_locked(tdev);
@@ -327,6 +388,9 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 
 static void trigger_dev_handle_state(struct trigger_dev *tdev, bool pressed_now)
 {
+	if (!READ_ONCE(tdev->enabled))
+		return;
+
 	if (pressed_now == tdev->pressed)
 		return;
 
@@ -375,6 +439,10 @@ static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 
 	tdev->last_irq_ns = ktime_get_ns();
 	atomic64_inc(&tdev->irq_count);
+	if (!READ_ONCE(tdev->enabled)) {
+		atomic64_inc(&tdev->trigger_suppressed_count);
+		return IRQ_HANDLED;
+	}
 
 	/*
 	 * Fast edge mode:
@@ -516,7 +584,9 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	tdev->dev = dev;
 	platform_set_drvdata(pdev, tdev);
 	mutex_init(&tdev->mode_mutex);
+	mutex_init(&tdev->enable_mutex);
 	mutex_init(&tdev->led_mutex);
+	WRITE_ONCE(tdev->enabled, true);
 
 	/*
 	 * Primary DT property: input-gpios (con_id = "input")
@@ -555,6 +625,7 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	atomic64_set(&tdev->irq_count, 0);
 	atomic64_set(&tdev->trigger_ok_count, 0);
 	atomic64_set(&tdev->trigger_fail_count, 0);
+	atomic64_set(&tdev->trigger_suppressed_count, 0);
 	tdev->max_pending = 0;
 	tdev->last_irq_ns = 0;
 
@@ -590,7 +661,7 @@ static int trigger_dev_probe(struct platform_device *pdev)
 
 	gpio = desc_to_gpio(tdev->input_gpiod);
 	active_low = gpiod_is_active_low(tdev->input_gpiod);
-	dev_info(dev, "ready: gpio=%d irq=%d active_low=%d input_mode=%s debounce_ms=%u key_code=%u mode=%s\n",
+	dev_info(dev, "ready: gpio=%d irq=%d active_low=%d input_mode=%s debounce_ms=%u key_code=%u mode=%s enabled=%d\n",
 		 gpio,
 		 tdev->irq,
 		 active_low,
@@ -598,7 +669,8 @@ static int trigger_dev_probe(struct platform_device *pdev)
 		 tdev->debounce_ms,
 		 tdev->key_code,
 		 tdev->output_gpiod ?
-		 "direct-gpio-pulse" : "sysfs-write");
+		 "direct-gpio-pulse" : "sysfs-write",
+		 READ_ONCE(tdev->enabled));
 	if (tdev->input_mode == TRIGGER_DEV_INPUT_MODE_BUTTON &&
 	    !tdev->debounce_ms)
 		dev_warn(dev, "button input mode is selected with debounce-ms=0; mechanical keys may still bounce\n");
@@ -665,6 +737,36 @@ static ssize_t input_mode_store(struct device *dev,
 	return count;
 }
 static DEVICE_ATTR_RW(input_mode);
+
+/* Sysfs: enable (0=屏蔽外部触发并清空 pending, 1=允许外部触发) */
+static ssize_t enable_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(tdev->enabled));
+}
+
+static ssize_t enable_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+
+	ret = trigger_dev_set_enabled(tdev, enabled);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "external trigger %s\n", enabled ? "enabled" : "disabled");
+	return count;
+}
+static DEVICE_ATTR_RW(enable);
 
 /* Sysfs: mode (gpio|sysfs) */
 static ssize_t mode_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -874,10 +976,12 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 	u64 ago_us = tdev->last_irq_ns ? div_u64(now - tdev->last_irq_ns, 1000) : 0;
 
 	return sysfs_emit(buf,
-			  "irq=%lld ok=%lld fail=%lld pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u\n",
+			  "enabled=%d irq=%lld ok=%lld fail=%lld suppressed=%lld pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u\n",
+			  READ_ONCE(tdev->enabled),
 			  atomic64_read(&tdev->irq_count),
 			  atomic64_read(&tdev->trigger_ok_count),
 			  atomic64_read(&tdev->trigger_fail_count),
+			  atomic64_read(&tdev->trigger_suppressed_count),
 			  atomic_read(&tdev->trigger_pending),
 			  tdev->max_pending,
 			  ago_us,
@@ -888,6 +992,7 @@ static DEVICE_ATTR_RO(stats);
 
 static struct attribute *trigger_dev_attrs[] = {
 	&dev_attr_input_mode.attr,
+	&dev_attr_enable.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_pulse_count.attr,
 	&dev_attr_pulse_interval_us.attr,
@@ -930,5 +1035,3 @@ module_platform_driver(trigger_dev_driver);
 MODULE_DESCRIPTION("Generic GPIO input trigger device (camera trigger + optional result LEDs)");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
-
-

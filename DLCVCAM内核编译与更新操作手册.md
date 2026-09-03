@@ -20,7 +20,54 @@ which aarch64-linux-gnu-gcc
 
 ## 2. 编译内核
 
-### 2.1 初次配置（仅需执行一次）
+### 2.1 日期构建编号规则
+
+DLCVCAM 发布内核使用仓库根目录的 `DLCVCAM_BUILD_VERSION` 作为构建编号，
+格式固定为：
+
+```text
+YYYYMMDDNN
+```
+
+其中 `YYYYMMDD` 是发布日期，`NN` 是当天两位序号，从 `01` 开始。例如：
+
+```text
+2026072201
+```
+
+合入 `master` 前必须把该文件更新为实际合入日期；同一天发布多个内核时依次使用
+`01`、`02`、`03`。不要通过修改 `VERSION/PATCHLEVEL/SUBLEVEL` 记录发布日期，
+这样可以保持 `uname -r` 和 `/lib/modules/6.1.99-rk3576` 路径稳定。
+
+开发机查看仓库默认构建编号：
+
+```bash
+cat DLCVCAM_BUILD_VERSION
+make -s dlcvcam-build-version
+```
+
+板卡刷入对应内核后查看：
+
+```bash
+uname -v
+cat /proc/version
+```
+
+输出示例：
+
+```text
+#2026072201 SMP Wed Jul 22 10:46:10 CST 2026
+```
+
+正常发布构建不需要再手工传入 `KBUILD_BUILD_VERSION`。CI 或临时构建仍可显式传入
+该变量覆盖仓库值，但交付镜像必须使用 `DLCVCAM_BUILD_VERSION` 中已提交的编号。
+建议镜像文件名同时记录构建编号和 Git 短提交，例如：
+
+```text
+boot-rk3576-6.1.99-2026072201-e8c10e0f.img
+```
+
+### 2.2 初次配置（仅需执行一次）
 
 ```bash
 cd /home/ypw/kernel
@@ -36,7 +83,7 @@ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lubancat_linux_rk3576_defconfig
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 ```
 
-### 2.2 增量编译（日常修改后）
+### 2.3 增量编译（日常修改后）
 
 ```bash
 cd /home/ypw/kernel
@@ -65,6 +112,13 @@ BOOT_ITS=boot.its ./scripts/mkimg --dtb dlcvcam-rk3576.dtb
 
 ```bash
 mkimage -l boot.img
+```
+
+同时确认本次编译使用的日期构建编号：
+
+```bash
+make -s ARCH=arm64 O=/path/to/kernel-out dlcvcam-build-version
+# 2026072201
 ```
 
 ---
@@ -113,35 +167,117 @@ sudo rkdeveloptool rd                               # 重启
 
 ---
 
-## 4. 完整编译更新脚本
+## 4. 完整编译更新脚本（推荐）
 
-在编译主机上创建 `build_bootimg.sh`：
+> **推荐日常使用仓库根目录的 `build_bootimg.sh`**（见下）。  
+> 防砖（U-Boot FIT fallback / boot-try、recovery 金镜像、confirm 服务）**不在本仓库实现**：  
+> - U-Boot：https://github.com/dl-cv/u-boot/pull/1 （`tools/dlcvcam/` 含 confirm 脚本协议副本）  
+> - CamOS Admin：seed recovery、安装 boot-try / WDT、维护脚本 `dlcvcam_sync_boot_to_recovery.sh`
+
+### 4.1 一键编译
 
 ```bash
-#!/bin/bash
-set -e
+cd /path/to/kernel   # 本仓库
 
-cd /home/ypw/kernel
+./build_bootimg.sh
 
-echo "[1/4] 增量编译内核..."
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules -j8
+# 内存较小时降低并行度
+./build_bootimg.sh -j4
 
-echo "[2/4] 生成 Image.lz4..."
-lz4 -f arch/arm64/boot/Image arch/arm64/boot/Image.lz4
+# 强制重新 defconfig + 合并裁剪配置
+./build_bootimg.sh --force-config
 
-echo "[3/4] 打包 boot.img..."
-BOOT_ITS=boot.its ./scripts/mkimg --dtb dlcvcam-rk3576.dtb
+# 删除 .config 后走完整初次配置
+./build_bootimg.sh --clean-config
 
-echo "[4/4] 提示：如需更新内核模块（如 WiFi/BT 驱动等），请执行："
-echo "  sudo make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_install INSTALL_MOD_PATH=/path/to/rootfs"
-
-echo ""
-echo "完成！"
-ls -lh boot.img
-
-echo ""
-echo "下一步：通过 RKDevTool 或 rkdeveloptool 烧录 boot.img"
+# 不自动改写 DLCVCAM_BUILD_VERSION（沿用文件当前值）
+./build_bootimg.sh --no-bump
 ```
+
+### 4.2 脚本会做什么
+
+1. **构建编号**：按 `DLCVCAM_BUILD_VERSION`（`YYYYMMDDNN`）规则自动 bump（见 §2.1）。  
+2. **配置**：无合适 `.config` 时 `lubancat_linux_rk3576_defconfig` + `dlcvcam_rk3576_kernel_cut.config`。  
+3. **编译打包**：`Image` / `dtbs` / `modules` → `Image.lz4` → `boot.img`（FIT）。  
+4. **交付文件名**（同时保留根目录 `boot.img`）：
+
+```text
+boot-rk3576-6.1.99-<YYYYMMDDNN>-<git短sha[.dirty]>.img
+```
+
+5. **完整性 sidecar（无签名，仅整包 hash）**：为 `boot.img` 与交付镜像各生成：
+
+```text
+<镜像>.sha256         # 整包 SHA-256（sha256sum 格式）
+```
+
+交付物就是 **`.img` + `.sha256`**，不再生成 `.dlcvcam.json`。
+
+FIT 镜像本身在打包时已写入各 image 的内嵌 `sha256`（见 `boot.its`）。校验时两层分工：
+
+| 检查 | 依据 | 作用 |
+|------|------|------|
+| 整包 SHA-256 | `<img>.sha256` | 发现下载截断、拷贝损坏、**传错成另一份合法旧包** |
+| FIT 内嵌 hash | boot.img 内 fdt/kernel/resource 的 sha256 节点 | 发现 payload 被改；**不依赖 sidecar** 也能查内容损坏 |
+
+`.sha256` **不能替代签名**，只作运维防呆。
+
+### 4.3 编译完成后
+
+```bash
+ls -lh boot.img boot-rk3576-*.img boot-rk3576-*.img.sha256
+mkimage -l boot.img
+
+# 本地再验一次（打包脚本结束时已自检）
+python3 scripts/dlcvcam_verify_bootimg.py verify boot-rk3576-*.img --require-sidecar
+```
+
+### 4.4 板卡上传后、烧录前校验（推荐）
+
+把**镜像 + `.sha256`（建议连同校验脚本）**一起拷到板子，例如 `/tmp`：
+
+```bash
+# 在板卡上（需 python3）
+python3 scripts/dlcvcam_verify_bootimg.py verify /tmp/boot-rk3576-....img \
+  --require-sidecar
+# 退出码 0 才允许烧录；非 0 则重新传输，不要 wl/dd
+
+# 无 python 时也可用：
+# sha256sum -c /tmp/boot-rk3576-....img.sha256
+```
+
+只带了镜像、没有 `.sha256` 时，仍可只验 FIT 内嵌 hash：
+
+```bash
+python3 scripts/dlcvcam_verify_bootimg.py verify /tmp/boot-rk3576-....img
+```
+
+对已有镜像补生成 `.sha256`（开发机）：
+
+```bash
+python3 scripts/dlcvcam_verify_bootimg.py gen-sidecar boot-rk3576-....img
+```
+
+下一步：校验通过后，用第 3 节的 RKDevTool 或 `rkdeveloptool` 烧录（或经 **CamOS Admin** 内核升级面板）。
+
+### 4.5 防砖与 recovery（外链，本仓不提供脚本）
+
+| 能力 | 仓库 / 位置 |
+|------|-------------|
+| boot FIT 坏 → 读 recovery | [u-boot#1](https://github.com/dl-cv/u-boot/pull/1) `fit.c` |
+| 合法 FIT 起不来 → boot-try 计数 | 同上；misc@48KiB `DCBT` |
+| multi-user 后清计数 | u-boot `tools/dlcvcam/` + **Admin** 安装 confirm unit |
+| recovery 金镜像 status/sync/restore | **CamOS Admin** `dlcvcam_sync_boot_to_recovery.sh` |
+| 硬挂复位 | Admin `10-dlcvcam-watchdog.conf`（`RuntimeWatchdogSec`） |
+| 升级前 seed recovery / 只写 boot | Admin 内核升级逻辑 |
+
+板端完整说明（sync / boot-try / confirm / 看门狗 / 检查表）：CamOS `docs/admin/DLCVCAM内核防砖与金镜像维护.md`。
+
+**原则（产品路径）：**
+
+- 日常升级**只写 boot**；recovery 为金镜像，稳定后才手工提升。  
+- 不使用完整 userspace bootguard 状态机。  
+- 板端安装与操作以 Admin 上述文档及 u-boot `tools/dlcvcam/README.md` 为准。
 
 ---
 
@@ -150,6 +286,9 @@ echo "下一步：通过 RKDevTool 或 rkdeveloptool 烧录 boot.img"
 ```bash
 # 查看 FIT 镜像内容
 mkimage -l boot.img
+
+# 完整性校验（整包 + FIT 内嵌 hash，无签名）
+python3 scripts/dlcvcam_verify_bootimg.py verify boot.img --require-sidecar
 
 # 查看 eMMC 分区表
 fdisk -l /dev/mmcblk0

@@ -203,6 +203,21 @@ endif
 this-makefile := $(lastword $(MAKEFILE_LIST))
 abs_srctree := $(realpath $(dir $(this-makefile)))
 
+# DLCVCAM release build identifier. Keep the Linux release and module path
+# stable (for example 6.1.99-rk3576), while exposing a date-based identifier
+# through UTS_VERSION (`uname -v`) on the target board. A command-line
+# KBUILD_BUILD_VERSION still takes precedence for temporary/CI builds.
+DLCVCAM_BUILD_VERSION_FILE := $(abs_srctree)/DLCVCAM_BUILD_VERSION
+DLCVCAM_BUILD_VERSION := $(strip $(shell cat $(DLCVCAM_BUILD_VERSION_FILE) 2>/dev/null))
+DLCVCAM_BUILD_VERSION_VALID := $(shell printf '%s\n' '$(DLCVCAM_BUILD_VERSION)' | \
+	grep -Eq '^[0-9]{8}(0[1-9]|[1-9][0-9])$$' && echo y)
+ifneq ($(DLCVCAM_BUILD_VERSION_VALID),y)
+$(error DLCVCAM_BUILD_VERSION must use YYYYMMDDNN with NN in 01..99)
+endif
+KBUILD_BUILD_VERSION ?= $(DLCVCAM_BUILD_VERSION)
+
+export DLCVCAM_BUILD_VERSION KBUILD_BUILD_VERSION
+
 ifneq ($(words $(subst :, ,$(abs_srctree))), 1)
 $(error source directory cannot contain spaces or colons)
 endif
@@ -286,7 +301,8 @@ no-dot-config-targets := $(clean-targets) \
 			 cscope gtags TAGS tags help% %docs check% coccicheck \
 			 $(version_h) headers headers_% archheaders archscripts \
 			 %asm-generic kernelversion %src-pkg dt_binding_check \
-			 outputmakefile rustavailable rustfmt rustfmtcheck
+			 outputmakefile rustavailable rustfmt rustfmtcheck \
+			 dlcvcam-build-version
 # Installation targets should not require compiler. Unfortunately, vdso_install
 # is an exception where build artifacts may be updated. This must be fixed.
 no-compiler-targets := $(no-dot-config-targets) install dtbs_install \
@@ -1687,6 +1703,7 @@ help:
 	@echo  '  gtags           - Generate GNU GLOBAL index'
 	@echo  '  kernelrelease	  - Output the release version string (use with make -s)'
 	@echo  '  kernelversion	  - Output the version stored in Makefile (use with make -s)'
+	@echo  '  dlcvcam-build-version - Output the date-based DLCVCAM build identifier'
 	@echo  '  image_name	  - Output the image name (use with make -s)'
 	@echo  '  headers_install - Install sanitised kernel headers to INSTALL_HDR_PATH'; \
 	 echo  '                    (default: $(INSTALL_HDR_PATH))'; \
@@ -2095,7 +2112,7 @@ coccicheck:
 export_report:
 	$(PERL) $(srctree)/scripts/export_report.pl
 
-PHONY += checkstack kernelrelease kernelversion image_name
+PHONY += checkstack kernelrelease kernelversion dlcvcam-build-version image_name
 
 # UML needs a little special treatment here.  It wants to use the host
 # toolchain, so needs $(SUBARCH) passed to checkstack.pl.  Everyone
@@ -2115,6 +2132,9 @@ kernelrelease:
 
 kernelversion:
 	@echo $(KERNELVERSION)
+
+dlcvcam-build-version:
+	@echo $(KBUILD_BUILD_VERSION)
 
 image_name:
 	@echo $(KBUILD_IMAGE)

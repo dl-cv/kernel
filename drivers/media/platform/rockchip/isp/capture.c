@@ -588,6 +588,8 @@ void rkisp_stream_buf_done_early(struct rkisp_device *dev)
 	if (!dev->cap_dev.is_done_early)
 		return;
 
+	/* Buffer drop is applied in mi_frame_end via early_done_drop_left. */
+
 	for (i = 0; i < RKISP_MAX_STREAM; i++) {
 		if (i == RKISP_STREAM_VIR || i == RKISP_STREAM_LUMA ||
 		    i == RKISP_STREAM_DMATX0 || i == RKISP_STREAM_DMATX1 ||
@@ -598,6 +600,381 @@ void rkisp_stream_buf_done_early(struct rkisp_device *dev)
 		    stream->ops && stream->ops->frame_end)
 			stream->ops->frame_end(stream, FRAME_WORK);
 	}
+}
+
+static void rkisp_early_done_store_deadline(struct rkisp_capture_device *cap_dev,
+					    u64 deadline_ns)
+{
+	WRITE_ONCE(cap_dev->early_done_deadline_ns_lo, lower_32_bits(deadline_ns));
+	WRITE_ONCE(cap_dev->early_done_deadline_ns_hi, upper_32_bits(deadline_ns));
+}
+
+static u64 rkisp_early_done_load_deadline(struct rkisp_capture_device *cap_dev)
+{
+	u32 lo = READ_ONCE(cap_dev->early_done_deadline_ns_lo);
+	u32 hi = READ_ONCE(cap_dev->early_done_deadline_ns_hi);
+
+	return ((u64)hi << 32) | lo;
+}
+
+/*
+ * Live MI byte progress. On V39 FT the classic OFFS_CNT_SHD often sticks at 0
+ * for the whole open frame (logs: y=0/need base=0 saw=1 → permanent
+ * ceiling-miss → MI FE only on next XTRIG → N-1 phase). Sample both the SHD
+ * and the START (live) views and take the larger — whichever register is
+ * actually ticking on this silicon wins.
+ */
+static u32 rkisp_early_done_read_y_offs(struct rkisp_device *dev)
+{
+	u32 shd = rkisp_read(dev, CIF_MI_MP_Y_OFFS_CNT_SHD, true);
+	u32 start = rkisp_read(dev, CIF_MI_MP_Y_OFFS_CNT_START, true);
+
+	return max(shd, start);
+}
+
+static u32 rkisp_early_done_read_cb_offs(struct rkisp_device *dev)
+{
+	u32 shd = rkisp_read(dev, CIF_MI_MP_CB_OFFS_CNT_SHD, true);
+	u32 start = rkisp_read(dev, CIF_MI_MP_CB_OFFS_CNT_START, true);
+
+	return max(shd, start);
+}
+
+static void rkisp_early_done_cache_mi_sizes(struct rkisp_device *dev)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+	struct rkisp_stream *mp = &cap_dev->stream[RKISP_STREAM_MP];
+	u32 y_size = 0, cb_size = 0;
+
+	/*
+	 * Prefer the shadow programmed size (bytes the MI will write this
+	 * frame). Fall back to plane sizeimage from the MP format.
+	 */
+	if (mp->streaming) {
+		y_size = rkisp_read(dev, CIF_MI_MP_Y_SIZE_SHD, true);
+		cb_size = rkisp_read(dev, CIF_MI_MP_CB_SIZE_SHD, true);
+		if (!y_size && mp->out_fmt.num_planes >= 1)
+			y_size = mp->out_fmt.plane_fmt[0].sizeimage;
+		if (!cb_size && mp->out_fmt.num_planes >= 2)
+			cb_size = mp->out_fmt.plane_fmt[1].sizeimage;
+		/* Single-plane NV12: chroma is the second half. */
+		if (y_size && !cb_size && mp->out_fmt.num_planes == 1)
+			cb_size = y_size / 2;
+	}
+
+	WRITE_ONCE(cap_dev->early_done_mi_y_size, y_size);
+	WRITE_ONCE(cap_dev->early_done_mi_cb_size, cb_size);
+	/* Baseline at arm: detect later decrease/reset as live activity. */
+	WRITE_ONCE(cap_dev->early_done_mi_y_base,
+		   rkisp_early_done_read_y_offs(dev));
+	WRITE_ONCE(cap_dev->early_done_mi_cb_base,
+		   rkisp_early_done_read_cb_offs(dev));
+	WRITE_ONCE(cap_dev->early_done_mi_saw_y, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_saw_cb, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_ready, 0);
+}
+
+/*
+ * MI offs often still hold the previous buffer's final counts across an FT
+ * SOF, or stay stuck at 0 on SHD while START advances (V39). Require evidence
+ * of a live frame before trusting full (== need):
+ *   - offs below programmed size (classic ramp), or
+ *   - offs decreased vs the value sampled at arm (counter finally rolled), or
+ *   - offs is zero (counter reset at SOF / new buffer).
+ * Without this, residual offs==need makes saw_* stuck at 0; with SHD stuck at
+ * 0, every FT frame ceiling-misses and forces completion onto the next XTRIG
+ * (N-1 phase).
+ */
+static bool rkisp_early_done_mi_finished(struct rkisp_device *dev)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+	u32 y_need = READ_ONCE(cap_dev->early_done_mi_y_size);
+	u32 cb_need = READ_ONCE(cap_dev->early_done_mi_cb_size);
+	u32 y_base = READ_ONCE(cap_dev->early_done_mi_y_base);
+	u32 cb_base = READ_ONCE(cap_dev->early_done_mi_cb_base);
+	u32 y_offs = 0, cb_offs = 0;
+	bool y_full = true, cb_full = true;
+
+	if (!y_need && !cb_need)
+		return false;
+
+	if (y_need) {
+		y_offs = rkisp_early_done_read_y_offs(dev);
+		if (y_offs < y_need || y_offs < y_base || y_offs == 0)
+			WRITE_ONCE(cap_dev->early_done_mi_saw_y, 1);
+		y_full = READ_ONCE(cap_dev->early_done_mi_saw_y) &&
+			 (y_offs >= y_need);
+	}
+
+	if (cb_need) {
+		cb_offs = rkisp_early_done_read_cb_offs(dev);
+		if (cb_offs < cb_need || cb_offs < cb_base || cb_offs == 0)
+			WRITE_ONCE(cap_dev->early_done_mi_saw_cb, 1);
+		cb_full = READ_ONCE(cap_dev->early_done_mi_saw_cb) &&
+			  (cb_offs >= cb_need);
+	}
+
+	return y_full && cb_full;
+}
+
+/* Snapshot current offs for ceiling-miss diagnostics (IRQ/timer context). */
+static void rkisp_early_done_sample_offs(struct rkisp_device *dev,
+					 u32 *y_offs, u32 *cb_offs)
+{
+	*y_offs = rkisp_early_done_read_y_offs(dev);
+	*cb_offs = rkisp_early_done_read_cb_offs(dev);
+}
+
+static u32 rkisp_early_done_post_hold_us(struct rkisp_capture_device *cap_dev,
+					 bool force_path)
+{
+	u32 left = READ_ONCE(cap_dev->early_done_warmup_left);
+	u32 warm = READ_ONCE(cap_dev->early_done_warmup_post_mi_us);
+	u32 steady = READ_ONCE(cap_dev->early_done_post_mi_us);
+	u32 force = READ_ONCE(cap_dev->early_done_force_post_mi_us);
+	u32 residual = READ_ONCE(cap_dev->early_done_delay_us);
+	u32 hold;
+
+	/* Warmup after free-run/ROI→FT is always the most conservative. */
+	if (left && warm)
+		hold = warm;
+	else
+		hold = steady;
+
+	/*
+	 * Ceiling-force means MI offs never verified. Board evidence:
+	 * - 1456x592 green bot~8 with residual+16ms
+	 * - 1456x1088 mon→FT head frames still green with force=45ms (2026-08-10)
+	 * Floor at force_post; add most of residual again so short ROI and
+	 * full-height mode-switch cannot under-hold after wait_line. Warmup
+	 * frames already prefer warm post; still raise force floor over them.
+	 */
+	if (force_path) {
+		u32 extra = residual - (residual / 4); /* ~3/4 residual */
+
+		if (force > hold)
+			hold = force;
+		if (extra) {
+			if (hold < U32_MAX - extra)
+				hold += extra;
+			else
+				hold = U32_MAX;
+		}
+	}
+	return hold;
+}
+
+/*
+ * Fast-trigger completion after wait_line (OUT_FRM_HALF):
+ *
+ * Completing when ISP_OUT_LINE hits the V39 terminal (height - 8) publishes
+ * buffers with an ~8-row green bottom band — the counter saturates before MI
+ * finishes the last rows / chroma. MI SHD can also hold the previous buffer's
+ * final offsets across FT SOF, so require a live ramp before trusting full.
+ *
+ * Even after MI reports full, last NV12 chroma may still be in flight → hold
+ * post_mi_us (longer for the first few FT frames after mode/ROI switch).
+ *
+ * On residual ceiling without verified MI: ceiling-force + force_post hold
+ * (N-1 phase). Still never complete at bare wait_line without that hold.
+ */
+static enum hrtimer_restart rkisp_early_done_timer(struct hrtimer *timer)
+{
+	struct rkisp_capture_device *cap_dev =
+		container_of(timer, struct rkisp_capture_device, early_done_timer);
+	struct rkisp_device *dev = cap_dev->ispdev;
+	u64 armed_sof = READ_ONCE(cap_dev->early_done_armed_sof_ns);
+	u64 cur_sof = dev->isp_sdev.frm_timestamp;
+	u64 deadline = rkisp_early_done_load_deadline(cap_dev);
+	u64 now = ktime_get_ns();
+	u32 poll_us = READ_ONCE(cap_dev->early_done_poll_us);
+	u32 post_us;
+
+	if (!armed_sof || (cur_sof && armed_sof != cur_sof)) {
+		/* Stale arm — next SOF already won. */
+		WRITE_ONCE(cap_dev->early_done_armed_sof_ns, 0);
+		WRITE_ONCE(cap_dev->early_done_mi_ready, 0);
+		atomic_set(&cap_dev->early_done_pending, 0);
+		return HRTIMER_NORESTART;
+	}
+
+	if (!READ_ONCE(cap_dev->early_done_mi_ready)) {
+		if (rkisp_early_done_mi_finished(dev)) {
+			WRITE_ONCE(cap_dev->early_done_mi_ready, 1);
+			post_us = rkisp_early_done_post_hold_us(cap_dev, false);
+			if (post_us) {
+				hrtimer_forward_now(timer,
+					ns_to_ktime((u64)post_us * NSEC_PER_USEC));
+				return HRTIMER_RESTART;
+			}
+			/* fall through to complete */
+		} else if (!deadline || now < deadline) {
+			if (!poll_us)
+				poll_us = 50;
+			hrtimer_forward_now(timer,
+				ns_to_ktime((u64)poll_us * NSEC_PER_USEC));
+			return HRTIMER_RESTART;
+		} else {
+			/*
+			 * Ceiling without verified MI. On V39+IMX296 FT the
+			 * MI OFFS_CNT_* views often stay 0 for the whole open
+			 * frame (see y_shd/y_st logs), so the live-ramp check
+			 * can never succeed. Abandoning to MI FE then waits
+			 * for the *next* XTRIG to close the MIPI frame →
+			 * published content is always one shot behind (N-1).
+			 *
+			 * Residual ceiling already covers remaining lines
+			 * after wait_line; fall through the post-MI hold so
+			 * last NV12 chroma can land, then complete. This is
+			 * safer than green-band force-at-wait_line and fixes
+			 * the N-1 phase lock.
+			 */
+			WRITE_ONCE(cap_dev->early_done_diag_ceiling,
+				   READ_ONCE(cap_dev->early_done_diag_ceiling) + 1);
+			{
+				u32 yo = 0, co = 0;
+				u32 y_shd, y_st, cb_shd, cb_st;
+
+				rkisp_early_done_sample_offs(dev, &yo, &co);
+				y_shd = rkisp_read(dev, CIF_MI_MP_Y_OFFS_CNT_SHD, true);
+				y_st = rkisp_read(dev, CIF_MI_MP_Y_OFFS_CNT_START, true);
+				cb_shd = rkisp_read(dev, CIF_MI_MP_CB_OFFS_CNT_SHD, true);
+				cb_st = rkisp_read(dev, CIF_MI_MP_CB_OFFS_CNT_START, true);
+				rkisp_n1trace_info(&dev->v4l2_dev,
+					  "n1trace early ceiling-force sof=%llu cnt=%u y=%u/%u base=%u saw=%u cb=%u/%u base=%u saw=%u y_shd=%u y_st=%u cb_shd=%u cb_st=%u t_ns=%llu\n",
+					  armed_sof,
+					  READ_ONCE(cap_dev->early_done_diag_ceiling),
+					  yo, READ_ONCE(cap_dev->early_done_mi_y_size),
+					  READ_ONCE(cap_dev->early_done_mi_y_base),
+					  READ_ONCE(cap_dev->early_done_mi_saw_y),
+					  co, READ_ONCE(cap_dev->early_done_mi_cb_size),
+					  READ_ONCE(cap_dev->early_done_mi_cb_base),
+					  READ_ONCE(cap_dev->early_done_mi_saw_cb),
+					  y_shd, y_st, cb_shd, cb_st,
+					  ktime_get_ns());
+			}
+			WRITE_ONCE(cap_dev->early_done_mi_ready, 1);
+			post_us = rkisp_early_done_post_hold_us(cap_dev, true);
+			if (post_us) {
+				hrtimer_forward_now(timer,
+					ns_to_ktime((u64)post_us * NSEC_PER_USEC));
+				return HRTIMER_RESTART;
+			}
+			/* fall through to complete */
+		}
+	}
+
+	/* MI ready + post-MI hold elapsed (or post_us was 0). */
+	if (READ_ONCE(cap_dev->early_done_warmup_left))
+		WRITE_ONCE(cap_dev->early_done_warmup_left,
+			   READ_ONCE(cap_dev->early_done_warmup_left) - 1);
+
+	WRITE_ONCE(cap_dev->early_done_diag_complete,
+		   READ_ONCE(cap_dev->early_done_diag_complete) + 1);
+	rkisp_n1trace_info(&dev->v4l2_dev,
+		  "n1trace early complete sof=%llu warm_left=%u cnt=%u t_ns=%llu\n",
+		  armed_sof,
+		  READ_ONCE(cap_dev->early_done_warmup_left),
+		  READ_ONCE(cap_dev->early_done_diag_complete),
+		  ktime_get_ns());
+
+	rkisp_stream_buf_done_early(dev);
+	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_ready, 0);
+	rkisp_early_done_store_deadline(cap_dev, 0);
+	atomic_set(&cap_dev->early_done_pending, 0);
+	return HRTIMER_NORESTART;
+}
+
+void rkisp_stream_buf_done_early_drain(struct rkisp_device *dev,
+				       u32 ceiling_us)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+	u64 sof_ns = dev->isp_sdev.frm_timestamp;
+	u32 skip, poll_us;
+	u64 deadline;
+
+	if (!cap_dev->is_done_early)
+		return;
+
+	/* First SOFs after free-run/ROI→FT: use real MI FE only. */
+	skip = READ_ONCE(cap_dev->early_done_skip_frames);
+	if (skip) {
+		WRITE_ONCE(cap_dev->early_done_skip_frames, skip - 1);
+		WRITE_ONCE(cap_dev->early_done_diag_skip_sof,
+			   READ_ONCE(cap_dev->early_done_diag_skip_sof) + 1);
+		rkisp_n1trace_info(&dev->v4l2_dev,
+			  "n1trace early skip-sof left=%u cnt=%u sof=%llu t_ns=%llu\n",
+			  skip - 1,
+			  READ_ONCE(cap_dev->early_done_diag_skip_sof),
+			  sof_ns, ktime_get_ns());
+		return;
+	}
+
+	if (atomic_cmpxchg(&cap_dev->early_done_pending, 0, 1))
+		return;
+
+	rkisp_early_done_cache_mi_sizes(dev);
+	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, sof_ns);
+	WRITE_ONCE(cap_dev->early_done_diag_arm,
+		   READ_ONCE(cap_dev->early_done_diag_arm) + 1);
+	rkisp_n1trace_info(&dev->v4l2_dev,
+		  "n1trace early arm sof=%llu ceiling_us=%u cnt=%u t_ns=%llu\n",
+		  sof_ns,
+		  ceiling_us ? ceiling_us : READ_ONCE(cap_dev->early_done_delay_us),
+		  READ_ONCE(cap_dev->early_done_diag_arm),
+		  ktime_get_ns());
+
+	if (!ceiling_us)
+		ceiling_us = READ_ONCE(cap_dev->early_done_delay_us);
+	if (!ceiling_us)
+		ceiling_us = 10000;
+	deadline = ktime_get_ns() + (u64)ceiling_us * NSEC_PER_USEC;
+	rkisp_early_done_store_deadline(cap_dev, deadline);
+
+	poll_us = READ_ONCE(cap_dev->early_done_poll_us);
+	if (!poll_us)
+		poll_us = 50;
+
+	hrtimer_start(&cap_dev->early_done_timer,
+		      ns_to_ktime((u64)poll_us * NSEC_PER_USEC),
+		      HRTIMER_MODE_REL);
+}
+
+void rkisp_stream_buf_done_early_delayed(struct rkisp_device *dev,
+					 u32 delay_us)
+{
+	/* Prefer MI-drain path; delay_us is the safety ceiling. */
+	rkisp_stream_buf_done_early_drain(dev, delay_us);
+}
+
+void rkisp_early_done_clear_state(struct rkisp_device *dev)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+
+	WRITE_ONCE(cap_dev->early_done_armed_sof_ns, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_y_size, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_cb_size, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_saw_y, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_saw_cb, 0);
+	WRITE_ONCE(cap_dev->early_done_mi_ready, 0);
+	rkisp_early_done_store_deadline(cap_dev, 0);
+	atomic_set(&cap_dev->early_done_pending, 0);
+}
+
+void rkisp_stream_cancel_early_done(struct rkisp_device *dev)
+{
+	struct rkisp_capture_device *cap_dev = &dev->cap_dev;
+	int ret;
+
+	if (in_interrupt()) {
+		ret = hrtimer_try_to_cancel(&cap_dev->early_done_timer);
+		if (ret < 0)
+			return;
+	} else {
+		hrtimer_cancel(&cap_dev->early_done_timer);
+	}
+	rkisp_early_done_clear_state(dev);
 }
 
 int rkisp_stream_buf_cnt(struct rkisp_stream *stream)
@@ -1911,6 +2288,11 @@ int rkisp_register_stream_vdevs(struct rkisp_device *dev)
 	memset(cap_dev, 0, sizeof(*cap_dev));
 	cap_dev->ispdev = dev;
 	atomic_set(&cap_dev->refcnt, 0);
+	atomic_set(&cap_dev->early_done_pending, 0);
+	cap_dev->early_done_armed_sof_ns = 0;
+	hrtimer_init(&cap_dev->early_done_timer, CLOCK_MONOTONIC,
+		     HRTIMER_MODE_REL);
+	cap_dev->early_done_timer.function = rkisp_early_done_timer;
 
 	if (dev->isp_ver <= ISP_V13) {
 		if (dev->isp_ver == ISP_V12) {
@@ -1962,6 +2344,8 @@ int rkisp_register_stream_vdevs(struct rkisp_device *dev)
 
 void rkisp_unregister_stream_vdevs(struct rkisp_device *dev)
 {
+	rkisp_stream_cancel_early_done(dev);
+
 	if (dev->isp_ver <= ISP_V13)
 		rkisp_unregister_stream_v1x(dev);
 	else if (dev->isp_ver == ISP_V20)
