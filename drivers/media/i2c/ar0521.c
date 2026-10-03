@@ -2389,7 +2389,7 @@ static long ar0521_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		    sync_mode != INTERNAL_MASTER_MODE)
 			ret = -EINVAL;
 		else
-			sensor->sync_mode = INTERNAL_MASTER_MODE;
+			sensor->sync_mode = sync_mode;
 		break;
 	default:
 		ret = -ENOIOCTLCMD;
