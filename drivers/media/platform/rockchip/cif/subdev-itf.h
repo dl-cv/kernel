@@ -9,6 +9,7 @@
 #define _RKCIF_SDITF_H
 
 #include <linux/mutex.h>
+#include <linux/rcupdate.h>
 #include <media/media-device.h>
 #include <media/media-entity.h>
 #include <media/v4l2-ctrls.h>
@@ -105,6 +106,7 @@ struct sditf_priv {
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_subdev *sensor_sd;
+	struct v4l2_subdev __rcu *terminal_sensor_sd;
 	struct sditf_work_struct buffree_work;
 	struct list_head buf_free_list;
 	struct sditf_frame_idx frame_idx;

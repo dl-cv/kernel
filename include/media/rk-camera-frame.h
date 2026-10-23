@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _MEDIA_RK_CAMERA_FRAME_H
+#define _MEDIA_RK_CAMERA_FRAME_H
+
+#include <linux/bits.h>
+
+#define RK_CAMERA_FRAME_START	BIT(0)
+#define RK_CAMERA_FRAME_END	BIT(1)
+#define RK_CAMERA_FRAME_ERROR	BIT(2)
+
+#define RK_CAMERA_FRAME_EVENTS	(RK_CAMERA_FRAME_START | \
+				 RK_CAMERA_FRAME_END | \
+				 RK_CAMERA_FRAME_ERROR)
+
+#endif

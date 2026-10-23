@@ -16,9 +16,11 @@
 #include <linux/reset.h>
 #include <linux/pm_runtime.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/rcupdate.h>
 #include <linux/regmap.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/v4l2-fwnode.h>
+#include <media/rk-camera-frame.h>
 #include "dev.h"
 #include <linux/regulator/consumer.h>
 #include <linux/rk-camera-module.h>
@@ -704,6 +706,36 @@ static long sditf_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	}
 
 	return -EINVAL;
+}
+
+static int sditf_interrupt_service_routine(struct v4l2_subdev *sd, u32 status,
+					   bool *handled)
+{
+	struct sditf_priv *priv = to_sditf_priv(sd);
+	struct v4l2_subdev *sensor_sd;
+	bool sensor_handled = false;
+
+	if (!handled)
+		return -EINVAL;
+	*handled = false;
+
+	if (status != RK_CAMERA_FRAME_START &&
+	    status != RK_CAMERA_FRAME_END &&
+	    status != RK_CAMERA_FRAME_ERROR)
+		return -EINVAL;
+
+	if (priv->mode.rdbk_mode >= RKISP_VICAP_RDBK_AIQ)
+		return 0;
+
+	rcu_read_lock();
+	sensor_sd = rcu_dereference(priv->terminal_sensor_sd);
+	if (sensor_sd)
+		v4l2_subdev_call(sensor_sd, core, interrupt_service_routine,
+				 status, &sensor_handled);
+	rcu_read_unlock();
+
+	*handled = sensor_handled;
+	return 0;
 }
 
 #ifdef CONFIG_COMPAT
@@ -1542,6 +1574,7 @@ static const struct v4l2_subdev_core_ops sditf_core_ops = {
 	.subscribe_event = sditf_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 	.ioctl = sditf_ioctl,
+	.interrupt_service_routine = sditf_interrupt_service_routine,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl32 = sditf_compat_ioctl32,
 #endif
@@ -1712,6 +1745,7 @@ static int sditf_notifier_bound(struct v4l2_async_notifier *notifier,
 				 sditf->sensor_sd->name);
 	}
 	sditf->sensor_sd = subdev;
+	rcu_assign_pointer(sditf->terminal_sensor_sd, subdev);
 	++sditf->num_sensors;
 
 	v4l2_err(subdev, "Async registered subdev\n");
@@ -1727,6 +1761,8 @@ static void sditf_notifier_unbind(struct v4l2_async_notifier *notifier,
 						struct sditf_priv,
 						notifier);
 
+	RCU_INIT_POINTER(sditf->terminal_sensor_sd, NULL);
+	synchronize_rcu();
 	sditf->sensor_sd = NULL;
 }
 
@@ -1887,7 +1923,10 @@ static int rkcif_subdev_remove(struct platform_device *pdev)
 {
 	struct media_entity *me = platform_get_drvdata(pdev);
 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(me);
+	struct sditf_priv *priv = to_sditf_priv(sd);
 
+	RCU_INIT_POINTER(priv->terminal_sensor_sd, NULL);
+	synchronize_rcu();
 	media_entity_cleanup(&sd->entity);
 
 	pm_runtime_disable(&pdev->dev);
