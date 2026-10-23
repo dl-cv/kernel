@@ -712,8 +712,7 @@ static int sditf_interrupt_service_routine(struct v4l2_subdev *sd, u32 status,
 					   bool *handled)
 {
 	struct sditf_priv *priv = to_sditf_priv(sd);
-	struct v4l2_subdev *sensor_sd;
-	bool sensor_handled = false;
+	struct fwnode_handle *terminal;
 
 	if (!handled)
 		return -EINVAL;
@@ -728,13 +727,13 @@ static int sditf_interrupt_service_routine(struct v4l2_subdev *sd, u32 status,
 		return 0;
 
 	rcu_read_lock();
-	sensor_sd = rcu_dereference(priv->terminal_sensor_sd);
-	if (sensor_sd)
-		v4l2_subdev_call(sensor_sd, core, interrupt_service_routine,
-				 status, &sensor_handled);
+	terminal = rcu_dereference(priv->cif_dev->terminal_sensor_fwnode);
+	if (terminal) {
+		rk_camera_frame_notify(terminal, status);
+		*handled = true;
+	}
 	rcu_read_unlock();
 
-	*handled = sensor_handled;
 	return 0;
 }
 
@@ -1745,7 +1744,6 @@ static int sditf_notifier_bound(struct v4l2_async_notifier *notifier,
 				 sditf->sensor_sd->name);
 	}
 	sditf->sensor_sd = subdev;
-	rcu_assign_pointer(sditf->terminal_sensor_sd, subdev);
 	++sditf->num_sensors;
 
 	v4l2_err(subdev, "Async registered subdev\n");
@@ -1761,8 +1759,6 @@ static void sditf_notifier_unbind(struct v4l2_async_notifier *notifier,
 						struct sditf_priv,
 						notifier);
 
-	RCU_INIT_POINTER(sditf->terminal_sensor_sd, NULL);
-	synchronize_rcu();
 	sditf->sensor_sd = NULL;
 }
 
@@ -1797,7 +1793,10 @@ static int sditf_subdev_notifier(struct sditf_priv *sditf)
 		return ret;
 	}
 
-	return v4l2_async_register_subdev(&sditf->sd);
+	ret = v4l2_async_register_subdev(&sditf->sd);
+	if (!ret)
+		atomic_set(&sditf->is_async_registered, 1);
+	return ret;
 }
 
 static int sditf_count_port_nodes(struct device_node *root_node)
@@ -1859,6 +1858,7 @@ static int rkcif_subdev_media_init(struct sditf_priv *priv)
 	priv->toisp_inf.ch_info[1].is_valid = false;
 	priv->toisp_inf.ch_info[2].is_valid = false;
 	priv->is_toisp_off = true;
+	atomic_set(&priv->is_async_registered, 0);
 	if (priv->port_count > 1)
 		sditf_subdev_notifier(priv);
 	atomic_set(&priv->power_cnt, 0);
@@ -1874,6 +1874,14 @@ static int rkcif_subdev_media_init(struct sditf_priv *priv)
 	priv->hdr_wrap_line = 0;
 	priv->is_buf_init = false;
 	return 0;
+}
+
+void sditf_unregister_isp(struct sditf_priv *priv)
+{
+	if (!atomic_cmpxchg(&priv->is_async_registered, 1, 0))
+		return;
+
+	v4l2_async_unregister_subdev(&priv->sd);
 }
 
 static int rkcif_subdev_probe(struct platform_device *pdev)
@@ -1924,9 +1932,18 @@ static int rkcif_subdev_remove(struct platform_device *pdev)
 	struct media_entity *me = platform_get_drvdata(pdev);
 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(me);
 	struct sditf_priv *priv = to_sditf_priv(sd);
+	struct rkcif_device *cif_dev = priv->cif_dev;
 
-	RCU_INIT_POINTER(priv->terminal_sensor_sd, NULL);
-	synchronize_rcu();
+	if (priv->port_count > 1) {
+		v4l2_async_nf_unregister(&priv->notifier);
+		v4l2_async_nf_cleanup(&priv->notifier);
+	}
+	sditf_unregister_isp(priv);
+	if (cif_dev && priv->connect_id >= 0 &&
+	    priv->connect_id < cif_dev->sditf_cnt &&
+	    cif_dev->sditf[priv->connect_id] == priv)
+		cif_dev->sditf[priv->connect_id] = NULL;
+	priv->cif_dev = NULL;
 	media_entity_cleanup(&sd->entity);
 
 	pm_runtime_disable(&pdev->dev);

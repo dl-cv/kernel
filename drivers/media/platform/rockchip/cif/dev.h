@@ -8,7 +8,10 @@
 #ifndef _RKCIF_DEV_H
 #define _RKCIF_DEV_H
 
+#include <linux/fwnode.h>
 #include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
 #include <media/media-device.h>
 #include <media/media-entity.h>
 #include <media/v4l2-ctrls.h>
@@ -951,6 +954,9 @@ struct rkcif_device {
 	u32				num_sensors;
 	struct rkcif_sensor_info	*active_sensor;
 	struct rkcif_sensor_info	terminal_sensor;
+	struct fwnode_handle __rcu *terminal_sensor_fwnode;
+	spinlock_t			terminal_fwnode_lock;
+	bool				terminal_sensor_dying;
 
 	struct rkcif_stream		stream[RKCIF_MULTI_STREAMS_NUM];
 	struct rkcif_scale_vdev		scale_vdev[RKCIF_MULTI_STREAMS_NUM];
@@ -1105,6 +1111,8 @@ int rkcif_plat_init(struct rkcif_device *cif_dev, struct device_node *node, int 
 int rkcif_plat_uninit(struct rkcif_device *cif_dev);
 int rkcif_attach_hw(struct rkcif_device *cif_dev);
 int rkcif_update_sensor_info(struct rkcif_stream *stream);
+void rkcif_set_terminal_sensor_fwnode(struct rkcif_device *dev,
+					 struct fwnode_handle *fwnode);
 int rkcif_reset_notifier(struct notifier_block *nb, unsigned long action, void *data);
 void rkcif_reset_watchdog_timer_handler(struct timer_list *t);
 void rkcif_config_dvp_clk_sampling_edge(struct rkcif_device *dev,
