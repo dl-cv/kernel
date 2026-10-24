@@ -100,6 +100,9 @@ def main() -> None:
     tmp.mkdir(parents=True, exist_ok=True)
 
     source = SOURCE.read_text(encoding="utf-8")
+    probe = extract_function(source, "ar0521_probe")
+    if not re.search(r"^\s*sensor->grr_rearm\s*=\s*true;", probe, re.MULTILINE):
+        raise AssertionError("probe must enable GRR rearm without a userspace write")
     # Existing sysfs store returns int-or-size_t; preserve production code.
     functions = "\n\n".join(
         ("#pragma GCC diagnostic push\n"

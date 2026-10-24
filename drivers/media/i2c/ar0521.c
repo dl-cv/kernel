@@ -1860,7 +1860,7 @@ static ssize_t trigger_pulse_us_store(struct device *dev,
 
 static DEVICE_ATTR_RW(trigger_pulse_us);
 
-/* Qualification switch defaults off; errors require an explicit stream cycle. */
+/* Legacy fallback switch; errors require an explicit stream cycle. */
 static ssize_t grr_rearm_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
 {
@@ -3176,6 +3176,7 @@ static int ar0521_probe(struct i2c_client *client)
 	sensor->client = client;
 	sensor->sync_mode = INTERNAL_MASTER_MODE;
 	sensor->lane_count = AR0521_NUM_DATA_LANES;
+	sensor->grr_rearm = true;
 
 	ret = of_property_read_string(node, RKMODULE_CAMERA_SYNC_MODE,
 				      &sync_mode_name);
