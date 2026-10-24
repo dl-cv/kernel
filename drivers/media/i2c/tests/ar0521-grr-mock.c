@@ -150,6 +150,12 @@ struct ar0521 {
 	u64 grr_end_ns;
 	u64 grr_release_ns;
 	u64 grr_reclose_ns;
+	u32 grr_gate_calls;
+	u32 grr_gate_fail_call;
+	u16 grr_gate_target;
+	u16 grr_gate_actual;
+	int grr_gate_write_ret;
+	int grr_gate_read_ret;
 
 	struct v4l2_subdev sd;
 	struct ar0521_test_format format;
@@ -1035,6 +1041,74 @@ static void test_readback_mismatch(void)
 	case_end("gate readback mismatch");
 }
 
+static void test_gate_diagnostic_write_failure(void)
+{
+	case_begin();
+	g.fail_write_remaining = 1;
+	g.fail_write_reg = AR0521_REG_VD_TRIG_NEW_FRAME;
+	g.fail_write_value = AR0521_SLAVE_VD_TRIG;
+	CHECK_EQ(ar0521_grr_gate(&g.sensor, AR0521_SLAVE_VD_TRIG), -EIO,
+		 "gate write failure must propagate");
+	CHECK_EQ(g.sensor.grr_gate_fail_call, 1, "first failed gate recorded");
+	CHECK_EQ(g.sensor.grr_gate_target, AR0521_SLAVE_VD_TRIG, "target recorded");
+	CHECK_EQ(g.sensor.grr_gate_write_ret, -EIO, "write errno recorded");
+	CHECK_EQ(g.sensor.grr_gate_read_ret, -EINPROGRESS, "unattempted read explicit");
+	CHECK_EQ(ar0521_grr_gate(&g.sensor, AR0521_SLAVE_VD_TRIG), 0, "cleanup succeeds");
+	CHECK_EQ(g.sensor.grr_gate_fail_call, 1, "cleanup preserves first failure");
+	CHECK_EQ(g.sensor.grr_gate_write_ret, -EIO, "cleanup preserves errno");
+	case_end("gate diagnostics write failure survives cleanup");
+}
+
+static void test_gate_diagnostic_read_failure(void)
+{
+	case_begin();
+	g.fail_read_remaining = 1;
+	g.fail_read_reg = AR0521_REG_VD_TRIG_NEW_FRAME;
+	CHECK_EQ(ar0521_grr_gate(&g.sensor, 0), -EIO, "gate read failure propagates");
+	CHECK_EQ(g.sensor.grr_gate_fail_call, 1, "read failure gate recorded");
+	CHECK_EQ(g.sensor.grr_gate_write_ret, 0, "successful write recorded");
+	CHECK_EQ(g.sensor.grr_gate_read_ret, -EIO, "read errno recorded");
+	case_end("gate diagnostics read failure");
+}
+
+static void test_gate_diagnostic_reclose_mismatch(void)
+{
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	g.mismatch_vd_read = 3;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -EIO, "reclose mismatch fails");
+	CHECK_EQ(g.sensor.grr_gate_fail_call, 3, "post START reclose is gate 3");
+	CHECK_EQ(g.sensor.grr_gate_target, AR0521_SLAVE_VD_TRIG, "reclose target");
+	CHECK_EQ(g.sensor.grr_gate_actual, AR0521_SLAVE_VD_TRIG | BIT(0), "actual retained");
+	CHECK_EQ(g.sensor.grr_gate_write_ret, 0, "mismatch is not write errno");
+	CHECK_EQ(g.sensor.grr_gate_read_ret, 0, "mismatch is not read errno");
+	CHECK_EQ(g.sensor.grr_gate_calls, 4, "cleanup gate still executed");
+	CHECK_EQ(count_events(EV_WAIT), 1, "failed reclose does not wait END");
+	case_end("gate diagnostics reclose mismatch survives cleanup");
+}
+
+static void test_gate_diagnostic_transaction_reset(void)
+{
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	g.sensor.grr_gate_calls = 9;
+	g.sensor.grr_gate_fail_call = 7;
+	g.sensor.grr_gate_target = 123;
+	g.sensor.grr_gate_actual = 124;
+	g.sensor.grr_gate_write_ret = -EIO;
+	g.sensor.grr_gate_read_ret = -EIO;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0, "new transaction succeeds");
+	CHECK_EQ(g.sensor.grr_gate_calls, 4, "new transaction gate count reset");
+	CHECK_EQ(g.sensor.grr_gate_fail_call, 0, "old failure cleared");
+	CHECK_EQ(g.sensor.grr_gate_target, 0, "old target cleared");
+	CHECK_EQ(g.sensor.grr_gate_actual, 0, "old actual cleared");
+	CHECK_EQ(g.sensor.grr_gate_write_ret, 0, "old write error cleared");
+	CHECK_EQ(g.sensor.grr_gate_read_ret, 0, "old read error cleared");
+	case_end("gate diagnostics reset at new transaction");
+}
+
 static void test_reclose_timeout(void)
 {
 	int ret;
@@ -1163,6 +1237,10 @@ int main(void)
 	test_queue_rejected();
 	test_unstarted_work_cancel_no_vd();
 	test_readback_mismatch();
+	test_gate_diagnostic_write_failure();
+	test_gate_diagnostic_read_failure();
+	test_gate_diagnostic_reclose_mismatch();
+	test_gate_diagnostic_transaction_reset();
 	test_reclose_timeout();
 	test_pwm_idle_failure_preserves_error();
 	test_notify_other_terminal_no_state_change();
@@ -1174,6 +1252,6 @@ int main(void)
 		printf("RESULT: FAIL (%d checks)\n", failures);
 		return 1;
 	}
-	printf("RESULT: PASS (21 state-machine cases)\n");
+	printf("RESULT: PASS (25 state-machine cases)\n");
 	return 0;
 }

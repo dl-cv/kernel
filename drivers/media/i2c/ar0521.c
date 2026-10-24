@@ -329,6 +329,13 @@ struct ar0521 {
 	u64 grr_end_ns;
 	u64 grr_release_ns;
 	u64 grr_reclose_ns;
+	/* First failed gate only; cleanup must not overwrite its evidence. */
+	u32 grr_gate_calls;
+	u32 grr_gate_fail_call;
+	u16 grr_gate_target;
+	u16 grr_gate_actual;
+	int grr_gate_write_ret;
+	int grr_gate_read_ret;
 
 	bool streaming;
 	bool power_on;
@@ -1459,13 +1466,24 @@ static void ar0521_grr_pwm_work(struct work_struct *work)
 
 static int ar0521_grr_gate(struct ar0521 *sensor, u16 value)
 {
-	u16 actual;
-	int ret;
+	u16 actual = 0;
+	int write_ret, read_ret = -EINPROGRESS, ret;
 
-	ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME, value);
-	if (!ret)
-		ret = ar0521_read_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME, &actual);
-	return ret ? ret : (actual == value ? 0 : -EIO);
+	sensor->grr_gate_calls++;
+	write_ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME, value);
+	if (!write_ret)
+		read_ret = ar0521_read_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME, &actual);
+	ret = write_ret ? write_ret : read_ret;
+	if (!ret && actual != value)
+		ret = -EIO;
+	if (ret && !sensor->grr_gate_fail_call) {
+		sensor->grr_gate_fail_call = sensor->grr_gate_calls;
+		sensor->grr_gate_target = value;
+		sensor->grr_gate_actual = actual;
+		sensor->grr_gate_write_ret = write_ret;
+		sensor->grr_gate_read_ret = read_ret;
+	}
+	return ret;
 }
 
 /* Keep the qualified rearm settling intervals; shorter waits and the full
@@ -1518,6 +1536,12 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 	atomic_set(&sensor->grr_phase, AR0521_GRR_WAIT_START);
 	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
 
+	sensor->grr_gate_calls = 0;
+	sensor->grr_gate_fail_call = 0;
+	sensor->grr_gate_target = 0;
+	sensor->grr_gate_actual = 0;
+	sensor->grr_gate_write_ret = 0;
+	sensor->grr_gate_read_ret = 0;
 	ret = ar0521_grr_gate(sensor, AR0521_SLAVE_VD_TRIG);
 	if (ret)
 		goto out;
@@ -1887,10 +1911,13 @@ static ssize_t grr_last_show(struct device *dev, struct device_attribute *attr,
 
 	mutex_lock(&sensor->mutex);
 	len = sysfs_emit(buf,
-		"ret=%d faulted=%u pwm_call_ns=%llu release_ns=%llu start_ns=%llu reclose_ns=%llu end_ns=%llu\n",
+		"ret=%d faulted=%u pwm_call_ns=%llu release_ns=%llu start_ns=%llu reclose_ns=%llu end_ns=%llu gate_calls=%u gate_fail_call=%u gate_target=0x%04x gate_actual=0x%04x gate_write_ret=%d gate_read_ret=%d\n",
 		sensor->grr_last_ret, sensor->grr_faulted, sensor->grr_pwm_call_ns,
 		sensor->grr_release_ns, sensor->grr_start_ns,
-		sensor->grr_reclose_ns, sensor->grr_end_ns);
+		sensor->grr_reclose_ns, sensor->grr_end_ns,
+		sensor->grr_gate_calls, sensor->grr_gate_fail_call,
+		sensor->grr_gate_target, sensor->grr_gate_actual,
+		sensor->grr_gate_write_ret, sensor->grr_gate_read_ret);
 	mutex_unlock(&sensor->mutex);
 	return len;
 }
