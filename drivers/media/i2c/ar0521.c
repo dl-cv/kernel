@@ -1307,6 +1307,8 @@ static int ar0521_quick_stream(struct ar0521 *sensor, bool on)
 {
 	int ret;
 
+	if (on && sensor->grr_faulted)
+		return -EIO;
 	if (!sensor->streaming || !pm_runtime_active(sensor->dev))
 		return -EINVAL;
 

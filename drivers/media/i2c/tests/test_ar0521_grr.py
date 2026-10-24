@@ -25,6 +25,7 @@ FUNCTION_NAMES = (
     "ar0521_grr_gate",
     "ar0521_grr_trigger_locked",
     "trigger_store",
+    "ar0521_quick_stream",
 )
 
 

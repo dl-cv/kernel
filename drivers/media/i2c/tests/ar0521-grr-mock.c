@@ -105,6 +105,8 @@ typedef struct {
 #define AR0521_REG_GLOBAL_READ_START 0x3166
 #define AR0521_REG_GLOBAL_READ_START_HI 0x3168
 #define AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR BIT(0)
+#define AR0521_REG_RESET 0x301A
+#define AR0521_REG_RESET_GPI BIT(8)
 #define AR0521_GRR_SCALE 512U
 #define AR0521_VT_PIX_CLK_HZ 205200000ULL
 #define AR0521_SLAVE_VD_TRIG 0x8000
@@ -231,8 +233,10 @@ struct mock_state {
 	int pwm_calls;
 	int init_trigger_pwm_calls;
 	int init_trigger_pwm_ret;
+	int stream_on_calls;
 	int stream_off_calls;
 	int stream_bit_ret;
+	int exit_lp11_calls;
 
 	int fail_write_remaining;
 	u16 fail_write_reg;
@@ -521,7 +525,9 @@ static int ar0521_init_trigger_pwm(struct ar0521 *sensor)
 static int ar0521_stream_bit(struct ar0521 *sensor, bool on)
 {
 	UNUSED(sensor);
-	if (!on) {
+	if (on) {
+		g.stream_on_calls++;
+	} else {
 		g.stream_off_calls++;
 		record_event(EV_STREAM_OFF, 0, 0, 1,
 			     atomic_read(&g.sensor.grr_phase),
@@ -633,6 +639,14 @@ static int kstrtouint(const char *buf, unsigned int base, unsigned int *value)
 #define mutex_lock(lock) UNUSED(lock)
 #define mutex_unlock(lock) UNUSED(lock)
 static int ar0521_trigger_once_locked(struct ar0521 *sensor);
+#define pm_runtime_active(dev) (UNUSED(dev), true)
+
+static int ar0521_exit_lp11_locked(struct ar0521 *sensor)
+{
+	UNUSED(sensor);
+	g.exit_lp11_calls++;
+	return 0;
+}
 
 /* ACTUAL_FUNCTIONS */
 
@@ -1366,6 +1380,49 @@ static void test_notify_idle_returns_done(void)
 	case_end("notifier IDLE returns NOTIFY_DONE");
 }
 
+static void test_quick_stream_fault_isolation(void)
+{
+	int events_before, stream_off_before;
+
+	case_begin();
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -ETIMEDOUT,
+		 "real GRR START timeout establishes fault");
+	CHECK_TRUE(g.sensor.grr_faulted, "GRR timeout must set faulted");
+	events_before = g.event_count;
+	stream_off_before = g.stream_off_calls;
+	CHECK_EQ(ar0521_quick_stream(&g.sensor, true), -EIO,
+		 "faulted quick-on must return EIO");
+	CHECK_EQ(g.event_count, events_before,
+		 "faulted quick-on must not reach hardware operations");
+	CHECK_EQ(g.stream_off_calls, stream_off_before,
+		 "faulted quick-on must not stop stream");
+	CHECK_EQ(g.exit_lp11_calls, 0, "faulted quick-on must not exit LP11");
+	stream_off_before = g.stream_off_calls;
+	CHECK_EQ(ar0521_quick_stream(&g.sensor, false), 0,
+		 "quick-off must remain allowed while faulted");
+	CHECK_EQ(g.stream_off_calls, stream_off_before + 1,
+		 "quick-off must execute the stream-off path");
+	CHECK_TRUE(g.sensor.grr_faulted, "quick-off must preserve fault state");
+	CHECK_EQ(g.exit_lp11_calls, 0, "quick-off must not exit LP11");
+	case_end("quick_stream fault isolation");
+}
+
+static void test_quick_stream_nonfault_on(void)
+{
+	case_begin();
+	CHECK_EQ(ar0521_quick_stream(&g.sensor, true), 0,
+		 "non-fault quick-on must still succeed");
+	CHECK_EQ(g.exit_lp11_calls, 1,
+		 "non-fault quick-on must enter the normal LP11 path");
+	CHECK_EQ(g.stream_on_calls, 1,
+		 "non-fault quick-on must execute stream-on");
+	CHECK_TRUE(count_events(EV_REG_WRITE) > 0,
+		 "non-fault quick-on must execute normal register setup");
+	CHECK_TRUE(!g.sensor.grr_faulted,
+		 "non-fault quick-on must not create a fault");
+	case_end("quick_stream nonfault on preserved");
+}
+
 static void test_grr_trigger_fault_gate(void)
 {
 	int ret;
@@ -1594,11 +1651,13 @@ int main(void)
 	test_notify_same_terminal_enters_real_irq();
 	test_notify_idle_returns_done();
 	test_grr_trigger_fault_gate();
+	test_quick_stream_fault_isolation();
+	test_quick_stream_nonfault_on();
 
 	if (failures) {
 		printf("RESULT: FAIL (%d checks)\n", failures);
 		return 1;
 	}
-	printf("RESULT: PASS (47 state-machine cases)\n");
+	printf("RESULT: PASS (49 state-machine cases)\n");
 	return 0;
 }
