@@ -1609,20 +1609,23 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 		ret = -EPROTO;
 		goto out;
 	}
-	ret = ar0521_grr_gate(sensor, AR0521_SLAVE_VD_TRIG);
-	sensor->grr_reclose_ns = ktime_get_ns();
-	if (ret)
-		goto out;
-	if (sensor->grr_reclose_ns - READ_ONCE(sensor->grr_start_ns) > 8000000) {
-		ret = -ETIME;
-		goto out;
-	}
+	/* Diagnostic candidate: keep Slave disabled through the current readout.
+	 * Validate only at CIT=1556; short-CIT following ERS is not qualified.
+	 */
 	if (!wait_for_completion_timeout(&sensor->grr_end, end_timeout)) {
 		ret = -ETIMEDOUT;
 		goto out;
 	}
-	if (atomic_read(&sensor->grr_phase) != AR0521_GRR_DONE)
+	if (atomic_read(&sensor->grr_phase) != AR0521_GRR_DONE) {
 		ret = -EPROTO;
+		goto out;
+	}
+	ret = ar0521_grr_gate(sensor, AR0521_SLAVE_VD_TRIG);
+	sensor->grr_reclose_ns = ktime_get_ns();
+	if (ret)
+		goto out;
+	if (sensor->grr_reclose_ns - READ_ONCE(sensor->grr_end_ns) > 8000000)
+		ret = -ETIME;
 
 out:
 	/* Reclose first, then cancel pending PWM work or join running work.

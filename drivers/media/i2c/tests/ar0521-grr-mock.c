@@ -782,6 +782,29 @@ static void test_normal_exactly_one_shot(void)
 	case_end("normal exactly one shot");
 }
 
+static void test_reclose_follows_end(void)
+{
+	int i, close_index = -1, end_index = -1, close_count = 0;
+
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0, "END-gated transaction succeeds");
+	for (i = 0; i < g.event_count; i++) {
+		if (g.events[i].kind == EV_IRQ && g.events[i].value == RK_CAMERA_FRAME_END)
+			end_index = i;
+		if (g.events[i].kind == EV_REG_WRITE &&
+		    g.events[i].reg == AR0521_REG_VD_TRIG_NEW_FRAME &&
+		    g.events[i].value == AR0521_SLAVE_VD_TRIG && ++close_count == 2)
+			close_index = i;
+	}
+	CHECK_TRUE(end_index >= 0 && close_index > end_index,
+		   "normal reclose must follow current frame END, not START");
+	CHECK_TRUE(g.sensor.grr_reclose_ns >= g.sensor.grr_end_ns,
+		   "reclose timestamp must not precede END");
+	case_end("reclose only after END");
+}
+
 static void test_early_start_gate0_write(void)
 {
 	int ret;
@@ -1078,13 +1101,13 @@ static void test_gate_diagnostic_reclose_mismatch(void)
 	g.end_action = WAIT_END;
 	g.mismatch_vd_read = 3;
 	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -EIO, "reclose mismatch fails");
-	CHECK_EQ(g.sensor.grr_gate_fail_call, 3, "post START reclose is gate 3");
+	CHECK_EQ(g.sensor.grr_gate_fail_call, 3, "post END reclose is gate 3");
 	CHECK_EQ(g.sensor.grr_gate_target, AR0521_SLAVE_VD_TRIG, "reclose target");
 	CHECK_EQ(g.sensor.grr_gate_actual, AR0521_SLAVE_VD_TRIG | BIT(0), "actual retained");
 	CHECK_EQ(g.sensor.grr_gate_write_ret, 0, "mismatch is not write errno");
 	CHECK_EQ(g.sensor.grr_gate_read_ret, 0, "mismatch is not read errno");
 	CHECK_EQ(g.sensor.grr_gate_calls, 4, "cleanup gate still executed");
-	CHECK_EQ(count_events(EV_WAIT), 1, "failed reclose does not wait END");
+	CHECK_EQ(count_events(EV_WAIT), 2, "reclose failure follows END wait");
 	case_end("gate diagnostics reclose mismatch survives cleanup");
 }
 
@@ -1119,8 +1142,8 @@ static void test_reclose_timeout(void)
 	g.clock_step_ns = 9000000ULL;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, -ETIME, "reclose later than 8ms must return ETIME");
-	CHECK_EQ(count_events(EV_WAIT), 1,
-		 "reclose timeout must fail before waiting for END");
+	CHECK_EQ(count_events(EV_WAIT), 2,
+		 "reclose budget is measured after END");
 	CHECK_EQ(count_events(EV_CANCEL), 1,
 		 "reclose timeout must cancel already-pending work");
 	CHECK_EQ(g.pwm_calls, 0, "reclose timeout must not leave runnable work");
@@ -1223,6 +1246,7 @@ static void test_grr_trigger_fault_gate(void)
 int main(void)
 {
 	test_normal_exactly_one_shot();
+	test_reclose_follows_end();
 	test_early_start_gate0_write();
 	test_early_start_gate0_readback();
 	test_early_end();
@@ -1252,6 +1276,6 @@ int main(void)
 		printf("RESULT: FAIL (%d checks)\n", failures);
 		return 1;
 	}
-	printf("RESULT: PASS (25 state-machine cases)\n");
+	printf("RESULT: PASS (26 state-machine cases)\n");
 	return 0;
 }
