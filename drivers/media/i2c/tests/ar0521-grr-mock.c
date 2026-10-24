@@ -141,6 +141,7 @@ struct ar0521 {
 	struct notifier_block grr_frame_notifier;
 	atomic_t grr_phase;
 	atomic_t grr_released;
+	atomic_t grr_release_requested;
 	bool grr_rearm;
 	bool grr_faulted;
 	int grr_pwm_ret;
@@ -149,6 +150,7 @@ struct ar0521 {
 	u64 grr_start_ns;
 	u64 grr_end_ns;
 	u64 grr_release_ns;
+	u64 grr_release_request_ns;
 	u64 grr_reclose_ns;
 	u32 grr_gate_calls;
 	u32 grr_gate_fail_call;
@@ -230,10 +232,13 @@ struct mock_state {
 	u16 fail_write_value;
 	int fail_read_remaining;
 	u16 fail_read_reg;
+	u32 fail_read_gate_call;
 	int mismatch_vd_read;
 
-	bool inject_start_on_gate0_write;
-	bool inject_start_on_gate0_read;
+	bool inject_start_on_release_write;
+	bool inject_start_on_release_read;
+	bool inject_start_and_end_on_release_read;
+	bool inject_start_on_prepare_read;
 	bool inject_end_on_first_vd_read;
 
 	u16 vd_reg;
@@ -398,8 +403,8 @@ static int ar0521_write_reg(struct ar0521 *sensor, u16 reg, u16 value)
 		     atomic_read(&sensor->grr_released), 0);
 
 	if (reg == AR0521_REG_VD_TRIG_NEW_FRAME && value == 0 &&
-	    g.inject_start_on_gate0_write) {
-		g.inject_start_on_gate0_write = false;
+	    g.inject_start_on_release_write) {
+		g.inject_start_on_release_write = false;
 		mock_irq(RK_CAMERA_FRAME_START);
 	}
 	return 0;
@@ -409,6 +414,15 @@ static int ar0521_read_reg(struct ar0521 *sensor, u16 reg, u16 *value)
 {
 	u16 actual;
 
+	if (g.fail_read_gate_call &&
+	    g.sensor.grr_gate_calls == g.fail_read_gate_call &&
+	    reg == AR0521_REG_VD_TRIG_NEW_FRAME) {
+		record_event(EV_REG_READ, reg, 0, 0,
+			     atomic_read(&sensor->grr_phase),
+			     atomic_read(&sensor->grr_phase),
+			     atomic_read(&sensor->grr_released), 0);
+		return -EIO;
+	}
 	if (g.fail_read_remaining > 0 && reg == g.fail_read_reg) {
 		g.fail_read_remaining--;
 		record_event(EV_REG_READ, reg, 0, 0,
@@ -451,8 +465,17 @@ static int ar0521_read_reg(struct ar0521 *sensor, u16 reg, u16 *value)
 		     atomic_read(&sensor->grr_released), 0);
 
 	if (reg == AR0521_REG_VD_TRIG_NEW_FRAME && g.vd_reg == 0 &&
-	    g.inject_start_on_gate0_read) {
-		g.inject_start_on_gate0_read = false;
+	    g.inject_start_on_release_read) {
+		g.inject_start_on_release_read = false;
+		mock_irq(RK_CAMERA_FRAME_START);
+		if (g.inject_start_and_end_on_release_read) {
+			g.inject_start_and_end_on_release_read = false;
+			mock_irq(RK_CAMERA_FRAME_END);
+		}
+	}
+	if (reg == AR0521_REG_GPIO_GPO_2 && g.gpio_reads == 2 &&
+	    g.inject_start_on_prepare_read) {
+		g.inject_start_on_prepare_read = false;
 		mock_irq(RK_CAMERA_FRAME_START);
 	}
 	if (reg == AR0521_REG_VD_TRIG_NEW_FRAME && g.vd_reads == 1 &&
@@ -615,6 +638,7 @@ static void reset_mock(void)
 	init_completion(&g.sensor.grr_end);
 	atomic_set(&g.sensor.grr_phase, AR0521_GRR_IDLE);
 	atomic_set(&g.sensor.grr_released, 0);
+	atomic_set(&g.sensor.grr_release_requested, 0);
 	g.sensor.grr_pwm_work.func = ar0521_grr_pwm_work;
 	g.queue_result = true;
 	g.clock_step_ns = 1000000ULL;
@@ -679,6 +703,17 @@ static int last_event(enum event_kind kind)
 		if (g.events[i].kind == kind)
 			return i;
 	return -1;
+}
+
+static struct event *event_of_kind(enum event_kind kind, int ordinal)
+{
+	int i;
+
+	for (i = 0; i < g.event_count; i++) {
+		if (g.events[i].kind == kind && ordinal-- == 0)
+			return &g.events[i];
+	}
+	return NULL;
 }
 
 static int count_reg_write(u16 value, int success_only)
@@ -805,44 +840,133 @@ static void test_reclose_follows_end(void)
 	case_end("reclose only after END");
 }
 
-static void test_early_start_gate0_write(void)
+static void test_start_during_release_write(void)
 {
+	struct event *start;
 	int ret;
 
 	case_begin();
-	g.inject_start_on_gate0_write = true;
+	g.inject_start_on_release_write = true;
+	g.end_action = WAIT_END;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
-	CHECK_EQ(ret, -EPROTO, "START during gate0 write must fail closed");
-	CHECK_EQ(g.pwm_calls, 0, "rejected START must not emit PWM");
-	CHECK_EQ(count_events(EV_QUEUE), 1, "rejected START must cancel queued work");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "rejected START must cancel work");
-	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
-		 "rejected START must leave released clear");
-	CHECK_EQ(irq_event(RK_CAMERA_FRAME_START, 0)->released, 0,
-		 "gate0 write START must see released=0");
-	CHECK_TRUE(g.sensor.grr_faulted, "rejected START must fault");
-	check_failure_cleanup(EV_CANCEL);
-	case_end("early START during gate0 write");
+	CHECK_EQ(ret, 0, "START during release write must be buffered");
+	CHECK_EQ(g.pwm_calls, 1, "buffered START must preserve the one shot");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "buffered START must not fault");
+	CHECK_TRUE(!g.sensor.grr_faulted, "buffered START must not fault the sensor");
+	start = irq_event(RK_CAMERA_FRAME_START, 0);
+	CHECK_TRUE(start != NULL, "release write must deliver START");
+	if (start) {
+		CHECK_EQ(start->phase, AR0521_GRR_WAIT_START,
+			 "release write START must belong to WAIT_START");
+		CHECK_EQ(start->phase_after, AR0521_GRR_WAIT_END,
+			 "release write START must enter WAIT_END");
+		CHECK_EQ(start->released, 0,
+			 "release write START must precede released confirmation");
+	}
+	CHECK_TRUE(g.sensor.grr_release_request_ns > 0,
+		   "release request timestamp must be recorded");
+	CHECK_TRUE(g.sensor.grr_release_request_ns < g.sensor.grr_start_ns,
+		   "software release request must precede the early START");
+	CHECK_TRUE(g.sensor.grr_start_ns < g.sensor.grr_release_ns,
+		   "release confirmation must follow the early START");
+	case_end("START during release write");
 }
 
-static void test_early_start_gate0_readback(void)
+static void test_start_during_release_read(void)
 {
+	struct event *start;
 	int ret;
 
 	case_begin();
-	g.inject_start_on_gate0_read = true;
+	g.inject_start_on_release_read = true;
+	g.end_action = WAIT_END;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
-	CHECK_EQ(ret, -EPROTO, "START during gate0 readback must fail closed");
-	CHECK_EQ(g.pwm_calls, 0, "readback-race START must not emit PWM");
-	CHECK_EQ(count_events(EV_QUEUE), 1, "readback-race START must cancel queued work");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "readback-race START must cancel work");
+	CHECK_EQ(ret, 0, "START during release readback must be buffered");
+	CHECK_EQ(g.pwm_calls, 1, "readback START must preserve the one shot");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "readback START must not fault");
+	CHECK_TRUE(!g.sensor.grr_faulted, "readback START must not fault the sensor");
+	start = irq_event(RK_CAMERA_FRAME_START, 0);
+	CHECK_TRUE(start != NULL, "release readback must deliver START");
+	if (start) {
+		CHECK_EQ(start->phase, AR0521_GRR_WAIT_START,
+			 "release readback START must belong to WAIT_START");
+		CHECK_EQ(start->phase_after, AR0521_GRR_WAIT_END,
+			 "release readback START must enter WAIT_END");
+		CHECK_EQ(start->released, 0,
+			 "release readback START must precede released confirmation");
+	}
+	CHECK_TRUE(g.sensor.grr_release_request_ns > 0,
+		   "readback case must record the software request");
+	CHECK_TRUE(g.sensor.grr_release_request_ns < g.sensor.grr_start_ns,
+		   "readback request must precede the early START");
+	CHECK_TRUE(g.sensor.grr_start_ns < g.sensor.grr_release_ns,
+		   "readback confirmation must follow the early START");
+	case_end("START during release readback");
+}
+
+static void test_start_and_end_before_wait(void)
+{
+	struct event *start, *end;
+	int ret;
+
+	case_begin();
+	g.inject_start_on_release_read = true;
+	g.inject_start_and_end_on_release_read = true;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, 0, "START+END completed before wait_start must succeed");
+	CHECK_EQ(g.pwm_calls, 1, "early complete frame must emit one shot");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "early complete frame must not fault");
+	CHECK_TRUE(!g.sensor.grr_faulted, "early complete frame must stay healthy");
+	start = irq_event(RK_CAMERA_FRAME_START, 0);
+	end = irq_event(RK_CAMERA_FRAME_END, 0);
+	CHECK_TRUE(start != NULL && end != NULL,
+		   "early complete frame must deliver START and END");
+	if (start && end) {
+		CHECK_EQ(start->released, 0,
+			 "early START must precede released confirmation");
+		CHECK_EQ(end->released, 0,
+			 "early END must precede released confirmation");
+	}
+	CHECK_TRUE(g.sensor.grr_release_request_ns < g.sensor.grr_start_ns,
+		   "early frame request must precede START");
+	CHECK_TRUE(g.sensor.grr_start_ns < g.sensor.grr_end_ns,
+		   "early frame START must precede END");
+	CHECK_TRUE(g.sensor.grr_end_ns < g.sensor.grr_release_ns,
+		   "early frame END must precede release confirmation");
+	if (event_of_kind(EV_WAIT, 0) && event_of_kind(EV_WAIT, 1)) {
+		CHECK_EQ(event_of_kind(EV_WAIT, 0)->ok, 1,
+			 "wait_start must consume the already-completed START");
+		CHECK_EQ(event_of_kind(EV_WAIT, 1)->ok, 1,
+			 "wait_end must consume the already-completed END");
+	} else {
+		CHECK_TRUE(false, "early complete frame must reach both completion waits");
+	}
+	case_end("START+END before caller wait");
+}
+
+static void test_start_before_release_request(void)
+{
+	struct event *start;
+	int ret;
+
+	case_begin();
+	g.inject_start_on_prepare_read = true;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, -EPROTO, "START before the release request must fail closed");
+	CHECK_EQ(g.pwm_calls, 0, "pre-request START must not emit PWM");
+	CHECK_EQ(count_events(EV_QUEUE), 0, "pre-request START must stop before queueing");
+	CHECK_EQ(atomic_read(&g.sensor.grr_release_requested), 0,
+		 "pre-request START must not fabricate a request");
+	CHECK_EQ(g.sensor.grr_release_request_ns, 0,
+		 "pre-request START must not record a request time");
 	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
-		 "readback-race START must leave released clear");
-	CHECK_EQ(irq_event(RK_CAMERA_FRAME_START, 0)->released, 0,
-		 "gate0 readback START must see released=0");
-	CHECK_TRUE(g.sensor.grr_faulted, "readback-race START must fault");
-	check_failure_cleanup(EV_CANCEL);
-	case_end("early START during gate0 readback");
+		 "pre-request START must leave released clear");
+	start = irq_event(RK_CAMERA_FRAME_START, 0);
+	CHECK_TRUE(start != NULL && start->phase_after == AR0521_GRR_ERROR,
+		   "pre-request START must enter ERROR");
+	CHECK_TRUE(g.sensor.grr_faulted, "pre-request START must fault");
+	check_failure_cleanup(EV_REG_WRITE);
+	case_end("START before release request");
 }
 
 static void test_early_end(void)
@@ -970,6 +1094,57 @@ static void test_gate_readback_failure(void)
 	CHECK_TRUE(g.sensor.grr_faulted, "gate readback failure must fault");
 	check_failure_cleanup(EV_REG_WRITE);
 	case_end("I2C gate readback failure");
+}
+
+static void test_release_write_failure(void)
+{
+	int ret;
+
+	case_begin();
+	g.fail_write_remaining = 1;
+	g.fail_write_reg = AR0521_REG_VD_TRIG_NEW_FRAME;
+	g.fail_write_value = 0;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, -EIO, "release write failure must propagate");
+	CHECK_EQ(count_reg_write(0, 0), 1,
+		 "release write failure must remain observable");
+	CHECK_EQ(count_events(EV_CANCEL), 1,
+		 "release write failure must cancel queued work");
+	CHECK_TRUE(g.sensor.grr_release_request_ns > 0,
+		   "release write failure must preserve the software request time");
+	CHECK_EQ(g.sensor.grr_release_ns, 0,
+		 "failed release write must not confirm release");
+	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
+		 "failed release write must leave released clear");
+	CHECK_EQ(atomic_read(&g.sensor.grr_release_requested), 0,
+		 "failed release write must clear the request state");
+	CHECK_TRUE(g.sensor.grr_faulted, "release write failure must fault");
+	check_failure_cleanup(EV_CANCEL);
+	case_end("release gate write failure");
+}
+
+static void test_release_readback_failure(void)
+{
+	int ret;
+
+	case_begin();
+	g.fail_read_gate_call = 2;
+	g.fail_read_reg = AR0521_REG_VD_TRIG_NEW_FRAME;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, -EIO, "release readback failure must propagate");
+	CHECK_EQ(count_events(EV_CANCEL), 1,
+		 "release readback failure must cancel queued work");
+	CHECK_TRUE(g.sensor.grr_release_request_ns > 0,
+		   "release readback failure must preserve the software request time");
+	CHECK_EQ(g.sensor.grr_release_ns, 0,
+		 "failed release readback must not confirm release");
+	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
+		 "failed release readback must leave released clear");
+	CHECK_EQ(atomic_read(&g.sensor.grr_release_requested), 0,
+		 "failed release readback must clear the request state");
+	CHECK_TRUE(g.sensor.grr_faulted, "release readback failure must fault");
+	check_failure_cleanup(EV_CANCEL);
+	case_end("release gate readback failure");
 }
 
 static void test_poll_failure(void)
@@ -1247,8 +1422,10 @@ int main(void)
 {
 	test_normal_exactly_one_shot();
 	test_reclose_follows_end();
-	test_early_start_gate0_write();
-	test_early_start_gate0_readback();
+	test_start_during_release_write();
+	test_start_during_release_read();
+	test_start_and_end_before_wait();
+	test_start_before_release_request();
 	test_early_end();
 	test_repeated_start();
 	test_frame_error();
@@ -1256,6 +1433,8 @@ int main(void)
 	test_end_timeout();
 	test_gate_write_failure();
 	test_gate_readback_failure();
+	test_release_write_failure();
+	test_release_readback_failure();
 	test_poll_failure();
 	test_pwm_failure();
 	test_queue_rejected();
@@ -1276,6 +1455,6 @@ int main(void)
 		printf("RESULT: FAIL (%d checks)\n", failures);
 		return 1;
 	}
-	printf("RESULT: PASS (26 state-machine cases)\n");
+	printf("RESULT: PASS (30 state-machine cases)\n");
 	return 0;
 }

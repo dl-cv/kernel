@@ -320,6 +320,7 @@ struct ar0521 {
 	spinlock_t grr_irq_lock;
 	atomic_t grr_phase;
 	atomic_t grr_released;
+	atomic_t grr_release_requested;
 	bool grr_rearm;
 	bool grr_faulted;
 	int grr_pwm_ret;
@@ -328,6 +329,7 @@ struct ar0521 {
 	u64 grr_start_ns;
 	u64 grr_end_ns;
 	u64 grr_release_ns;
+	u64 grr_release_request_ns;
 	u64 grr_reclose_ns;
 	/* First failed gate only; cleanup must not overwrite its evidence. */
 	u32 grr_gate_calls;
@@ -1418,7 +1420,8 @@ static int ar0521_grr_frame_irq(struct v4l2_subdev *sd, u32 status,
 		goto unlock;
 	*handled = true;
 	if (status == RK_CAMERA_FRAME_START &&
-	    atomic_read(&sensor->grr_released) &&
+	    (atomic_read(&sensor->grr_release_requested) ||
+	     atomic_read(&sensor->grr_released)) &&
 	    atomic_cmpxchg(&sensor->grr_phase, AR0521_GRR_WAIT_START,
 			   AR0521_GRR_WAIT_END) == AR0521_GRR_WAIT_START) {
 		WRITE_ONCE(sensor->grr_start_ns, ktime_get_ns());
@@ -1495,7 +1498,7 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 	u64 read_us;
 	unsigned long start_timeout, end_timeout, flags;
 	bool queued = false;
-	int ret, poll_ret, close_ret;
+	int ret, poll_ret, close_ret, phase;
 
 	lockdep_assert_held(&sensor->mutex);
 	if (!sensor->streaming || sensor->active_mode != AR0521_TRIGGER_ONE_SHOT)
@@ -1527,10 +1530,12 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 	reinit_completion(&sensor->grr_start);
 	reinit_completion(&sensor->grr_end);
 	atomic_set(&sensor->grr_released, 0);
+	atomic_set(&sensor->grr_release_requested, 0);
 	sensor->grr_pwm_call_ns = 0;
 	sensor->grr_start_ns = 0;
 	sensor->grr_end_ns = 0;
 	sensor->grr_release_ns = 0;
+	sensor->grr_release_request_ns = 0;
 	sensor->grr_reclose_ns = 0;
 	sensor->grr_pwm_ret = -EINPROGRESS;
 	atomic_set(&sensor->grr_phase, AR0521_GRR_WAIT_START);
@@ -1587,17 +1592,34 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 		ret = -EPROTO;
 		goto out;
 	}
-	ret = ar0521_grr_gate(sensor, 0);
-	if (ret)
-		goto out;
-	/* Fail closed for START during the I2C release: its order is ambiguous. */
+	/* Publish intent before gate I2C so IRQs may stage START/END. This is a
+	 * software request timestamp, not the physical edge; only a successful
+	 * gate write/read below confirms grr_released.
+	 */
 	spin_lock_irqsave(&sensor->grr_irq_lock, flags);
 	if (atomic_read(&sensor->grr_phase) != AR0521_GRR_WAIT_START) {
 		ret = -EPROTO;
 	} else {
-		sensor->grr_release_ns = ktime_get_ns();
-		atomic_set(&sensor->grr_released, 1);
+		sensor->grr_release_request_ns = ktime_get_ns();
+		atomic_set(&sensor->grr_release_requested, 1);
+		ret = 0;
 	}
+	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
+	if (ret)
+		goto out;
+	ret = ar0521_grr_gate(sensor, 0);
+	spin_lock_irqsave(&sensor->grr_irq_lock, flags);
+	if (!ret) {
+		sensor->grr_release_ns = ktime_get_ns();
+		phase = atomic_read(&sensor->grr_phase);
+		if (phase == AR0521_GRR_WAIT_START ||
+		    phase == AR0521_GRR_WAIT_END ||
+		    phase == AR0521_GRR_DONE)
+			atomic_set(&sensor->grr_released, 1);
+		else
+			ret = -EPROTO;
+	}
+	atomic_set(&sensor->grr_release_requested, 0);
 	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
 	if (ret)
 		goto out;
@@ -1605,7 +1627,8 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 		ret = -ETIMEDOUT;
 		goto out;
 	}
-	if (atomic_read(&sensor->grr_phase) != AR0521_GRR_WAIT_END) {
+	phase = atomic_read(&sensor->grr_phase);
+	if (phase != AR0521_GRR_WAIT_END && phase != AR0521_GRR_DONE) {
 		ret = -EPROTO;
 		goto out;
 	}
@@ -1645,6 +1668,7 @@ out:
 	spin_lock_irqsave(&sensor->grr_irq_lock, flags);
 	if (!ret && atomic_read(&sensor->grr_phase) != AR0521_GRR_DONE)
 		ret = -EPROTO;
+	atomic_set(&sensor->grr_release_requested, 0);
 	atomic_set(&sensor->grr_phase, AR0521_GRR_IDLE);
 	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
 	if (ret) {
@@ -1914,9 +1938,9 @@ static ssize_t grr_last_show(struct device *dev, struct device_attribute *attr,
 
 	mutex_lock(&sensor->mutex);
 	len = sysfs_emit(buf,
-		"ret=%d faulted=%u pwm_call_ns=%llu release_ns=%llu start_ns=%llu reclose_ns=%llu end_ns=%llu gate_calls=%u gate_fail_call=%u gate_target=0x%04x gate_actual=0x%04x gate_write_ret=%d gate_read_ret=%d\n",
+		"ret=%d faulted=%u pwm_call_ns=%llu release_request_ns=%llu release_ns=%llu start_ns=%llu reclose_ns=%llu end_ns=%llu gate_calls=%u gate_fail_call=%u gate_target=0x%04x gate_actual=0x%04x gate_write_ret=%d gate_read_ret=%d\n",
 		sensor->grr_last_ret, sensor->grr_faulted, sensor->grr_pwm_call_ns,
-		sensor->grr_release_ns, sensor->grr_start_ns,
+		sensor->grr_release_request_ns, sensor->grr_release_ns, sensor->grr_start_ns,
 		sensor->grr_reclose_ns, sensor->grr_end_ns,
 		sensor->grr_gate_calls, sensor->grr_gate_fail_call,
 		sensor->grr_gate_target, sensor->grr_gate_actual,
@@ -3364,6 +3388,7 @@ static int ar0521_probe(struct i2c_client *client)
 	init_completion(&sensor->grr_end);
 	atomic_set(&sensor->grr_phase, AR0521_GRR_IDLE);
 	atomic_set(&sensor->grr_released, 0);
+	atomic_set(&sensor->grr_release_requested, 0);
 
 	ret = ar0521_init_trigger_pwm(sensor);
 	if (ret)
