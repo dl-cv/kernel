@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/types.h>
 
 #define UNUSED(x) ((void)(x))
 
@@ -164,6 +166,9 @@ struct ar0521 {
 	bool streaming;
 	enum ar0521_op_mode active_mode;
 	u32 light_source_advance_us;
+	u32 light_source_off_delay_us;
+	bool light_source_enabled;
+	void *light_source_gpio;
 };
 
 enum event_kind {
@@ -178,6 +183,8 @@ enum event_kind {
 	EV_PWM,
 	EV_PWM_IDLE,
 	EV_STREAM_OFF,
+	EV_LIGHT,
+	EV_SLEEP,
 };
 
 struct event {
@@ -245,13 +252,15 @@ struct mock_state {
 	u16 seq_trigger;
 	int vd_reads;
 	int gpio_reads;
+	u16 gpio_before_rearm;
+	u16 gpio_after_rearm;
 	u64 clock_ns;
 	u64 clock_step_ns;
 	bool initialized;
 };
 
 static struct mock_state g;
-static struct workqueue_struct *const system_highpri_wq = &g.wq;
+static struct workqueue_struct *const __attribute__((unused)) system_highpri_wq = &g.wq;
 #define to_ar0521(sd) ((struct ar0521 *)(sd)->priv)
 
 static int ar0521_grr_frame_irq(struct v4l2_subdev *sd, u32 status,
@@ -434,7 +443,7 @@ static int ar0521_read_reg(struct ar0521 *sensor, u16 reg, u16 *value)
 
 	switch (reg) {
 	case AR0521_REG_GPIO_GPO_2:
-		actual = 0x0080;
+		actual = g.gpio_reads ? g.gpio_after_rearm : g.gpio_before_rearm;
 		if (g.sensor.grr_pwm_work.queued && !g.poll_never_ready)
 			actual |= BIT(1);
 		g.gpio_reads++;
@@ -529,9 +538,10 @@ static void mock_dev_err(const char *format, ...)
 
 #define dev_err(dev, format, ...) \
 	do { UNUSED(dev); mock_dev_err(format, ##__VA_ARGS__); } while (0)
-#define msleep(msecs) UNUSED(msecs)
+#define msleep(msecs) record_event(EV_SLEEP, 0, (msecs) * 1000, 1, 0, 0, 0, 0)
 
-static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
+/* Retained workqueue/poll mocks trap accidental PWM-path reintroduction. */
+static bool __attribute__((unused)) queue_work(struct workqueue_struct *wq, struct work_struct *work)
 {
 	UNUSED(wq);
 	/* false models an already-pending work item that could not be newly queued. */
@@ -545,7 +555,7 @@ static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
 	return g.queue_result;
 }
 
-static bool cancel_work_sync(struct work_struct *work)
+static bool __attribute__((unused)) cancel_work_sync(struct work_struct *work)
 {
 	bool pending = work->queued && !work->completed;
 
@@ -560,7 +570,7 @@ static bool cancel_work_sync(struct work_struct *work)
 	return pending;
 }
 
-static bool flush_work(struct work_struct *work)
+static bool __attribute__((unused)) flush_work(struct work_struct *work)
 {
 	bool pending = work->queued && !work->completed;
 
@@ -595,6 +605,34 @@ static bool flush_work(struct work_struct *work)
 		     atomic_read(&g.sensor.grr_released), 0); \
 	__poll_ret; \
 })
+
+static void ar0521_light_source_set_locked(struct ar0521 *sensor, bool on)
+{
+	record_event(EV_LIGHT, 0, on, 1, 0, 0, 0, 0);
+}
+
+static void ar0521_sleep_us(u32 us)
+{
+	record_event(EV_SLEEP, 0, us, 1, 0, 0, 0, 0);
+}
+
+struct device_attribute { int unused; };
+static struct ar0521 *ar0521_from_dev(struct device *dev)
+{
+	return dev == &g.dev ? &g.sensor : NULL;
+}
+static int kstrtouint(const char *buf, unsigned int base, unsigned int *value)
+{
+	char *end;
+	unsigned long result = strtoul(buf, &end, base);
+	if (end == buf || (*end && *end != '\n') || result > UINT32_MAX)
+		return -EINVAL;
+	*value = result;
+	return 0;
+}
+#define mutex_lock(lock) UNUSED(lock)
+#define mutex_unlock(lock) UNUSED(lock)
+static int ar0521_trigger_once_locked(struct ar0521 *sensor);
 
 /* ACTUAL_FUNCTIONS */
 
@@ -644,6 +682,8 @@ static void reset_mock(void)
 	g.clock_step_ns = 1000000ULL;
 	g.vd_reg = AR0521_SLAVE_VD_TRIG;
 	g.seq_trigger = AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR;
+	g.gpio_before_rearm = 0x0080;
+	g.gpio_after_rearm = 0x0080;
 }
 
 static int failures;
@@ -768,26 +808,21 @@ static struct event *irq_event(u32 status, int ordinal)
 	return NULL;
 }
 
-static void check_failure_cleanup(enum event_kind join)
+static void check_failure_cleanup(void)
 {
 	int gate_last = last_reg_write(AR0521_SLAVE_VD_TRIG);
 	int idle = last_event(EV_PWM_IDLE);
 	int stop = last_event(EV_STREAM_OFF);
-	int joined = last_event(join);
 
 	CHECK_EQ(g.stream_off_calls, 1, "failure must stop streaming once");
 	CHECK_EQ(g.init_trigger_pwm_calls, 1,
 		 "failure must force PWM idle exactly once");
 	CHECK_TRUE(gate_last >= 0, "failure cleanup must reclose the VD gate");
 	CHECK_TRUE(idle > gate_last, "PWM idle must follow the final gate 0x8000");
-	if (join != EV_REG_WRITE) {
-		CHECK_TRUE(joined > gate_last, "work join must follow gate 0x8000");
-		CHECK_TRUE(idle > joined, "PWM idle must follow the work join");
-	}
 	CHECK_TRUE(stop > idle, "standby must follow PWM idle");
 }
 
-static void test_normal_exactly_one_shot(void)
+static void test_normal_direct_release(void)
 {
 	int ret;
 
@@ -796,8 +831,8 @@ static void test_normal_exactly_one_shot(void)
 	g.end_action = WAIT_END;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, 0, "normal trigger must succeed");
-	CHECK_EQ(g.pwm_calls, 1, "normal trigger must emit exactly one shot");
-	CHECK_EQ(count_events(EV_FLUSH), 1, "normal trigger must flush work once");
+	CHECK_EQ(g.pwm_calls, 0, "direct release emits no PWM");
+	CHECK_EQ(count_events(EV_FLUSH), 0, "direct release has no PWM work to join");
 	CHECK_EQ(count_events(EV_CANCEL), 0, "normal trigger must not cancel work");
 	CHECK_EQ(g.stream_off_calls, 0, "normal trigger must keep streaming");
 	CHECK_EQ(g.init_trigger_pwm_calls, 0,
@@ -812,9 +847,8 @@ static void test_normal_exactly_one_shot(void)
 		   "normal trigger must observe START");
 	CHECK_EQ(irq_event(RK_CAMERA_FRAME_START, 0)->released, 1,
 		 "START must only be accepted after gate0 readback");
-	CHECK_EQ(last_event(EV_FLUSH) > last_reg_write(AR0521_SLAVE_VD_TRIG), 1,
-		 "normal cleanup gate must precede flush_work");
-	case_end("normal exactly one shot");
+	CHECK_EQ(count_events(EV_QUEUE), 0, "direct release must not queue work");
+	case_end("normal direct release");
 }
 
 static void test_reclose_follows_end(void)
@@ -850,7 +884,7 @@ static void test_start_during_release_write(void)
 	g.end_action = WAIT_END;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, 0, "START during release write must be buffered");
-	CHECK_EQ(g.pwm_calls, 1, "buffered START must preserve the one shot");
+	CHECK_EQ(g.pwm_calls, 0, "direct release emits no PWM");
 	CHECK_EQ(count_events(EV_CANCEL), 0, "buffered START must not fault");
 	CHECK_TRUE(!g.sensor.grr_faulted, "buffered START must not fault the sensor");
 	start = irq_event(RK_CAMERA_FRAME_START, 0);
@@ -882,7 +916,7 @@ static void test_start_during_release_read(void)
 	g.end_action = WAIT_END;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, 0, "START during release readback must be buffered");
-	CHECK_EQ(g.pwm_calls, 1, "readback START must preserve the one shot");
+	CHECK_EQ(g.pwm_calls, 0, "direct release emits no PWM");
 	CHECK_EQ(count_events(EV_CANCEL), 0, "readback START must not fault");
 	CHECK_TRUE(!g.sensor.grr_faulted, "readback START must not fault the sensor");
 	start = irq_event(RK_CAMERA_FRAME_START, 0);
@@ -914,7 +948,7 @@ static void test_start_and_end_before_wait(void)
 	g.inject_start_and_end_on_release_read = true;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, 0, "START+END completed before wait_start must succeed");
-	CHECK_EQ(g.pwm_calls, 1, "early complete frame must emit one shot");
+	CHECK_EQ(g.pwm_calls, 0, "direct release emits no PWM");
 	CHECK_EQ(count_events(EV_CANCEL), 0, "early complete frame must not fault");
 	CHECK_TRUE(!g.sensor.grr_faulted, "early complete frame must stay healthy");
 	start = irq_event(RK_CAMERA_FRAME_START, 0);
@@ -965,7 +999,7 @@ static void test_start_before_release_request(void)
 	CHECK_TRUE(start != NULL && start->phase_after == AR0521_GRR_ERROR,
 		   "pre-request START must enter ERROR");
 	CHECK_TRUE(g.sensor.grr_faulted, "pre-request START must fault");
-	check_failure_cleanup(EV_REG_WRITE);
+	check_failure_cleanup();
 	case_end("START before release request");
 }
 
@@ -982,7 +1016,7 @@ static void test_early_end(void)
 		 "early END must see released=0");
 	CHECK_EQ(count_events(EV_QUEUE), 0, "early END must not queue work");
 	CHECK_TRUE(g.sensor.grr_faulted, "early END must fault");
-	check_failure_cleanup(EV_REG_WRITE);
+	check_failure_cleanup();
 	case_end("early END");
 }
 
@@ -1002,9 +1036,9 @@ static void test_repeated_start(void)
 		 AR0521_GRR_WAIT_END, "second START must be unexpected");
 	CHECK_EQ(irq_event(RK_CAMERA_FRAME_START, 1)->phase_after,
 		 AR0521_GRR_ERROR, "second START must enter ERROR");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "failed transaction must cancel work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_TRUE(g.sensor.grr_faulted, "repeated START must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("repeated START");
 }
 
@@ -1019,9 +1053,9 @@ static void test_frame_error(void)
 	CHECK_EQ(count_irq(RK_CAMERA_FRAME_ERROR), 1, "ERROR event must reach IRQ");
 	CHECK_EQ(irq_event(RK_CAMERA_FRAME_ERROR, 0)->phase_after,
 		 AR0521_GRR_ERROR, "ERROR must enter ERROR phase");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "ERROR must cancel work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_TRUE(g.sensor.grr_faulted, "ERROR must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("frame ERROR");
 }
 
@@ -1033,10 +1067,10 @@ static void test_start_timeout(void)
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, -ETIMEDOUT, "missing START must time out");
 	CHECK_EQ(count_events(EV_WAIT), 1, "start timeout must not wait for END");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "start timeout must cancel work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_EQ(g.pwm_calls, 0, "pending work must not run after cancellation");
 	CHECK_TRUE(g.sensor.grr_faulted, "start timeout must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("START timeout");
 }
 
@@ -1049,9 +1083,9 @@ static void test_end_timeout(void)
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, -ETIMEDOUT, "missing END must time out");
 	CHECK_EQ(count_events(EV_WAIT), 2, "end timeout must wait for START and END");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "end timeout must cancel work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_TRUE(g.sensor.grr_faulted, "end timeout must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("END timeout");
 }
 
@@ -1073,7 +1107,7 @@ static void test_gate_write_failure(void)
 	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
 		 "gate write failure must not release START");
 	CHECK_TRUE(g.sensor.grr_faulted, "gate write failure must fault");
-	check_failure_cleanup(EV_REG_WRITE);
+	check_failure_cleanup();
 	case_end("I2C gate write failure");
 }
 
@@ -1092,7 +1126,7 @@ static void test_gate_readback_failure(void)
 	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
 		 "gate readback failure must not release START");
 	CHECK_TRUE(g.sensor.grr_faulted, "gate readback failure must fault");
-	check_failure_cleanup(EV_REG_WRITE);
+	check_failure_cleanup();
 	case_end("I2C gate readback failure");
 }
 
@@ -1108,8 +1142,7 @@ static void test_release_write_failure(void)
 	CHECK_EQ(ret, -EIO, "release write failure must propagate");
 	CHECK_EQ(count_reg_write(0, 0), 1,
 		 "release write failure must remain observable");
-	CHECK_EQ(count_events(EV_CANCEL), 1,
-		 "release write failure must cancel queued work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_TRUE(g.sensor.grr_release_request_ns > 0,
 		   "release write failure must preserve the software request time");
 	CHECK_EQ(g.sensor.grr_release_ns, 0,
@@ -1119,7 +1152,7 @@ static void test_release_write_failure(void)
 	CHECK_EQ(atomic_read(&g.sensor.grr_release_requested), 0,
 		 "failed release write must clear the request state");
 	CHECK_TRUE(g.sensor.grr_faulted, "release write failure must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("release gate write failure");
 }
 
@@ -1132,8 +1165,7 @@ static void test_release_readback_failure(void)
 	g.fail_read_reg = AR0521_REG_VD_TRIG_NEW_FRAME;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, -EIO, "release readback failure must propagate");
-	CHECK_EQ(count_events(EV_CANCEL), 1,
-		 "release readback failure must cancel queued work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_TRUE(g.sensor.grr_release_request_ns > 0,
 		   "release readback failure must preserve the software request time");
 	CHECK_EQ(g.sensor.grr_release_ns, 0,
@@ -1143,82 +1175,13 @@ static void test_release_readback_failure(void)
 	CHECK_EQ(atomic_read(&g.sensor.grr_release_requested), 0,
 		 "failed release readback must clear the request state");
 	CHECK_TRUE(g.sensor.grr_faulted, "release readback failure must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("release gate readback failure");
 }
 
-static void test_poll_failure(void)
-{
-	int ret;
 
-	case_begin();
-	g.poll_override = -EIO;
-	ret = ar0521_grr_trigger_locked(&g.sensor);
-	CHECK_EQ(ret, -EIO, "poll failure must propagate");
-	CHECK_EQ(g.poll_calls, 1, "poll failure must execute one poll attempt");
-	CHECK_EQ(count_events(EV_CANCEL), 1, "poll failure must cancel work");
-	CHECK_TRUE(g.sensor.grr_faulted, "poll failure must fault");
-	check_failure_cleanup(EV_CANCEL);
-	case_end("poll failure");
-}
 
-static void test_pwm_failure(void)
-{
-	int ret;
 
-	case_begin();
-	g.start_action = WAIT_START;
-	g.end_action = WAIT_END;
-	g.pwm_ret = -EIO;
-	ret = ar0521_grr_trigger_locked(&g.sensor);
-	CHECK_EQ(ret, -EIO, "PWM failure must propagate after join");
-	CHECK_EQ(g.pwm_calls, 1, "normal transaction must run one worker");
-	CHECK_EQ(count_events(EV_FLUSH), 1, "successful frame path must flush work");
-	CHECK_EQ(count_events(EV_CANCEL), 0, "PWM failure is observed after flush");
-	CHECK_TRUE(g.sensor.grr_faulted, "PWM failure must fault");
-	check_failure_cleanup(EV_FLUSH);
-	case_end("PWM failure");
-}
-
-static void test_queue_rejected(void)
-{
-	int ret;
-
-	case_begin();
-	/* queue_work=false means work was already pending before the call. */
-	g.queue_result = false;
-	ret = ar0521_grr_trigger_locked(&g.sensor);
-	CHECK_EQ(ret, -EBUSY, "rejected queue must return EBUSY");
-	CHECK_EQ(count_events(EV_QUEUE), 1, "queue rejection must be observable");
-	CHECK_EQ(count_events(EV_FLUSH), 0, "already-pending work must not flush");
-	CHECK_EQ(count_events(EV_CANCEL), 1,
-		 "already-pending work must be cancelled synchronously");
-	CHECK_TRUE(g.sensor.grr_pwm_work.cancelled,
-		   "queue rejection must leave no pending work");
-	CHECK_EQ(g.pwm_calls, 0, "rejected queue must not emit PWM");
-	CHECK_TRUE(g.sensor.grr_faulted, "queue rejection must fault");
-	check_failure_cleanup(EV_CANCEL);
-	flush_work(&g.sensor.grr_pwm_work);
-	CHECK_EQ(g.pwm_calls, 0, "cancelled pending work must stay inert after stop");
-	case_end("queue_work false cancels already-pending work");
-}
-
-static void test_unstarted_work_cancel_no_vd(void)
-{
-	int ret;
-
-	case_begin();
-	ret = ar0521_grr_trigger_locked(&g.sensor);
-	CHECK_EQ(ret, -ETIMEDOUT, "unstarted-work case must time out at START");
-	CHECK_EQ(count_events(EV_CANCEL), 1,
-		 "unstarted queued work must be cancelled synchronously");
-	CHECK_EQ(g.pwm_calls, 0, "cancelled work must not emit PWM/VD");
-	CHECK_EQ(g.stream_off_calls, 1, "unsafe work must stop streaming");
-	check_failure_cleanup(EV_CANCEL);
-	flush_work(&g.sensor.grr_pwm_work);
-	CHECK_EQ(g.pwm_calls, 0, "cancelled work must remain inert after stream-off");
-	case_end("unstarted work cancel before stop");
-}
 
 static void test_readback_mismatch(void)
 {
@@ -1231,11 +1194,10 @@ static void test_readback_mismatch(void)
 	CHECK_EQ(ret, -EIO, "readback mismatch must return EIO");
 	CHECK_EQ(atomic_read(&g.sensor.grr_released), 0,
 		 "readback mismatch must not set released");
-	CHECK_EQ(count_events(EV_CANCEL), 1,
-		 "readback mismatch must cancel already-pending work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_EQ(g.pwm_calls, 0, "readback mismatch must not leave runnable work");
 	CHECK_TRUE(g.sensor.grr_faulted, "readback mismatch must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("gate readback mismatch");
 }
 
@@ -1319,11 +1281,10 @@ static void test_reclose_timeout(void)
 	CHECK_EQ(ret, -ETIME, "reclose later than 8ms must return ETIME");
 	CHECK_EQ(count_events(EV_WAIT), 2,
 		 "reclose budget is measured after END");
-	CHECK_EQ(count_events(EV_CANCEL), 1,
-		 "reclose timeout must cancel already-pending work");
+	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_EQ(g.pwm_calls, 0, "reclose timeout must not leave runnable work");
 	CHECK_TRUE(g.sensor.grr_faulted, "reclose timeout must fault");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("reclose over 8ms");
 }
 
@@ -1342,7 +1303,7 @@ static void test_pwm_idle_failure_preserves_error(void)
 		 "forced PWM idle failure must remain observable");
 	CHECK_TRUE(g.sensor.grr_faulted,
 		   "PWM-idle failure must keep the sensor faulted");
-	check_failure_cleanup(EV_CANCEL);
+	check_failure_cleanup();
 	case_end("PWM idle failure preserves original error");
 }
 static void test_notify_other_terminal_no_state_change(void)
@@ -1415,12 +1376,199 @@ static void test_grr_trigger_fault_gate(void)
 	CHECK_EQ(ret, -EIO, "faulted sensor must reject at grr_trigger entry");
 	CHECK_EQ(g.event_count, 0, "grr_trigger fault gate must precede I2C and work");
 	CHECK_EQ(g.stream_off_calls, 0, "fault gate must not reopen cleanup path");
-	case_end("grr_trigger fault gate (trigger_store bypass not covered)");
+	case_end("grr_trigger fault gate");
+}
+
+static void test_direct_release_no_long_rearm_sleeps(void)
+{
+	int i, clear = -1, set = -1, release = -1, long_sleeps = 0;
+
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0,
+		 "direct release with no long rearm sleeps succeeds");
+	for (i = 0; i < g.event_count; i++) {
+		if (g.events[i].kind == EV_SLEEP &&
+		    (g.events[i].value == 100000 || g.events[i].value == 200000))
+			long_sleeps++;
+		if (g.events[i].kind == EV_REG_WRITE &&
+		    g.events[i].reg == AR0521_REG_GLOBAL_SEQ_TRIGGER) {
+			if (!(g.events[i].value & AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR) &&
+			    clear < 0)
+				clear = i;
+			if ((g.events[i].value & AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR) &&
+			    clear >= 0 && set < 0)
+				set = i;
+		}
+		if (g.events[i].kind == EV_REG_WRITE &&
+		    g.events[i].reg == AR0521_REG_VD_TRIG_NEW_FRAME &&
+		    g.events[i].value == 0)
+			release = i;
+	}
+	CHECK_EQ(long_sleeps, 0, "actual trigger path must not sleep 100ms or 200ms");
+	CHECK_TRUE(clear >= 0, "actual trigger path must clear 315E bit0");
+	CHECK_TRUE(set > clear, "actual trigger path must set 315E bit0 after clear");
+	CHECK_TRUE(release > set, "3158 release must follow 315E clear then set");
+	CHECK_EQ(count_reg_write(0, 1), 1, "direct release must write 3158=0 once");
+	case_end("direct release no long rearm sleeps");
+}
+
+static void test_direct_release_no_pwm_or_poll(void)
+{
+	case_begin();
+	g.poll_never_ready = true;
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0, "release must not require SHUTTER high");
+	CHECK_EQ(g.poll_calls, 0, "direct release must not poll SHUTTER");
+	CHECK_EQ(count_events(EV_QUEUE), 0, "direct release must not enqueue PWM");
+	CHECK_EQ(g.pwm_calls, 0, "direct release must emit zero PWM");
+	CHECK_EQ(g.sensor.grr_pwm_call_ns, 0, "PWM diagnostic remains zero");
+	case_end("direct release zero PWM and no SHUTTER poll");
+}
+
+static void test_direct_early_frame_no_pwm(void)
+{
+	case_begin();
+	g.inject_start_on_release_read = true;
+	g.inject_start_and_end_on_release_read = true;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0, "complete frame before readback return is legal");
+	CHECK_EQ(g.pwm_calls, 0, "early frame must not emit PWM");
+	CHECK_EQ(g.sensor.grr_pwm_call_ns, 0, "early frame PWM timestamp is zero");
+	CHECK_TRUE(g.sensor.grr_start_ns < g.sensor.grr_release_ns, "START precedes release readback return");
+	CHECK_TRUE(g.sensor.grr_end_ns < g.sensor.grr_release_ns, "END precedes release readback return");
+	case_end("direct short frame before gate readback");
+}
+
+static void test_direct_light_exits(void)
+{
+	int mode, i, on, advance, release, off_delay, off;
+	for (mode = 0; mode < 4; mode++) {
+		case_begin();
+		g.sensor.light_source_enabled = true;
+		g.sensor.light_source_gpio = &g.dev;
+		g.sensor.light_source_advance_us = 321;
+		g.sensor.light_source_off_delay_us = 654;
+		if (mode != 1) { g.start_action = WAIT_START; g.end_action = WAIT_END; }
+		if (mode >= 2) {
+			g.fail_write_remaining = 1;
+			g.fail_write_reg = AR0521_REG_VD_TRIG_NEW_FRAME;
+			g.fail_write_value = mode == 2 ? 0 : AR0521_SLAVE_VD_TRIG;
+		}
+		CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), mode == 0 ? 0 : (mode == 1 ? -ETIMEDOUT : -EIO), "light path result");
+		on = advance = release = off_delay = off = -1;
+		for (i = 0; i < g.event_count; i++) {
+			if (g.events[i].kind == EV_LIGHT && g.events[i].value) on = i;
+			if (g.events[i].kind == EV_LIGHT && !g.events[i].value) off = i;
+			if (g.events[i].kind == EV_SLEEP && g.events[i].value == 321) advance = i;
+			if (g.events[i].kind == EV_SLEEP && g.events[i].value == 654) off_delay = i;
+			if (g.events[i].kind == EV_REG_WRITE && g.events[i].reg == AR0521_REG_VD_TRIG_NEW_FRAME && !g.events[i].value) release = i;
+		}
+		if (mode < 3) CHECK_TRUE(on >= 0 && advance > on && release > advance, "light on then advance before release");
+		CHECK_TRUE(off_delay > last_reg_write(AR0521_SLAVE_VD_TRIG) && off > off_delay, "off-delay and light-off follow cleanup on every exit");
+		CHECK_EQ(g.pwm_calls, 0, "lighting must not emit PWM");
+		case_end(mode == 0 ? "light normal exit" : mode == 1 ? "light timeout exit" : mode == 2 ? "light release-error exit" : "light setup-error exit");
+	}
+}
+
+static void test_trigger_store_routes(void)
+{
+	int rearm;
+	for (rearm = 0; rearm <= 1; rearm++) {
+		case_begin();
+		g.sensor.grr_rearm = rearm;
+		g.start_action = WAIT_START;
+		g.end_action = WAIT_END;
+		CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), 1, "actual trigger_store succeeds");
+		CHECK_EQ(g.pwm_calls, rearm ? 0 : 1, "legacy PWM vs direct release routing");
+		CHECK_EQ(count_reg_write(0, 1), rearm ? 1 : 0, "only GRR releases the gate");
+		g.sensor.grr_faulted = true;
+		CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), -EIO, "fault blocks both routes");
+		CHECK_EQ(g.pwm_calls, rearm ? 0 : 1, "fault does not emit PWM");
+		case_end(rearm ? "store direct route" : "store legacy PWM route");
+	}
+}
+
+static void test_direct_without_pwm_or_light(void)
+{
+	case_begin();
+	g.sensor.trigger_pwm = NULL;
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0, "direct path needs no PWM device");
+	CHECK_EQ(count_events(EV_LIGHT), 0, "disabled lighting stays untouched");
+	CHECK_EQ(g.pwm_calls, 0, "no PWM emitted");
+	case_end("direct without PWM or light");
+}
+
+static void test_direct_formal_gpio_profile(void)
+{
+	case_begin();
+	g.gpio_before_rearm = g.gpio_after_rearm = 0xFD0C;
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0,
+		 "formal constant-low GPIO1 profile must allow direct release");
+	CHECK_EQ(count_reg_write(0, 1), 1, "formal profile releases gate once");
+	CHECK_EQ(count_irq(RK_CAMERA_FRAME_START), 1, "formal profile requires START");
+	CHECK_EQ(count_irq(RK_CAMERA_FRAME_END), 1, "formal profile requires END");
+	CHECK_EQ(g.pwm_calls, 0, "formal profile must not emit PWM");
+	CHECK_TRUE(!g.sensor.grr_faulted, "formal profile success must not fault");
+	case_end("direct formal constant-low GPIO profile");
+
+	case_begin();
+	g.gpio_before_rearm = g.gpio_after_rearm = 0xFD0C;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -ETIMEDOUT,
+		 "constant-low output is not evidence of a completed frame");
+	check_failure_cleanup();
+	case_end("formal GPIO low still requires frame IRQ");
+}
+
+static void test_direct_gpio_guard(void)
+{
+	int selector;
+
+	for (selector = 0; selector < 8; selector++) {
+		if (selector == 1 || selector == 2)
+			continue;
+		case_begin();
+		g.gpio_before_rearm = selector << 7;
+		CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -EBUSY,
+			 "unqualified GPIO profile must fail before writes");
+		CHECK_EQ(count_events(EV_REG_WRITE), 0, "rejected profile must not write");
+		case_end("unqualified GPIO profile");
+	}
+	for (selector = 1; selector <= 2; selector++) {
+		case_begin();
+		g.gpio_before_rearm = (selector << 7) | BIT(1);
+		CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -EBUSY,
+			 "high GPIO output must fail before writes");
+		CHECK_EQ(count_events(EV_REG_WRITE), 0, "high output must not write");
+		case_end("high GPIO output rejected");
+	}
+	case_begin();
+	g.gpio_after_rearm = 0x0100;
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), -EPROTO,
+		 "GPIO mux must not change during prepare");
+	CHECK_EQ(count_reg_write(0, 1), 0, "changed mux must not release gate");
+	check_failure_cleanup();
+	case_end("GPIO mux changed during prepare");
 }
 
 int main(void)
 {
-	test_normal_exactly_one_shot();
+	test_direct_formal_gpio_profile();
+	test_direct_gpio_guard();
+	test_trigger_store_routes();
+	test_direct_without_pwm_or_light();
+	test_direct_release_no_long_rearm_sleeps();
+	test_direct_release_no_pwm_or_poll();
+	test_direct_early_frame_no_pwm();
+	test_direct_light_exits();
+	test_normal_direct_release();
 	test_reclose_follows_end();
 	test_start_during_release_write();
 	test_start_during_release_read();
@@ -1435,10 +1583,6 @@ int main(void)
 	test_gate_readback_failure();
 	test_release_write_failure();
 	test_release_readback_failure();
-	test_poll_failure();
-	test_pwm_failure();
-	test_queue_rejected();
-	test_unstarted_work_cancel_no_vd();
 	test_readback_mismatch();
 	test_gate_diagnostic_write_failure();
 	test_gate_diagnostic_read_failure();
@@ -1455,6 +1599,6 @@ int main(void)
 		printf("RESULT: FAIL (%d checks)\n", failures);
 		return 1;
 	}
-	printf("RESULT: PASS (30 state-machine cases)\n");
+	printf("RESULT: PASS (47 state-machine cases)\n");
 	return 0;
 }

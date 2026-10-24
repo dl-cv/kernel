@@ -24,13 +24,14 @@ FUNCTION_NAMES = (
     "ar0521_grr_frame_notify",
     "ar0521_grr_gate",
     "ar0521_grr_trigger_locked",
+    "trigger_store",
 )
 
 
 def extract_function(source: str, name: str) -> str:
     """Return one complete function body, ignoring braces in comments/strings."""
     match = re.search(
-        rf"^static\s+(?:int|void)\s+{re.escape(name)}\s*\(",
+        rf"^static\s+(?:int|void|ssize_t)\s+{re.escape(name)}\s*\(",
         source,
         flags=re.MULTILINE,
     )
@@ -98,7 +99,14 @@ def main() -> None:
     tmp.mkdir(parents=True, exist_ok=True)
 
     source = SOURCE.read_text(encoding="utf-8")
-    functions = "\n\n".join(extract_function(source, name) for name in FUNCTION_NAMES)
+    # Existing sysfs store returns int-or-size_t; preserve production code.
+    functions = "\n\n".join(
+        ("#pragma GCC diagnostic push\n"
+         '#pragma GCC diagnostic ignored "-Wsign-compare"\n'
+         + extract_function(source, name) + "\n#pragma GCC diagnostic pop")
+        if name == "trigger_store" else extract_function(source, name)
+        for name in FUNCTION_NAMES
+    )
     scaffold = MOCK.read_text(encoding="utf-8")
     marker = "/* ACTUAL_FUNCTIONS */"
     if scaffold.count(marker) != 1:
