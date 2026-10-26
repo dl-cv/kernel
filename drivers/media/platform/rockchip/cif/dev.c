@@ -13,6 +13,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/pm_runtime.h>
 #include <linux/pinctrl/consumer.h>
@@ -2066,8 +2067,11 @@ static int subdev_asyn_register_itf(struct rkcif_device *dev)
 	if (!dev->is_notifier_isp) {
 		for (i = 0; i < dev->sditf_cnt; i++) {
 			sditf = dev->sditf[i];
-			if (sditf && (!sditf->is_combine_mode))
+			if (sditf && (!sditf->is_combine_mode)) {
 				ret = v4l2_async_register_subdev_sensor(&sditf->sd);
+				if (!ret)
+					atomic_set(&sditf->is_async_registered, 1);
+			}
 		}
 		dev->is_notifier_isp = true;
 	}
@@ -2820,7 +2824,39 @@ static void rkcif_exp_work(struct work_struct *exp_work)
 	priv->frame_idx.total_frame_idx = stream->frame_idx;
 }
 
-int rkcif_plat_init(struct rkcif_device *cif_dev, struct device_node *node, int inf_id)
+void rkcif_set_terminal_sensor_fwnode(struct rkcif_device *dev,
+				      struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *new = NULL;
+	struct fwnode_handle *old;
+	unsigned long flags;
+
+	if (fwnode)
+		new = fwnode_handle_get(fwnode);
+
+	spin_lock_irqsave(&dev->terminal_fwnode_lock, flags);
+	if (dev->terminal_sensor_dying && new) {
+		spin_unlock_irqrestore(&dev->terminal_fwnode_lock, flags);
+		fwnode_handle_put(new);
+		return;
+	}
+	old = rcu_dereference_protected(dev->terminal_sensor_fwnode, 1);
+	rcu_assign_pointer(dev->terminal_sensor_fwnode, new);
+	spin_unlock_irqrestore(&dev->terminal_fwnode_lock, flags);
+
+	if (old == new) {
+		if (new)
+			fwnode_handle_put(new);
+		return;
+	}
+	if (old) {
+		synchronize_rcu();
+		fwnode_handle_put(old);
+	}
+}
+
+int rkcif_plat_init(struct rkcif_device *cif_dev,
+		    struct device_node *node, int inf_id)
 {
 	struct device *dev = cif_dev->dev;
 	struct v4l2_device *v4l2_dev;
@@ -2837,6 +2873,8 @@ int rkcif_plat_init(struct rkcif_device *cif_dev, struct device_node *node, int 
 	spin_lock_init(&cif_dev->reset_watchdog_timer.timer_lock);
 	spin_lock_init(&cif_dev->reset_watchdog_timer.csi2_err_lock);
 	spin_lock_init(&cif_dev->stream_spinlock);
+	spin_lock_init(&cif_dev->terminal_fwnode_lock);
+	cif_dev->terminal_sensor_dying = false;
 	atomic_set(&cif_dev->pipe.power_cnt, 0);
 	atomic_set(&cif_dev->pipe.stream_cnt, 0);
 	atomic_set(&cif_dev->power_cnt, 0);
@@ -2991,13 +3029,32 @@ err_unreg_v4l2_dev:
 
 int rkcif_plat_uninit(struct rkcif_device *cif_dev)
 {
+	unsigned long flags;
+	u32 mbus_type = 0;
 	int stream_num = 0;
+	int i;
 
-	if (cif_dev->active_sensor->mbus.type == V4L2_MBUS_CCP2)
+	spin_lock_irqsave(&cif_dev->terminal_fwnode_lock, flags);
+	cif_dev->terminal_sensor_dying = true;
+	spin_unlock_irqrestore(&cif_dev->terminal_fwnode_lock, flags);
+	if (cif_dev->active_sensor)
+		mbus_type = cif_dev->active_sensor->mbus.type;
+	rkcif_set_terminal_sensor_fwnode(cif_dev, NULL);
+	for (i = 0; i < cif_dev->sditf_cnt; i++) {
+		if (!cif_dev->sditf[i])
+			continue;
+		sditf_unregister_isp(cif_dev->sditf[i]);
+		cif_dev->sditf[i]->cif_dev = NULL;
+		cif_dev->sditf[i] = NULL;
+	}
+	v4l2_async_nf_unregister(&cif_dev->notifier);
+	v4l2_async_nf_cleanup(&cif_dev->notifier);
+
+	if (mbus_type == V4L2_MBUS_CCP2)
 		rkcif_unregister_lvds_subdev(cif_dev);
 
-	if (cif_dev->active_sensor->mbus.type == V4L2_MBUS_BT656 ||
-	    cif_dev->active_sensor->mbus.type == V4L2_MBUS_PARALLEL)
+	if (mbus_type == V4L2_MBUS_BT656 ||
+	    mbus_type == V4L2_MBUS_PARALLEL)
 		rkcif_unregister_dvp_sof_subdev(cif_dev);
 
 	media_device_unregister(&cif_dev->media_dev);

@@ -16,9 +16,11 @@
 #include <linux/reset.h>
 #include <linux/pm_runtime.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/rcupdate.h>
 #include <linux/regmap.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/v4l2-fwnode.h>
+#include <media/rk-camera-frame.h>
 #include "dev.h"
 #include <linux/regulator/consumer.h>
 #include <linux/rk-camera-module.h>
@@ -704,6 +706,35 @@ static long sditf_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	}
 
 	return -EINVAL;
+}
+
+static int sditf_interrupt_service_routine(struct v4l2_subdev *sd, u32 status,
+					   bool *handled)
+{
+	struct sditf_priv *priv = to_sditf_priv(sd);
+	struct fwnode_handle *terminal;
+
+	if (!handled)
+		return -EINVAL;
+	*handled = false;
+
+	if (status != RK_CAMERA_FRAME_START &&
+	    status != RK_CAMERA_FRAME_END &&
+	    status != RK_CAMERA_FRAME_ERROR)
+		return -EINVAL;
+
+	if (priv->mode.rdbk_mode >= RKISP_VICAP_RDBK_AIQ)
+		return 0;
+
+	rcu_read_lock();
+	terminal = rcu_dereference(priv->cif_dev->terminal_sensor_fwnode);
+	if (terminal) {
+		rk_camera_frame_notify(terminal, status);
+		*handled = true;
+	}
+	rcu_read_unlock();
+
+	return 0;
 }
 
 #ifdef CONFIG_COMPAT
@@ -1542,6 +1573,7 @@ static const struct v4l2_subdev_core_ops sditf_core_ops = {
 	.subscribe_event = sditf_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 	.ioctl = sditf_ioctl,
+	.interrupt_service_routine = sditf_interrupt_service_routine,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl32 = sditf_compat_ioctl32,
 #endif
@@ -1761,7 +1793,10 @@ static int sditf_subdev_notifier(struct sditf_priv *sditf)
 		return ret;
 	}
 
-	return v4l2_async_register_subdev(&sditf->sd);
+	ret = v4l2_async_register_subdev(&sditf->sd);
+	if (!ret)
+		atomic_set(&sditf->is_async_registered, 1);
+	return ret;
 }
 
 static int sditf_count_port_nodes(struct device_node *root_node)
@@ -1823,6 +1858,7 @@ static int rkcif_subdev_media_init(struct sditf_priv *priv)
 	priv->toisp_inf.ch_info[1].is_valid = false;
 	priv->toisp_inf.ch_info[2].is_valid = false;
 	priv->is_toisp_off = true;
+	atomic_set(&priv->is_async_registered, 0);
 	if (priv->port_count > 1)
 		sditf_subdev_notifier(priv);
 	atomic_set(&priv->power_cnt, 0);
@@ -1838,6 +1874,14 @@ static int rkcif_subdev_media_init(struct sditf_priv *priv)
 	priv->hdr_wrap_line = 0;
 	priv->is_buf_init = false;
 	return 0;
+}
+
+void sditf_unregister_isp(struct sditf_priv *priv)
+{
+	if (!atomic_cmpxchg(&priv->is_async_registered, 1, 0))
+		return;
+
+	v4l2_async_unregister_subdev(&priv->sd);
 }
 
 static int rkcif_subdev_probe(struct platform_device *pdev)
@@ -1887,7 +1931,19 @@ static int rkcif_subdev_remove(struct platform_device *pdev)
 {
 	struct media_entity *me = platform_get_drvdata(pdev);
 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(me);
+	struct sditf_priv *priv = to_sditf_priv(sd);
+	struct rkcif_device *cif_dev = priv->cif_dev;
 
+	if (priv->port_count > 1) {
+		v4l2_async_nf_unregister(&priv->notifier);
+		v4l2_async_nf_cleanup(&priv->notifier);
+	}
+	sditf_unregister_isp(priv);
+	if (cif_dev && priv->connect_id >= 0 &&
+	    priv->connect_id < cif_dev->sditf_cnt &&
+	    cif_dev->sditf[priv->connect_id] == priv)
+		cif_dev->sditf[priv->connect_id] = NULL;
+	priv->cif_dev = NULL;
 	media_entity_cleanup(&sd->entity);
 
 	pm_runtime_disable(&pdev->dev);
