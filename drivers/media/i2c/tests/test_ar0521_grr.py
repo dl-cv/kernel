@@ -35,7 +35,7 @@ FUNCTION_NAMES = (
 def extract_function(source: str, name: str) -> str:
     """Return one complete function body, ignoring braces in comments/strings."""
     match = re.search(
-        rf"^static\s+(?:int|void|ssize_t)\s+{re.escape(name)}\s*\(",
+        rf"^static\s+(?:int|void|ssize_t)\s+{re.escape(name)}\s*\([^;{{}}]*\)\s*(?=\{{)",
         source,
         flags=re.MULTILINE,
     )
