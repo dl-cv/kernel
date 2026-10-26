@@ -99,7 +99,10 @@ typedef struct {
 	do { UNUSED(flags); pthread_mutex_unlock(&((spinp)->lock)); } while (0)
 #define lockdep_assert_held(lock) UNUSED(lock)
 
+#define AR0521_REG_GPIO_GPO_1 0x30F8
+#define AR0521_REG_GPIO_CTRL2 0x3026
 #define AR0521_REG_VD_TRIG_NEW_FRAME 0x3158
+#define AR0521_REG_GLOBAL_RST_END 0x3160
 #define AR0521_REG_GPIO_GPO_2 0x30FA
 #define AR0521_REG_GLOBAL_SEQ_TRIGGER 0x315E
 #define AR0521_REG_GLOBAL_READ_START 0x3166
@@ -107,6 +110,10 @@ typedef struct {
 #define AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR BIT(0)
 #define AR0521_REG_RESET 0x301A
 #define AR0521_REG_RESET_GPI BIT(8)
+#define AR0521_REG_RESET_STREAM BIT(2)
+#define AR0521_SLAVE_GPIO_GPO_1 0x0002
+#define AR0521_SLAVE_GPIO_CTRL2 0xFD70
+#define AR0521_GRR_GPIO_CTRL2 0xFFF0
 #define AR0521_GRR_SCALE 512U
 #define AR0521_VT_PIX_CLK_HZ 205200000ULL
 #define AR0521_SLAVE_VD_TRIG 0x8000
@@ -128,6 +135,8 @@ enum ar0521_op_mode {
 	AR0521_TRIGGER_ONE_SHOT = 1,
 };
 
+struct v4l2_ctrl { int val; };
+
 struct ar0521_test_format {
 	u32 height;
 };
@@ -148,6 +157,16 @@ struct ar0521 {
 	atomic_t grr_release_requested;
 	bool grr_rearm;
 	bool grr_faulted;
+	u16 saved_gpio_gpo_1;
+	u16 saved_gpio_ctrl2;
+	u16 saved_vd_trig;
+	u16 saved_global_seq;
+	u16 saved_reset;
+	u16 saved_global_rst_end;
+	u16 saved_global_read_start;
+	u16 saved_global_read_start_hi;
+	bool slave_backup_valid;
+	struct v4l2_ctrl *exposure;
 	int grr_pwm_ret;
 	int grr_last_ret;
 	u64 grr_pwm_call_ns;
@@ -252,6 +271,7 @@ struct mock_state {
 	bool inject_start_on_prepare_read;
 	bool inject_end_on_first_vd_read;
 
+	u16 reg_values[65536];
 	u16 vd_reg;
 	u16 seq_trigger;
 	int vd_reads;
@@ -406,6 +426,7 @@ static int ar0521_write_reg(struct ar0521 *sensor, u16 reg, u16 value)
 		return -EIO;
 	}
 
+	g.reg_values[reg] = value;
 	if (reg == AR0521_REG_VD_TRIG_NEW_FRAME)
 		g.vd_reg = value;
 	if (reg == AR0521_REG_GLOBAL_SEQ_TRIGGER)
@@ -460,6 +481,12 @@ static int ar0521_read_reg(struct ar0521 *sensor, u16 reg, u16 *value)
 		break;
 	case AR0521_REG_GLOBAL_SEQ_TRIGGER:
 		actual = g.seq_trigger;
+		break;
+	case AR0521_REG_GPIO_GPO_1:
+	case AR0521_REG_GPIO_CTRL2:
+	case AR0521_REG_RESET:
+	case AR0521_REG_GLOBAL_RST_END:
+		actual = g.reg_values[reg];
 		break;
 	case AR0521_REG_VD_TRIG_NEW_FRAME:
 		g.vd_reads++;
@@ -636,6 +663,16 @@ static int kstrtouint(const char *buf, unsigned int base, unsigned int *value)
 	*value = result;
 	return 0;
 }
+static int kstrtobool(const char *buf, bool *value)
+{
+	char *end;
+	unsigned long result = strtoul(buf, &end, 10);
+
+	if (end == buf || (*end && *end != '\n') || result > 1)
+		return -EINVAL;
+	*value = result != 0;
+	return 0;
+}
 #define mutex_lock(lock) UNUSED(lock)
 #define mutex_unlock(lock) UNUSED(lock)
 static int ar0521_trigger_once_locked(struct ar0521 *sensor);
@@ -645,6 +682,19 @@ static int ar0521_exit_lp11_locked(struct ar0521 *sensor)
 {
 	UNUSED(sensor);
 	g.exit_lp11_calls++;
+	return 0;
+}
+
+static int ar0521_config_grr_seq_trigger_locked(struct ar0521 *sensor)
+{
+	UNUSED(sensor);
+	return 0;
+}
+
+static int ar0521_apply_grr_timing_locked(struct ar0521 *sensor, u32 exposure_us)
+{
+	UNUSED(sensor);
+	UNUSED(exposure_us);
 	return 0;
 }
 
@@ -702,6 +752,7 @@ static void reset_mock(void)
 
 static int failures;
 static int case_failures;
+static int test_cases;
 
 #define CHECK_TRUE(condition, message) \
 	do { \
@@ -730,6 +781,7 @@ static void case_begin(void)
 
 static void case_end(const char *name)
 {
+	test_cases++;
 	if (case_failures) {
 		failures += case_failures;
 		printf("FAILED: %s (%d checks)\n", name, case_failures);
@@ -1529,6 +1581,87 @@ static void test_direct_light_exits(void)
 	}
 }
 
+static int count_reg_write_value(u16 reg, u16 value)
+{
+	int i;
+	int count = 0;
+
+	for (i = 0; i < g.event_count; i++)
+		if (g.events[i].kind == EV_REG_WRITE &&
+		    g.events[i].reg == reg && g.events[i].value == value &&
+		    g.events[i].ok)
+			count++;
+	return count;
+}
+
+static void test_enter_slave_gpio_selector(void)
+{
+	struct v4l2_ctrl exposure = { .val = 1000 };
+
+	case_begin();
+	g.sensor.exposure = &exposure;
+	g.sensor.grr_rearm = true;
+	CHECK_EQ(ar0521_enter_slave_locked(&g.sensor), 0,
+		 "rearm entry succeeds");
+	CHECK_EQ(count_reg_write_value(AR0521_REG_GPIO_CTRL2,
+				       AR0521_GRR_GPIO_CTRL2), 1,
+		 "rearm entry selects no GPI trigger source");
+	case_end("enter slave selector with rearm");
+
+	case_begin();
+	g.sensor.exposure = &exposure;
+	g.sensor.grr_rearm = false;
+	CHECK_EQ(ar0521_enter_slave_locked(&g.sensor), 0,
+		 "legacy entry succeeds");
+	CHECK_EQ(count_reg_write_value(AR0521_REG_GPIO_CTRL2,
+				       AR0521_SLAVE_GPIO_CTRL2), 1,
+		 "legacy entry preserves GPI2 trigger source");
+	case_end("enter slave selector without rearm");
+
+	case_begin();
+	g.sensor.exposure = &exposure;
+	g.sensor.grr_rearm = true;
+	g.reg_values[AR0521_REG_GPIO_GPO_1] = 0x1357;
+	g.reg_values[AR0521_REG_GPIO_CTRL2] = 0x2468;
+	g.vd_reg = 0x3579;
+	g.fail_write_remaining = 1;
+	g.fail_write_reg = AR0521_REG_GPIO_CTRL2;
+	g.fail_write_value = AR0521_GRR_GPIO_CTRL2;
+	CHECK_EQ(ar0521_enter_slave_locked(&g.sensor), -EIO,
+		 "selector write error propagates");
+	CHECK_EQ(count_reg_write_value(AR0521_REG_GPIO_CTRL2, 0x2468), 1,
+		 "selector failure restores saved GPIO selector");
+	CHECK_TRUE(!g.sensor.slave_backup_valid,
+		   "successful rollback clears slave backup state");
+	case_end("selector write failure rolls back");
+}
+
+static void test_grr_rearm_store_streaming_policy(void)
+{
+	case_begin();
+	g.sensor.streaming = true;
+	g.sensor.grr_rearm = true;
+	CHECK_EQ(grr_rearm_store(&g.dev, NULL, "0", 1), -EBUSY,
+		 "changing rearm while streaming is busy");
+	CHECK_TRUE(g.sensor.grr_rearm,
+		   "busy rearm change preserves current setting");
+	CHECK_EQ(grr_rearm_store(&g.dev, NULL, "1", 1), 1,
+		 "same rearm value is idempotent while streaming");
+	CHECK_TRUE(g.sensor.grr_rearm,
+		   "idempotent write preserves setting");
+
+	g.sensor.streaming = false;
+	CHECK_EQ(grr_rearm_store(&g.dev, NULL, "0", 1), 1,
+		 "stopped stream permits disabling rearm");
+	CHECK_TRUE(!g.sensor.grr_rearm,
+		   "stopped write updates setting");
+	CHECK_EQ(grr_rearm_store(&g.dev, NULL, "1", 1), 1,
+		 "stopped stream permits enabling rearm");
+	CHECK_TRUE(g.sensor.grr_rearm,
+		   "stopped write updates setting in either direction");
+	case_end("rearm store requires stream stop for changes");
+}
+
 static void test_trigger_store_routes(void)
 {
 	int rearm;
@@ -1619,6 +1752,8 @@ int main(void)
 {
 	test_direct_formal_gpio_profile();
 	test_direct_gpio_guard();
+	test_enter_slave_gpio_selector();
+	test_grr_rearm_store_streaming_policy();
 	test_trigger_store_routes();
 	test_direct_without_pwm_or_light();
 	test_direct_release_no_long_rearm_sleeps();
@@ -1658,6 +1793,6 @@ int main(void)
 		printf("RESULT: FAIL (%d checks)\n", failures);
 		return 1;
 	}
-	printf("RESULT: PASS (49 state-machine cases)\n");
+	printf("RESULT: PASS (%d state-machine cases)\n", test_cases);
 	return 0;
 }

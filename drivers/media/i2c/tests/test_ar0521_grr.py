@@ -20,11 +20,14 @@ import subprocess
 SOURCE = pathlib.Path(__file__).resolve().parents[1] / "ar0521.c"
 MOCK = pathlib.Path(__file__).with_name("ar0521-grr-mock.c")
 FUNCTION_NAMES = (
+    "ar0521_restore_slave_backup_locked",
+    "ar0521_enter_slave_locked",
     "ar0521_grr_frame_irq",
     "ar0521_grr_frame_notify",
     "ar0521_grr_gate",
     "ar0521_grr_trigger_locked",
     "trigger_store",
+    "grr_rearm_store",
     "ar0521_quick_stream",
 )
 
@@ -92,6 +95,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--cc", default="cc")
+    parser.add_argument("--source", type=pathlib.Path, default=SOURCE)
     args = parser.parse_args()
 
     output = args.out.resolve()
@@ -99,7 +103,7 @@ def main() -> None:
     tmp = output / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
 
-    source = SOURCE.read_text(encoding="utf-8")
+    source = args.source.read_text(encoding="utf-8")
     probe = extract_function(source, "ar0521_probe")
     if not re.search(r"^\s*sensor->grr_rearm\s*=\s*true;", probe, re.MULTILINE):
         raise AssertionError("probe must enable GRR rearm without a userspace write")
@@ -108,7 +112,7 @@ def main() -> None:
         ("#pragma GCC diagnostic push\n"
          '#pragma GCC diagnostic ignored "-Wsign-compare"\n'
          + extract_function(source, name) + "\n#pragma GCC diagnostic pop")
-        if name == "trigger_store" else extract_function(source, name)
+        if name in ("trigger_store", "grr_rearm_store") else extract_function(source, name)
         for name in FUNCTION_NAMES
     )
     scaffold = MOCK.read_text(encoding="utf-8")

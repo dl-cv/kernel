@@ -237,7 +237,8 @@
  *   p23 GRR (TRIGGER pin VD):   0xFD70 -> trigger_pin_select=2 (GPI2/pin51)
  *
  * This board PWM (GPIO0_B5 / pwm1_ch1_m0) is wired to package pin 51
- * TRIGGER=GPI2, so use 0xFD70, not the p24 FLASH/GPIO0 value.
+ * TRIGGER=GPI2, so the legacy PWM path uses 0xFD70. Software GRR must
+ * disconnect this input: a high GPI2 otherwise prevents per-shot rearming.
  */
 #define AR0521_GPI_PIN_GPI2			2
 #define AR0521_GPI_PIN_NONE			7
@@ -252,6 +253,11 @@
 	 (AR0521_GPI_PIN_NONE << AR0521_GPI_SADDR_PIN_SELECT_SHIFT))
 static_assert(AR0521_SLAVE_GPIO_CTRL2 == 0xFD70,
 	      "slave gpi_status must be AND9573 p23 TRIGGER/GPI2 recipe");
+#define AR0521_GRR_GPIO_CTRL2			\
+	(AR0521_SLAVE_GPIO_CTRL2 | \
+	 (AR0521_GPI_PIN_NONE << AR0521_GPI_TRIGGER_PIN_SELECT_SHIFT))
+static_assert(AR0521_GRR_GPIO_CTRL2 == 0xFFF0,
+	      "software GRR must not accept a pin trigger");
 #define AR0521_SLAVE_VD_TRIG			0x8000
 
 #define OF_CAMERA_PINCTRL_STATE_DEFAULT		"rockchip,camera_default"
@@ -1126,7 +1132,7 @@ static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 	}
 
 	/* AND9573 p23/p24: stop stream, then GPI/VD/GRR, then stream.
-	 * 0x3026 uses TRIGGER/GPI2 (0xFD70), not FLASH/GPI0 (0xFC70).
+	 * Software GRR isolates the PWM input; only the legacy path uses GPI2.
 	 */
 	ret = ar0521_stream_bit(sensor, false);
 	if (ret)
@@ -1140,6 +1146,7 @@ static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 	if (ret)
 		goto rollback;
 	ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_CTRL2,
+			       sensor->grr_rearm ? AR0521_GRR_GPIO_CTRL2 :
 			       AR0521_SLAVE_GPIO_CTRL2);
 	if (ret)
 		goto rollback;
@@ -1860,7 +1867,7 @@ static ssize_t trigger_pulse_us_store(struct device *dev,
 
 static DEVICE_ATTR_RW(trigger_pulse_us);
 
-/* Legacy fallback switch; errors require an explicit stream cycle. */
+/* Switch while stopped: reconnecting a high GPI input can emit a frame. */
 static ssize_t grr_rearm_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
 {
@@ -1883,9 +1890,12 @@ static ssize_t grr_rearm_store(struct device *dev, struct device_attribute *attr
 	if (ret)
 		return ret;
 	mutex_lock(&sensor->mutex);
-	sensor->grr_rearm = enable;
+	if (sensor->streaming && sensor->grr_rearm != enable)
+		ret = -EBUSY;
+	else
+		sensor->grr_rearm = enable;
 	mutex_unlock(&sensor->mutex);
-	return count;
+	return ret ? ret : count;
 }
 
 static DEVICE_ATTR_RW(grr_rearm);
