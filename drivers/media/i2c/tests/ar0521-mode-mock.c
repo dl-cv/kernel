@@ -42,9 +42,11 @@ typedef uint64_t u64;
 #define AR0521_GRR_GPIO_CTRL2 0xFFF0
 #define AR0521_SLAVE_VD_TRIG 0x8000
 enum ar0521_op_mode { AR0521_FREE_RUN, AR0521_TRIGGER_ONE_SHOT };
+enum ar0521_trigger_shutter_mode { AR0521_TRIGGER_ERS, AR0521_TRIGGER_GRR };
 struct v4l2_ctrl { int val; };
 struct v4l2_subdev { void *priv; };
 struct ar0521 {
+    int grr_phase;
     void *dev;
     int mutex;
     struct v4l2_subdev sd;
@@ -58,6 +60,10 @@ struct ar0521 {
 #define mutex_lock(m) ((void)(m))
 #define mutex_unlock(m) ((void)(m))
 #define dev_err(...) ((void)0)
+#define dev_info(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define atomic_set(p, v) (*(p) = (v))
+#define AR0521_GRR_IDLE 0
 #define __v4l2_ctrl_grab(c, v) ((void)(c))
 static struct {
     struct ar0521 sensor;
@@ -198,6 +204,37 @@ static void check_sequence(void)
     for (i = 0; i < g.event_count; i++) if (g.events[i] == EV_ON) last_on = i;
     for (i = last_on + 1; i < g.event_count; i++) CHECK(g.events[i] != EV_CONFIG);
 }
+static void test_shutter_switch(void)
+{
+    init(true, AR0521_TRIGGER_ONE_SHOT);
+    g.sensor.slave_backup_valid = true;
+    CHECK(ar0521_set_trigger_shutter_mode_locked(&g.sensor, AR0521_TRIGGER_ERS, true) == 0);
+    CHECK(!g.sensor.grr_rearm && g.sensor.streaming && !g.sensor.grr_faulted);
+    CHECK(g.sensor.active_mode == AR0521_TRIGGER_ONE_SHOT && g.pm_refs == 1);
+    CHECK(g.stream_on == 1 && g.unsafe_config == 0);
+}
+static void test_shutter_switch_rollback(void)
+{
+    init(true, AR0521_TRIGGER_ONE_SHOT);
+    g.sensor.slave_backup_valid = true;
+    g.write_fail_reg = 0x3026; g.write_fail_nth = 2; g.write_errno = -EREMOTEIO;
+    CHECK(ar0521_set_trigger_shutter_mode_locked(&g.sensor, AR0521_TRIGGER_ERS, true) == -EREMOTEIO);
+    CHECK(g.sensor.grr_rearm && g.sensor.streaming && !g.sensor.grr_faulted);
+    CHECK(g.sensor.active_mode == AR0521_TRIGGER_ONE_SHOT && g.pm_refs == 1);
+    CHECK(g.stream_on == 1 && g.unsafe_config == 0);
+}
+static void test_shutter_preference_only(void)
+{
+    init(true, AR0521_FREE_RUN);
+    CHECK(ar0521_set_trigger_shutter_mode_locked(&g.sensor, AR0521_TRIGGER_ERS, true) == 0);
+    CHECK(!g.sensor.grr_rearm && g.sensor.streaming && g.stream_on == 0);
+}
+static void test_sysfs_shutter_change_busy_while_streaming(void)
+{
+    init(true, AR0521_FREE_RUN);
+    CHECK(ar0521_set_trigger_shutter_mode_locked(&g.sensor, AR0521_TRIGGER_ERS, false) == -EBUSY);
+    CHECK(g.sensor.grr_rearm && g.sensor.streaming && g.stream_on == 0);
+}
 static void test_mode_sequence(void)
 {
     init(true, AR0521_FREE_RUN);
@@ -335,7 +372,8 @@ static void test_slave_gate_stop(int failure)
 #define RUN(expr) do { int before = failures; cases++; expr; printf("%s: %s\n", failures == before ? "PASS" : "FAILED", #expr); } while (0)
 int main(void)
 {
-    RUN(test_mode_sequence()); RUN(test_start_sequence()); RUN(test_free_start_sequence());
+    RUN(test_shutter_switch()); RUN(test_shutter_switch_rollback());
+    RUN(test_shutter_preference_only()); RUN(test_sysfs_shutter_change_busy_while_streaming()); RUN(test_mode_sequence()); RUN(test_start_sequence()); RUN(test_free_start_sequence());
     RUN(test_stop_sequence()); RUN(test_entry_leaves_stopped());
     for (int k = 0; k < 4; k++) { RUN(test_stop_failure(k, false)); RUN(test_stop_failure(k, true)); }
     RUN(test_long_frame()); RUN(test_long_exposure());

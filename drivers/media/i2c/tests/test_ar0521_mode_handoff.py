@@ -17,7 +17,7 @@ FUNCTIONS = (
     "ar0521_exit_slave_locked", "ar0521_apply_mode_regs_locked",
     "ar0521_config_grr_seq_trigger_locked", "ar0521_restore_ctrls_for_mode_locked",
     "ar0521_exit_lp11_locked", "ar0521_stream_on_bits", "ar0521_stream_off_bits",
-    "ar0521_mode_switch", "ar0521_s_stream",
+    "ar0521_mode_switch", "ar0521_set_trigger_shutter_mode_locked", "ar0521_s_stream",
 )
 
 

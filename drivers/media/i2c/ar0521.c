@@ -282,12 +282,23 @@ static_assert(AR0521_GRR_GPIO_CTRL2 == 0xFFF0,
 #define V4L2_CID_AR0521_LIGHT_SOURCE_ACTIVE_LEVEL (V4L2_CID_USER_AR0521_BASE + 0x3)
 #define V4L2_CID_AR0521_LIGHT_SOURCE_ADVANCE_US	(V4L2_CID_USER_AR0521_BASE + 0x4)
 #define V4L2_CID_AR0521_LIGHT_SOURCE_OFF_DELAY_US (V4L2_CID_USER_AR0521_BASE + 0x5)
+#define V4L2_CID_AR0521_TRIGGER_SHUTTER_MODE	(V4L2_CID_USER_AR0521_BASE + 0x6)
 
 #define be					cpu_to_be16
 
 enum ar0521_op_mode {
 	AR0521_FREE_RUN = 0,
 	AR0521_TRIGGER_ONE_SHOT = 1,
+};
+
+enum ar0521_trigger_shutter_mode {
+	AR0521_TRIGGER_ERS = 0,
+	AR0521_TRIGGER_GRR = 1,
+};
+
+static const char * const ar0521_trigger_shutter_mode_menu[] = {
+	"ers",
+	"grr",
 };
 
 static const char * const ar0521_supply_names[] = {
@@ -1695,10 +1706,27 @@ out:
 }
 
 static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl);
+static int ar0521_get_volatile_ctrl(struct v4l2_ctrl *ctrl);
+static int ar0521_set_trigger_shutter_mode_locked(
+	struct ar0521 *sensor, enum ar0521_trigger_shutter_mode mode,
+	bool allow_live_restart);
 static int ar0521_mode_switch(struct ar0521 *sensor, enum ar0521_op_mode new_mode);
 
 static const struct v4l2_ctrl_ops ar0521_ctrl_ops = {
 	.s_ctrl = ar0521_set_ctrl,
+	.g_volatile_ctrl = ar0521_get_volatile_ctrl,
+};
+
+static const struct v4l2_ctrl_config ar0521_trigger_shutter_mode_ctrl_cfg = {
+	.ops = &ar0521_ctrl_ops,
+	.id = V4L2_CID_AR0521_TRIGGER_SHUTTER_MODE,
+	.type = V4L2_CTRL_TYPE_MENU,
+	.name = "ar0521_trigger_shutter_mode",
+	.min = AR0521_TRIGGER_ERS,
+	.max = AR0521_TRIGGER_GRR,
+	.def = AR0521_TRIGGER_GRR,
+	.qmenu = ar0521_trigger_shutter_mode_menu,
+	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 };
 
 static const struct v4l2_ctrl_config ar0521_op_mode_ctrl_cfg = {
@@ -1909,6 +1937,10 @@ static ssize_t trigger_pulse_us_store(struct device *dev,
 
 static DEVICE_ATTR_RW(trigger_pulse_us);
 
+static int ar0521_set_trigger_shutter_mode_locked(
+	struct ar0521 *sensor, enum ar0521_trigger_shutter_mode mode,
+	bool allow_live_restart);
+
 /* Switch while stopped: reconnecting a high GPI input can emit a frame. */
 static ssize_t grr_rearm_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
@@ -1932,10 +1964,8 @@ static ssize_t grr_rearm_store(struct device *dev, struct device_attribute *attr
 	if (ret)
 		return ret;
 	mutex_lock(&sensor->mutex);
-	if (sensor->streaming && sensor->grr_rearm != enable)
-		ret = -EBUSY;
-	else
-		sensor->grr_rearm = enable;
+	ret = ar0521_set_trigger_shutter_mode_locked(sensor,
+		enable ? AR0521_TRIGGER_GRR : AR0521_TRIGGER_ERS, false);
 	mutex_unlock(&sensor->mutex);
 	return ret ? ret : count;
 }
@@ -1987,7 +2017,7 @@ static int ar0521_ctrls_init(struct ar0521 *sensor)
 	if (ret < 0)
 		return ret;
 
-	ret = v4l2_ctrl_handler_init(handler, 20);
+	ret = v4l2_ctrl_handler_init(handler, 24);
 	if (ret)
 		return ret;
 
@@ -2047,6 +2077,8 @@ static int ar0521_ctrls_init(struct ar0521 *sensor)
 	sensor->op_mode_ctrl = v4l2_ctrl_new_custom(handler,
 						    &ar0521_op_mode_ctrl_cfg,
 						    NULL);
+	v4l2_ctrl_new_custom(handler,
+				     &ar0521_trigger_shutter_mode_ctrl_cfg, NULL);
 	sensor->light_source_enable_ctrl =
 		v4l2_ctrl_new_custom(handler, &ar0521_light_source_enable_cfg,
 				     NULL);
@@ -2525,6 +2557,105 @@ stop_failed:
 	return ret;
 }
 
+static int ar0521_set_trigger_shutter_mode_locked(
+	struct ar0521 *sensor, enum ar0521_trigger_shutter_mode mode,
+	bool allow_live_restart)
+{
+	bool old_mode = sensor->grr_rearm;
+	int ret, rec_ret;
+
+	if (mode != AR0521_TRIGGER_ERS && mode != AR0521_TRIGGER_GRR)
+		return -EINVAL;
+	if (old_mode == (mode == AR0521_TRIGGER_GRR))
+		return 0;
+	if (!allow_live_restart && sensor->streaming)
+		return -EBUSY;
+	if (!sensor->streaming ||
+	    sensor->active_mode != AR0521_TRIGGER_ONE_SHOT) {
+		sensor->grr_rearm = mode == AR0521_TRIGGER_GRR;
+		return 0;
+	}
+	if (!allow_live_restart)
+		return -EBUSY;
+
+	ret = pm_runtime_resume_and_get(sensor->dev);
+	if (ret < 0)
+		return ret;
+
+	ar0521_light_source_set_locked(sensor, false);
+	ret = ar0521_stream_off_bits(sensor);
+	if (ret)
+		goto stop_failed;
+	ret = ar0521_exit_slave_locked(sensor);
+	if (ret)
+		goto restore_old;
+
+	sensor->grr_rearm = mode == AR0521_TRIGGER_GRR;
+	ret = ar0521_apply_mode_regs_locked(sensor, AR0521_TRIGGER_ONE_SHOT);
+	if (!ret)
+		ret = ar0521_restore_ctrls_for_mode_locked(sensor,
+						   AR0521_TRIGGER_ONE_SHOT);
+	if (!ret)
+		ret = ar0521_exit_lp11_locked(sensor);
+	if (!ret)
+		ret = ar0521_stream_bit(sensor, true);
+	if (!ret) {
+		atomic_set(&sensor->grr_phase, AR0521_GRR_IDLE);
+		sensor->grr_faulted = false;
+		ar0521_light_source_set_locked(sensor, sensor->light_source_enabled);
+		dev_info(sensor->dev,
+			 "trigger shutter switch old_mode=%u new_mode=%u streaming=%u faulted=%u\n",
+			 old_mode, sensor->grr_rearm, sensor->streaming,
+			 sensor->grr_faulted);
+		pm_runtime_put(sensor->dev);
+		return 0;
+	}
+
+restore_old:
+	sensor->grr_rearm = old_mode;
+	rec_ret = ar0521_stream_off_bits(sensor);
+	if (!rec_ret)
+		rec_ret = ar0521_apply_mode_regs_locked(sensor,
+						    AR0521_TRIGGER_ONE_SHOT);
+	if (!rec_ret)
+		rec_ret = ar0521_restore_ctrls_for_mode_locked(sensor,
+						   AR0521_TRIGGER_ONE_SHOT);
+	if (!rec_ret)
+		rec_ret = ar0521_exit_lp11_locked(sensor);
+	if (!rec_ret)
+		rec_ret = ar0521_stream_bit(sensor, true);
+	if (rec_ret)
+		goto stop_failed;
+
+	sensor->grr_faulted = false;
+	ar0521_light_source_set_locked(sensor, sensor->light_source_enabled);
+	dev_warn(sensor->dev,
+		 "trigger shutter switch rollback old_mode=%u new_mode=%u streaming=%u faulted=%u ret=%d\n",
+		 old_mode, mode, sensor->streaming, sensor->grr_faulted, ret);
+	pm_runtime_put(sensor->dev);
+	return ret;
+
+stop_failed:
+	sensor->grr_rearm = old_mode;
+	sensor->grr_faulted = true;
+	ar0521_light_source_set_locked(sensor, false);
+	dev_err(sensor->dev,
+		"trigger shutter switch failed old_mode=%u new_mode=%u streaming=%u faulted=%u ret=%d\n",
+		old_mode, mode, sensor->streaming, sensor->grr_faulted, ret);
+	pm_runtime_put(sensor->dev);
+	return ret;
+}
+
+static int ar0521_get_volatile_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct ar0521 *sensor = container_of(ctrl->handler, struct ar0521, ctrls);
+
+	if (ctrl->id == V4L2_CID_AR0521_TRIGGER_SHUTTER_MODE)
+		ctrl->val = sensor->grr_rearm ? AR0521_TRIGGER_GRR :
+			AR0521_TRIGGER_ERS;
+	return 0;
+}
+
 static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ar0521 *sensor = container_of(ctrl->handler, struct ar0521, ctrls);
@@ -2533,6 +2664,8 @@ static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	if (ctrl->id == V4L2_CID_AR0521_OP_MODE)
 		return ar0521_mode_switch(sensor, ctrl->val);
+	if (ctrl->id == V4L2_CID_AR0521_TRIGGER_SHUTTER_MODE)
+		return ar0521_set_trigger_shutter_mode_locked(sensor, ctrl->val, true);
 
 	mode = ar0521_ctrl_mode_locked(sensor);
 
@@ -2612,7 +2745,7 @@ static int ar0521_set_ctrl(struct v4l2_ctrl *ctrl)
 	}
 	if (ctrl->id == V4L2_CID_EXPOSURE &&
 	    mode == AR0521_TRIGGER_ONE_SHOT &&
-	    sensor->slave_backup_valid) {
+	    sensor->grr_rearm && sensor->slave_backup_valid) {
 		int grr_ret = ar0521_apply_grr_timing_locked(sensor, ctrl->val);
 
 		if (!ret)

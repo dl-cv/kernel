@@ -134,6 +134,10 @@ enum ar0521_op_mode {
 	AR0521_FREE_RUN = 0,
 	AR0521_TRIGGER_ONE_SHOT = 1,
 };
+enum ar0521_trigger_shutter_mode {
+	AR0521_TRIGGER_ERS,
+	AR0521_TRIGGER_GRR,
+};
 
 struct v4l2_ctrl { int val; };
 
@@ -695,6 +699,19 @@ static int ar0521_apply_grr_timing_locked(struct ar0521 *sensor, u32 exposure_us
 {
 	UNUSED(sensor);
 	UNUSED(exposure_us);
+	return 0;
+}
+
+static int ar0521_set_trigger_shutter_mode_locked(
+	struct ar0521 *sensor, enum ar0521_trigger_shutter_mode mode,
+	bool allow_live_restart)
+{
+	bool rearm = mode == AR0521_TRIGGER_GRR;
+
+	if (!allow_live_restart && sensor->streaming &&
+	    sensor->grr_rearm != rearm)
+		return -EBUSY;
+	sensor->grr_rearm = rearm;
 	return 0;
 }
 
