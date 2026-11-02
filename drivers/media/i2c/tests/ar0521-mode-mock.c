@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#ifdef _MSC_VER
+#define __attribute__(attr)
+#define EREMOTEIO 121
+#endif
 
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -40,6 +44,7 @@ typedef uint64_t u64;
 #define AR0521_SLAVE_GPIO_GPO_1 0x0002
 #define AR0521_SLAVE_GPIO_CTRL2 0xFD70
 #define AR0521_GRR_GPIO_CTRL2 0xFFF0
+#define AR0521_GPI_PIN_GPI2 2
 #define AR0521_SLAVE_VD_TRIG 0x8000
 enum ar0521_op_mode { AR0521_FREE_RUN, AR0521_TRIGGER_ONE_SHOT };
 enum ar0521_trigger_shutter_mode { AR0521_TRIGGER_ERS, AR0521_TRIGGER_GRR };
@@ -48,6 +53,7 @@ struct v4l2_subdev { void *priv; };
 struct ar0521 {
     int grr_phase;
     void *dev;
+    void *trigger_pwm;
     int mutex;
     struct v4l2_subdev sd;
     struct v4l2_ctrl *exposure, *vblank, *anal_gain, *vflip, *hflip, *test_pattern;

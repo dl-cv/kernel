@@ -538,6 +538,7 @@ static int ar0521_init_trigger_pwm(struct ar0521 *sensor)
 {
 	struct pwm_state state = { 0 };
 	u64 pulse_ns;
+	int ret;
 
 	if (!sensor->trigger_pwm)
 		return 0;
@@ -547,9 +548,23 @@ static int ar0521_init_trigger_pwm(struct ar0521 *sensor)
 						ar0521_pwm_period_ns(sensor->trigger_pwm));
 	state.duty_cycle = 0;
 	state.polarity = PWM_POLARITY_NORMAL;
-	state.enabled = false;
+	state.enabled = true;
+	/* Call only with the sensor in reset/standby or its VD input isolated.
+	 * Rockchip selects active pinctrl only when enabled. Prime low at 0%
+	 * before disabling so the next pulse starts with a fresh counter.
+	 */
+	ret = pwm_apply_state(sensor->trigger_pwm, &state);
+	if (ret)
+		return ret;
 
+	/* Disabled output is not guaranteed low; ERS entry checks GPI2. */
+	state.enabled = false;
 	return pwm_apply_state(sensor->trigger_pwm, &state);
+}
+
+static void ar0521_disable_trigger_pwm(void *data)
+{
+	pwm_disable(data);
 }
 
 static int ar0521_light_source_value_locked(struct ar0521 *sensor, bool on)
@@ -1144,6 +1159,7 @@ static int ar0521_restore_slave_backup_locked(struct ar0521 *sensor)
 
 static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 {
+	u16 gpio;
 	int ret;
 	int rb;
 
@@ -1195,8 +1211,7 @@ static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 	if (ret)
 		goto rollback;
 	ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_CTRL2,
-			       sensor->grr_rearm ? AR0521_GRR_GPIO_CTRL2 :
-			       AR0521_SLAVE_GPIO_CTRL2);
+			       AR0521_GRR_GPIO_CTRL2);
 	if (ret)
 		goto rollback;
 	ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME,
@@ -1209,6 +1224,27 @@ static int ar0521_enter_slave_locked(struct ar0521 *sensor)
 	ret = ar0521_apply_grr_timing_locked(sensor, sensor->exposure->val);
 	if (ret)
 		goto rollback;
+	if (!sensor->grr_rearm) {
+		/* Prepare after every stream start/resume and hot switch. Keep VD
+		 * disconnected through PWM reconfiguration; reconnect only low.
+		 */
+		ret = ar0521_init_trigger_pwm(sensor);
+		if (ret)
+			goto rollback;
+		if (sensor->trigger_pwm) {
+			ret = ar0521_read_reg(sensor, AR0521_REG_GPIO_CTRL2, &gpio);
+			if (ret)
+				goto rollback;
+			if (gpio & BIT(AR0521_GPI_PIN_GPI2)) {
+				ret = -EIO;
+				goto rollback;
+			}
+		}
+		ret = ar0521_write_reg(sensor, AR0521_REG_GPIO_CTRL2,
+				       AR0521_SLAVE_GPIO_CTRL2);
+		if (ret)
+			goto rollback;
+	}
 
 	return 0;
 
@@ -3530,6 +3566,12 @@ static int ar0521_probe(struct i2c_client *client)
 	if (IS_ERR(sensor->trigger_pwm))
 		return dev_err_probe(dev, PTR_ERR(sensor->trigger_pwm),
 				     "failed to get trigger pwm\n");
+	if (sensor->trigger_pwm) {
+		ret = devm_add_action_or_reset(dev, ar0521_disable_trigger_pwm,
+					      sensor->trigger_pwm);
+		if (ret)
+			return ret;
+	}
 
 	sensor->pinctrl = devm_pinctrl_get(dev);
 	if (!IS_ERR(sensor->pinctrl)) {

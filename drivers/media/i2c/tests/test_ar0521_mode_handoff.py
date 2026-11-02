@@ -37,13 +37,20 @@ def main():
         names.append("ar0521_wait_standby_locked")
     bodies = [extract_function(source, name) for name in names]
     prototypes = "\n".join(body[:body.index("{")].strip() + ";" for body in bodies)
-    mock = pathlib.Path(__file__).with_name("ar0521-mode-mock.c").read_text()
+    mock = pathlib.Path(__file__).with_name("ar0521-mode-mock.c").read_text(encoding="utf-8")
     generated = out / "ar0521-mode-host.c"
-    generated.write_text(mock.replace("/* ACTUAL_FUNCTIONS */", prototypes + "\n" + "\n\n".join(bodies)))
+    generated.write_text(mock.replace("/* ACTUAL_FUNCTIONS */", prototypes + "\n" + "\n\n".join(bodies)), encoding="utf-8")
     env = dict(os.environ, TMPDIR=str(out / "tmp"), TMP=str(out / "tmp"), TEMP=str(out / "tmp"))
-    binary = out / "ar0521-mode-host"
-    subprocess.run([args.cc, "-std=gnu11", "-O0", "-g", "-Wall", "-Wextra", "-Werror",
-                    "-Wno-unused-parameter", str(generated), "-o", str(binary)], check=True, env=env)
+    msvc = pathlib.Path(args.cc).name.lower() in ("cl", "cl.exe")
+    binary = out / ("ar0521-mode-host.exe" if msvc else "ar0521-mode-host")
+    if msvc:
+        command = [args.cc, "/nologo", "/TC", "/std:c11", "/W4", "/WX",
+                   "/wd4100", "/wd4244", "/wd4505", str(generated),
+                   "/Fe:" + str(binary), "/Fo:" + str(out / "mode.obj")]
+    else:
+        command = [args.cc, "-std=gnu11", "-O0", "-g", "-Wall", "-Wextra", "-Werror",
+                   "-Wno-unused-parameter", str(generated), "-o", str(binary)]
+    subprocess.run(command, check=True, env=env, cwd=out)
     subprocess.run([str(binary)], check=True, env=env)
 
 
