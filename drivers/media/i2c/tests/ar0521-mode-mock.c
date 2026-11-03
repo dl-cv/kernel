@@ -47,11 +47,13 @@ typedef uint64_t u64;
 #define AR0521_GPI_PIN_GPI2 2
 #define AR0521_SLAVE_VD_TRIG 0x8000
 enum ar0521_op_mode { AR0521_FREE_RUN, AR0521_TRIGGER_ONE_SHOT };
+enum ar0521_ers_phase { AR0521_ERS_IDLE };
 enum ar0521_trigger_shutter_mode { AR0521_TRIGGER_ERS, AR0521_TRIGGER_GRR };
 struct v4l2_ctrl { int val; };
 struct v4l2_subdev { void *priv; };
 struct ar0521 {
     int grr_phase;
+    int ers_phase;
     void *dev;
     void *trigger_pwm;
     int mutex;
@@ -80,6 +82,7 @@ static struct {
     int pm_refs, read_fail_nth, write_fail_nth, read_errno, write_errno;
     u16 read_fail_reg, write_fail_reg;
     bool stopped, standby_seen, never_standby;
+    int light_state;
     bool block_after_error, error_seen, fail_stream_on, block_after_stream_error;
     int events[4096], event_count;
 } g;
@@ -163,7 +166,7 @@ static void pm_runtime_put_autosuspend(void *d) { g.pm_refs--; }
 static void pm_runtime_mark_last_busy(void *d) { }
 static void ar0521_update_ctrl_visibility_locked(struct ar0521 *s, enum ar0521_op_mode m) { }
 static void ar0521_update_exposure_range_locked(struct ar0521 *s, enum ar0521_op_mode m, int v) { }
-static void ar0521_light_source_set_locked(struct ar0521 *s, bool on) { }
+static void ar0521_light_source_set_locked(struct ar0521 *s, bool on) { (void)s; g.light_state = on; }
 static int ar0521_light_source_init_locked(struct ar0521 *s) { return 0; }
 static int ar0521_init_trigger_pwm(struct ar0521 *s) { return 0; }
 static int ar0521_apply_analog_gain_locked(struct ar0521 *s, int v) { return ar0521_write_reg(s, 0x305E, v); }
@@ -214,20 +217,22 @@ static void test_shutter_switch(void)
 {
     init(true, AR0521_TRIGGER_ONE_SHOT);
     g.sensor.slave_backup_valid = true;
+    g.sensor.light_source_enabled = true;
     CHECK(ar0521_set_trigger_shutter_mode_locked(&g.sensor, AR0521_TRIGGER_ERS, true) == 0);
     CHECK(!g.sensor.grr_rearm && g.sensor.streaming && !g.sensor.grr_faulted);
     CHECK(g.sensor.active_mode == AR0521_TRIGGER_ONE_SHOT && g.pm_refs == 1);
-    CHECK(g.stream_on == 1 && g.unsafe_config == 0);
+    CHECK(g.stream_on == 0 && g.unsafe_config == 0 && g.light_state == 0);
 }
 static void test_shutter_switch_rollback(void)
 {
     init(true, AR0521_TRIGGER_ONE_SHOT);
     g.sensor.slave_backup_valid = true;
-    g.write_fail_reg = 0x3026; g.write_fail_nth = 2; g.write_errno = -EREMOTEIO;
+    g.sensor.light_source_enabled = true;
+    g.write_fail_reg = 0x034C; g.write_fail_nth = 1; g.write_errno = -EREMOTEIO;
     CHECK(ar0521_set_trigger_shutter_mode_locked(&g.sensor, AR0521_TRIGGER_ERS, true) == -EREMOTEIO);
     CHECK(g.sensor.grr_rearm && g.sensor.streaming && !g.sensor.grr_faulted);
     CHECK(g.sensor.active_mode == AR0521_TRIGGER_ONE_SHOT && g.pm_refs == 1);
-    CHECK(g.stream_on == 1 && g.unsafe_config == 0);
+    CHECK(g.stream_on == 1 && g.unsafe_config == 0 && g.light_state == 1);
 }
 static void test_shutter_preference_only(void)
 {
@@ -255,6 +260,15 @@ static void test_start_sequence(void)
     CHECK(ar0521_s_stream(&g.sensor.sd, 1) == 0);
     CHECK(g.sensor.streaming && g.pm_refs == 1);
     check_sequence();
+}
+static void test_ers_start_sequence(void)
+{
+    init(false, AR0521_TRIGGER_ONE_SHOT);
+    g.sensor.grr_rearm = false;
+    CHECK(ar0521_s_stream(&g.sensor.sd, 1) == 0);
+    CHECK(g.sensor.streaming && g.pm_refs == 1);
+    CHECK(g.stream_on == 0);
+    CHECK(g.regs[AR0521_REG_RESET] == 0x0218);
 }
 static void test_free_start_sequence(void)
 {
@@ -379,7 +393,7 @@ static void test_slave_gate_stop(int failure)
 int main(void)
 {
     RUN(test_shutter_switch()); RUN(test_shutter_switch_rollback());
-    RUN(test_shutter_preference_only()); RUN(test_sysfs_shutter_change_busy_while_streaming()); RUN(test_mode_sequence()); RUN(test_start_sequence()); RUN(test_free_start_sequence());
+    RUN(test_shutter_preference_only()); RUN(test_sysfs_shutter_change_busy_while_streaming()); RUN(test_mode_sequence()); RUN(test_start_sequence()); RUN(test_ers_start_sequence()); RUN(test_free_start_sequence());
     RUN(test_stop_sequence()); RUN(test_entry_leaves_stopped());
     for (int k = 0; k < 4; k++) { RUN(test_stop_failure(k, false)); RUN(test_stop_failure(k, true)); }
     RUN(test_long_frame()); RUN(test_long_exposure());

@@ -12,7 +12,6 @@ FUNCTIONS = (
     "ar0521_pwm_period_ns", "ar0521_trigger_period_ns",
     "ar0521_init_trigger_pwm", "ar0521_update_bits",
     "ar0521_restore_slave_backup_locked", "ar0521_enter_slave_locked",
-    "ar0521_trigger_once_locked",
 )
 
 

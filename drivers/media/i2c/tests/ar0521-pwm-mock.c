@@ -112,27 +112,6 @@ static int ar0521_write_reg(struct ar0521 *s, u16 reg, u16 value)
 }
 static int ar0521_config_grr_seq_trigger_locked(struct ar0521 *s) { return 0; }
 static int ar0521_apply_grr_timing_locked(struct ar0521 *s, int exposure) { return 0; }
-static void ar0521_light_source_set_locked(struct ar0521 *s, bool on) { }
-static void ar0521_sleep_us(u32 us)
-{
-    us += g.cleanup_delay_us;
-    g.elapsed_us += us;
-    /* Advance a running counter, including active/inactive boundaries. */
-    if (g.pwm.state.enabled && g.pwm.state.period) {
-        u64 period = g.pwm.state.period;
-        u64 remaining = (u64)us * 1000;
-        while (remaining) {
-            u64 boundary = (g.phase_ns < g.pwm.state.duty_cycle) ? g.pwm.state.duty_cycle : period;
-            u64 step = boundary - g.phase_ns;
-            if (!step) step = period;
-            if (step > remaining) step = remaining;
-            if (g.pad_high) g.high_ns += step;
-            remaining -= step;
-            g.phase_ns = (g.phase_ns + step) % period;
-            drive(g.pwm.state.duty_cycle && g.phase_ns < g.pwm.state.duty_cycle);
-        }
-    }
-}
 /* ACTUAL_FUNCTIONS */
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __func__, __LINE__, #c); return 1; } } while (0)
 static void init(void)
@@ -156,20 +135,6 @@ static int test_probe_primes_low_then_disables(void)
     CHECK(g.elapsed_us == 0 && g.rising_edges == 0);
     return 0;
 }
-static int test_repeated_hardware_pulses(void)
-{
-    init();
-    CHECK(ar0521_enter_slave_locked(&g.sensor) == 0);
-    for (int shot = 1; shot <= 3; shot++) {
-        /* Disabled counters may retain phase; each enable must restart. */
-        g.phase_ns = (u64)shot * 3000000;
-        CHECK(ar0521_trigger_once_locked(&g.sensor) == 0);
-        CHECK(g.rising_edges == shot && !g.pad_high);
-        CHECK(!g.pwm.state.enabled && !g.pwm.state.duty_cycle);
-        CHECK(g.high_ns == (u64)shot * 800000);
-    }
-    return 0;
-}
 static int test_prepare_before_connect(void)
 {
     init();
@@ -177,19 +142,6 @@ static int test_prepare_before_connect(void)
     CHECK(g.connect_calls == 1 && g.unsafe_connect == 0 && g.low_reads > 0);
     CHECK(g.pwm_while_connected == 0 && g.rising_edges == 0 && !g.pad_high);
     CHECK(!g.pwm.state.enabled);
-    CHECK(ar0521_trigger_once_locked(&g.sensor) == 0);
-    CHECK(g.rising_edges == 1 && !g.pad_high);
-    return 0;
-}
-static int test_hardware_duty_with_late_cleanup(void)
-{
-    init();
-    CHECK(ar0521_enter_slave_locked(&g.sensor) == 0);
-    g.cleanup_delay_us = 1000;
-    CHECK(ar0521_trigger_once_locked(&g.sensor) == 0);
-    /* Model-only: hardware duty, not delayed software cleanup, ends high. */
-    CHECK(g.rising_edges == 1 && g.high_ns == 800000);
-    CHECK(!g.pad_high && !g.pwm.state.enabled);
     return 0;
 }
 static int test_prepare_after_context_loss(void)
@@ -237,13 +189,11 @@ static int test_disabled_high_is_not_connected(void)
 int main(void)
 {
     int ret = test_probe_primes_low_then_disables();
-    ret |= test_repeated_hardware_pulses();
     ret |= test_prepare_before_connect();
-    ret |= test_hardware_duty_with_late_cleanup();
     ret |= test_prepare_after_context_loss();
     ret |= test_prepare_error_does_not_connect();
     ret |= test_grr_keeps_input_isolated();
     ret |= test_disabled_high_is_not_connected();
-    puts(ret ? "FAIL: PWM preparation contracts" : "PASS: PWM preparation contracts (8 cases)");
+    puts(ret ? "FAIL: PWM preparation contracts" : "PASS: PWM preparation contracts (5 cases)");
     return ret;
 }

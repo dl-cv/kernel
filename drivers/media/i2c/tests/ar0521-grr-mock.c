@@ -129,6 +129,7 @@ enum ar0521_grr_phase {
 	AR0521_GRR_WAIT_END,
 	AR0521_GRR_DONE,
 	AR0521_GRR_ERROR,
+	AR0521_GRR_CLOSING,
 };
 
 enum ar0521_op_mode {
@@ -155,6 +156,10 @@ struct ar0521 {
 	struct work_struct grr_pwm_work;
 	struct completion grr_start;
 	struct completion grr_end;
+	struct completion grr_reclose;
+	struct workqueue_struct *grr_reclose_wq;
+	struct work_struct grr_reclose_work;
+	struct mutex grr_gate_lock;
 	spinlock_t grr_irq_lock;
 	struct notifier_block grr_frame_notifier;
 	atomic_t grr_phase;
@@ -174,6 +179,8 @@ struct ar0521 {
 	struct v4l2_ctrl *exposure;
 	int grr_pwm_ret;
 	int grr_last_ret;
+	int ers_last_ret;
+	int grr_reclose_ret;
 	u64 grr_pwm_call_ns;
 	u64 grr_start_ns;
 	u64 grr_end_ns;
@@ -255,6 +262,8 @@ struct mock_state {
 
 	int pwm_ret;
 	int pwm_calls;
+	int ers_trigger_calls;
+	int ers_trigger_ret;
 	int init_trigger_pwm_calls;
 	int init_trigger_pwm_ret;
 	int stream_on_calls;
@@ -275,6 +284,9 @@ struct mock_state {
 	bool inject_start_and_end_on_release_read;
 	bool inject_start_on_prepare_read;
 	bool inject_end_on_first_vd_read;
+	bool inject_end_on_empty_flush;
+	bool inject_start_after_reclose;
+	bool hold_worker_on_irq;
 
 	u16 reg_values[65536];
 	u16 vd_reg;
@@ -285,6 +297,7 @@ struct mock_state {
 	u16 gpio_after_rearm;
 	u64 clock_ns;
 	u64 clock_step_ns;
+	u64 end_schedule_delay_ns;
 	bool initialized;
 };
 
@@ -296,7 +309,9 @@ static int ar0521_grr_frame_irq(struct v4l2_subdev *sd, u32 status,
 				bool *handled);
 static int ar0521_grr_frame_notify(struct notifier_block *nb,
 					unsigned long action, void *data);
+static int ar0521_ers_trigger_locked(struct ar0521 *sensor);
 static int ar0521_grr_gate(struct ar0521 *sensor, u16 value);
+static void ar0521_grr_reclose_work(struct work_struct *work);
 static int ar0521_grr_trigger_locked(struct ar0521 *sensor);
 static void ar0521_grr_pwm_work(struct work_struct *work);
 
@@ -363,6 +378,15 @@ static void mock_irq(u32 status)
 	ar0521_grr_frame_irq(&sensor->sd, status, &handled);
 	record_event(EV_IRQ, 0, status, 1, phase,
 		     atomic_read(&sensor->grr_phase), released, handled);
+	if (status == RK_CAMERA_FRAME_END) {
+		if (!g.hold_worker_on_irq && sensor->grr_reclose_work.queued &&
+		    !sensor->grr_reclose_work.completed) {
+			sensor->grr_reclose_work.func(&sensor->grr_reclose_work);
+			sensor->grr_reclose_work.queued = false;
+			sensor->grr_reclose_work.completed = true;
+		}
+		g.clock_ns += g.end_schedule_delay_ns;
+	}
 }
 
 static void apply_wait_action(enum wait_action action)
@@ -415,7 +439,28 @@ static unsigned long wait_for_completion_timeout(struct completion *completion,
 	if (!completion->done)
 		return 0;
 	completion->done--;
+	if (completion == &sensor->grr_reclose &&
+	    g.inject_start_after_reclose) {
+		g.inject_start_after_reclose = false;
+		mock_irq(RK_CAMERA_FRAME_START);
+	}
 	return 1;
+}
+
+static int ar0521_ers_frame_irq(struct v4l2_subdev *sd, u32 status,
+			      bool *handled)
+{
+	UNUSED(sd);
+	UNUSED(status);
+	*handled = false;
+	return 0;
+}
+
+static int ar0521_ers_trigger_locked(struct ar0521 *sensor)
+{
+	UNUSED(sensor);
+	g.ers_trigger_calls++;
+	return g.ers_trigger_ret;
 }
 
 static int ar0521_write_reg(struct ar0521 *sensor, u16 reg, u16 value)
@@ -612,6 +657,12 @@ static bool __attribute__((unused)) flush_work(struct work_struct *work)
 {
 	bool pending = work->queued && !work->completed;
 
+	if (!pending && g.inject_end_on_empty_flush) {
+		g.inject_end_on_empty_flush = false;
+		g.hold_worker_on_irq = true;
+		mock_irq(RK_CAMERA_FRAME_END);
+		g.hold_worker_on_irq = false;
+	}
 	record_event(EV_FLUSH, 0, pending, pending,
 		     atomic_read(&g.sensor.grr_phase),
 		     atomic_read(&g.sensor.grr_phase),
@@ -678,6 +729,7 @@ static int kstrtobool(const char *buf, bool *value)
 	*value = result != 0;
 	return 0;
 }
+#define mutex_init(m) UNUSED(m)
 #define mutex_lock(lock) UNUSED(lock)
 #define mutex_unlock(lock) UNUSED(lock)
 static int ar0521_trigger_once_locked(struct ar0521 *sensor);
@@ -756,11 +808,16 @@ static void reset_mock(void)
 	spin_lock_init(&g.sensor.grr_irq_lock);
 	init_completion(&g.sensor.grr_start);
 	init_completion(&g.sensor.grr_end);
+	init_completion(&g.sensor.grr_reclose);
+	g.sensor.grr_reclose_wq = &g.wq;
+	g.sensor.grr_reclose_work.func = ar0521_grr_reclose_work;
+	g.sensor.grr_reclose_ret = -EINPROGRESS;
 	atomic_set(&g.sensor.grr_phase, AR0521_GRR_IDLE);
 	atomic_set(&g.sensor.grr_released, 0);
 	atomic_set(&g.sensor.grr_release_requested, 0);
 	g.sensor.grr_pwm_work.func = ar0521_grr_pwm_work;
 	g.queue_result = true;
+	g.ers_trigger_ret = 0;
 	g.clock_step_ns = 1000000ULL;
 	g.vd_reg = AR0521_SLAVE_VD_TRIG;
 	g.seq_trigger = AR0521_REG_GLOBAL_SEQ_TRIGGER_GRR;
@@ -916,7 +973,7 @@ static void test_normal_direct_release(void)
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, 0, "normal trigger must succeed");
 	CHECK_EQ(g.pwm_calls, 0, "direct release emits no PWM");
-	CHECK_EQ(count_events(EV_FLUSH), 0, "direct release has no PWM work to join");
+	CHECK_EQ(count_events(EV_FLUSH), 1, "normal trigger drains the frame-end worker");
 	CHECK_EQ(count_events(EV_CANCEL), 0, "normal trigger must not cancel work");
 	CHECK_EQ(g.stream_off_calls, 0, "normal trigger must keep streaming");
 	CHECK_EQ(g.init_trigger_pwm_calls, 0,
@@ -931,7 +988,7 @@ static void test_normal_direct_release(void)
 		   "normal trigger must observe START");
 	CHECK_EQ(irq_event(RK_CAMERA_FRAME_START, 0)->released, 1,
 		 "START must only be accepted after gate0 readback");
-	CHECK_EQ(count_events(EV_QUEUE), 0, "direct release must not queue work");
+	CHECK_EQ(count_events(EV_QUEUE), 1, "frame end must queue one reclose worker");
 	case_end("normal direct release");
 }
 
@@ -1328,7 +1385,7 @@ static void test_gate_diagnostic_reclose_mismatch(void)
 	CHECK_EQ(g.sensor.grr_gate_write_ret, 0, "mismatch is not write errno");
 	CHECK_EQ(g.sensor.grr_gate_read_ret, 0, "mismatch is not read errno");
 	CHECK_EQ(g.sensor.grr_gate_calls, 4, "cleanup gate still executed");
-	CHECK_EQ(count_events(EV_WAIT), 2, "reclose failure follows END wait");
+	CHECK_EQ(count_events(EV_WAIT), 3, "reclose failure follows END and worker waits");
 	case_end("gate diagnostics reclose mismatch survives cleanup");
 }
 
@@ -1363,13 +1420,86 @@ static void test_reclose_timeout(void)
 	g.clock_step_ns = 9000000ULL;
 	ret = ar0521_grr_trigger_locked(&g.sensor);
 	CHECK_EQ(ret, -ETIME, "reclose later than 8ms must return ETIME");
-	CHECK_EQ(count_events(EV_WAIT), 2,
-		 "reclose budget is measured after END");
+	CHECK_EQ(count_events(EV_WAIT), 3,
+		 "reclose budget is measured after END and worker wait");
 	CHECK_EQ(count_events(EV_CANCEL), 0, "direct release has no PWM work to join");
 	CHECK_EQ(g.pwm_calls, 0, "reclose timeout must not leave runnable work");
 	CHECK_TRUE(g.sensor.grr_faulted, "reclose timeout must fault");
 	check_failure_cleanup();
 	case_end("reclose over 8ms");
+}
+
+static void test_late_end_cannot_queue_after_flush(void)
+{
+	int ret;
+
+	case_begin();
+	g.start_action = WAIT_START;
+	g.inject_end_on_empty_flush = true;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, -ETIMEDOUT, "missing END still reports its original timeout");
+	CHECK_TRUE(!g.sensor.grr_reclose_work.queued,
+		   "late FE must not queue work after the transaction fence");
+	CHECK_TRUE(atomic_read(&g.sensor.grr_phase) == AR0521_GRR_IDLE,
+		   "transaction must end IDLE after draining the closing fence");
+	CHECK_TRUE(g.sensor.grr_faulted, "late FE timeout must keep the sensor faulted");
+	check_failure_cleanup();
+	case_end("late END cannot cross transaction boundary");
+}
+
+static void test_error_before_out_is_not_cleared(void)
+{
+	int ret;
+
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	g.inject_start_after_reclose = true;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, -EPROTO, "ERROR before out must not become success");
+	CHECK_TRUE(g.sensor.grr_faulted, "ERROR before out must fault");
+	CHECK_TRUE(!g.sensor.grr_reclose_work.queued,
+		   "ERROR before out must not leave a queued worker");
+	check_failure_cleanup();
+	case_end("ERROR before out remains an error");
+}
+
+static void test_extra_end_during_closing_fails(void)
+{
+	int ret;
+
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	g.inject_end_on_empty_flush = true;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, -EPROTO, "extra FE during closing must fail the transaction");
+	CHECK_TRUE(!g.sensor.grr_reclose_work.queued,
+		   "extra FE during closing must not queue another worker");
+	CHECK_TRUE(g.sensor.grr_faulted, "extra FE during closing must fault");
+	check_failure_cleanup();
+	case_end("extra END during closing remains an error");
+}
+
+static void test_reclose_worker_covers_end_schedule_delay(void)
+{
+	int ret;
+
+	case_begin();
+	g.start_action = WAIT_START;
+	g.end_action = WAIT_END;
+	g.end_schedule_delay_ns = 12000000ULL;
+	ret = ar0521_grr_trigger_locked(&g.sensor);
+	CHECK_EQ(ret, 0,
+		 "frame-end worker must close before the sysfs thread resumes");
+	CHECK_TRUE(g.sensor.grr_reclose_ns > g.sensor.grr_end_ns,
+		   "reclose confirmation must follow frame end");
+	CHECK_TRUE(g.sensor.grr_reclose_ns - g.sensor.grr_end_ns <= 8000000ULL,
+		   "frame-end worker must stay inside the existing 8ms budget");
+	CHECK_EQ(g.stream_off_calls, 0, "normal worker path must keep streaming");
+	CHECK_TRUE(!g.sensor.grr_faulted,
+		   "scheduler delay after frame end must not fault a completed shot");
+	case_end("frame-end worker covers sysfs schedule delay");
 }
 
 static void test_pwm_idle_failure_preserves_error(void)
@@ -1480,6 +1610,7 @@ static void test_quick_stream_fault_isolation(void)
 static void test_quick_stream_nonfault_on(void)
 {
 	case_begin();
+	g.sensor.grr_rearm = true;
 	CHECK_EQ(ar0521_quick_stream(&g.sensor, true), 0,
 		 "non-fault quick-on must still succeed");
 	CHECK_EQ(g.exit_lp11_calls, 1,
@@ -1491,6 +1622,18 @@ static void test_quick_stream_nonfault_on(void)
 	CHECK_TRUE(!g.sensor.grr_faulted,
 		 "non-fault quick-on must not create a fault");
 	case_end("quick_stream nonfault on preserved");
+}
+
+static void test_quick_stream_ers_stays_standby(void)
+{
+	case_begin();
+	g.sensor.grr_rearm = false;
+	CHECK_EQ(ar0521_quick_stream(&g.sensor, true), 0,
+		 "ERS quick-on must succeed without starting a stream");
+	CHECK_EQ(g.exit_lp11_calls, 1, "ERS quick-on still prepares LP11");
+	CHECK_EQ(g.stream_on_calls, 0, "ERS quick-on must stay in standby");
+	CHECK_TRUE(!g.sensor.grr_faulted, "ERS quick-on must not fault");
+	case_end("ERS quick_stream keeps standby");
 }
 
 static void test_grr_trigger_fault_gate(void)
@@ -1549,7 +1692,7 @@ static void test_direct_release_no_pwm_or_poll(void)
 	g.end_action = WAIT_END;
 	CHECK_EQ(ar0521_grr_trigger_locked(&g.sensor), 0, "release must not require SHUTTER high");
 	CHECK_EQ(g.poll_calls, 0, "direct release must not poll SHUTTER");
-	CHECK_EQ(count_events(EV_QUEUE), 0, "direct release must not enqueue PWM");
+	CHECK_EQ(count_events(EV_QUEUE), 1, "only the frame-end close worker is queued");
 	CHECK_EQ(g.pwm_calls, 0, "direct release must emit zero PWM");
 	CHECK_EQ(g.sensor.grr_pwm_call_ns, 0, "PWM diagnostic remains zero");
 	case_end("direct release zero PWM and no SHUTTER poll");
@@ -1683,18 +1826,59 @@ static void test_grr_rearm_store_streaming_policy(void)
 static void test_trigger_store_routes(void)
 {
 	int rearm;
+
 	for (rearm = 0; rearm <= 1; rearm++) {
 		case_begin();
 		g.sensor.grr_rearm = rearm;
+		g.sensor.grr_last_ret = 77;
+		g.sensor.ers_last_ret = 77;
 		g.start_action = WAIT_START;
 		g.end_action = WAIT_END;
-		CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), 1, "actual trigger_store succeeds");
-		CHECK_EQ(g.pwm_calls, rearm ? 0 : 1, "legacy PWM vs direct release routing");
-		CHECK_EQ(count_reg_write(0, 1), rearm ? 1 : 0, "only GRR releases the gate");
+		CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), 1,
+			 "actual trigger_store succeeds");
+		CHECK_EQ(g.ers_trigger_calls, rearm ? 0 : 1,
+			 "ERS and GRR route separately");
+		CHECK_EQ(g.pwm_calls, 0, "trigger store must not use PWM");
+		CHECK_EQ(count_reg_write(0, 1), rearm ? 1 : 0,
+			 "only GRR releases the gate");
+		CHECK_EQ(rearm ? g.sensor.grr_last_ret : g.sensor.ers_last_ret,
+			 0, "successful route updates its diagnostic ret");
+		CHECK_EQ(rearm ? g.sensor.ers_last_ret : g.sensor.grr_last_ret,
+			 77, "successful route preserves the other diagnostic");
+
 		g.sensor.grr_faulted = true;
-		CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), -EIO, "fault blocks both routes");
-		CHECK_EQ(g.pwm_calls, rearm ? 0 : 1, "fault does not emit PWM");
-		case_end(rearm ? "store direct route" : "store legacy PWM route");
+		g.sensor.grr_last_ret = 88;
+		g.sensor.ers_last_ret = 88;
+		CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), -EIO,
+			 "fault blocks both routes");
+		CHECK_EQ(rearm ? g.sensor.grr_last_ret : g.sensor.ers_last_ret,
+			 -EIO, "fault path updates its diagnostic ret");
+
+		g.sensor.grr_faulted = false;
+		if (!rearm) {
+			g.sensor.ers_last_ret = 99;
+			g.ers_trigger_ret = -EAGAIN;
+			CHECK_EQ(trigger_store(&g.dev, NULL, "1", 1), -EAGAIN,
+				 "ERS early return propagates");
+			CHECK_EQ(g.sensor.ers_last_ret, -EAGAIN,
+				 "ERS early return updates diagnostic ret");
+			g.ers_trigger_ret = 0;
+		}
+
+		g.sensor.grr_last_ret = 66;
+		g.sensor.ers_last_ret = 66;
+		CHECK_EQ(trigger_store(&g.dev, NULL, "2", 1), -EINVAL,
+			 "invalid trigger value is rejected");
+		CHECK_EQ(rearm ? g.sensor.grr_last_ret : g.sensor.ers_last_ret,
+			 -EINVAL, "invalid trigger path updates diagnostic ret");
+		g.sensor.grr_faulted = true;
+		g.sensor.grr_last_ret = 55;
+		g.sensor.ers_last_ret = 55;
+		CHECK_EQ(trigger_store(&g.dev, NULL, "bad", 3), -EINVAL,
+			 "invalid trigger text is rejected");
+		CHECK_EQ(rearm ? g.sensor.grr_last_ret : g.sensor.ers_last_ret,
+			 -EINVAL, "parse error updates diagnostic ret");
+		case_end(rearm ? "store diagnostic GRR" : "store diagnostic ERS");
 	}
 }
 
@@ -1799,6 +1983,10 @@ int main(void)
 	test_gate_diagnostic_reclose_mismatch();
 	test_gate_diagnostic_transaction_reset();
 	test_reclose_timeout();
+	test_late_end_cannot_queue_after_flush();
+	test_error_before_out_is_not_cleared();
+	test_extra_end_during_closing_fails();
+	test_reclose_worker_covers_end_schedule_delay();
 	test_pwm_idle_failure_preserves_error();
 	test_notify_other_terminal_no_state_change();
 	test_notify_same_terminal_enters_real_irq();
@@ -1806,6 +1994,7 @@ int main(void)
 	test_grr_trigger_fault_gate();
 	test_quick_stream_fault_isolation();
 	test_quick_stream_nonfault_on();
+	test_quick_stream_ers_stays_standby();
 
 	if (failures) {
 		printf("RESULT: FAIL (%d checks)\n", failures);

@@ -23,6 +23,7 @@
 #include <linux/pinctrl/consumer.h>
 #include <linux/pwm.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
@@ -313,6 +314,15 @@ enum ar0521_grr_phase {
 	AR0521_GRR_WAIT_END,
 	AR0521_GRR_DONE,
 	AR0521_GRR_ERROR,
+	AR0521_GRR_CLOSING,
+};
+
+enum ar0521_ers_phase {
+	AR0521_ERS_IDLE,
+	AR0521_ERS_WAIT_FS,
+	AR0521_ERS_WAIT_FE,
+	AR0521_ERS_WAIT_STANDBY,
+	AR0521_ERS_CLOSING,
 };
 
 struct ar0521 {
@@ -328,11 +338,16 @@ struct ar0521 {
 	struct pinctrl_state *pins_sleep;
 	struct pinctrl_state *pins_active_high;
 	struct mutex mutex; /* serialize streaming, controls, and trigger */
+	/* Serialize gate I2C; the worker cannot take mutex while sysfs waits. */
+	struct mutex grr_gate_lock;
 
 	/* The sysfs transaction owns mutex through gate and light cleanup. */
 	struct notifier_block grr_frame_notifier;
 	struct completion grr_start;
 	struct completion grr_end;
+	struct completion grr_reclose;
+	struct workqueue_struct *grr_reclose_wq;
+	struct work_struct grr_reclose_work;
 	spinlock_t grr_irq_lock;
 	atomic_t grr_phase;
 	atomic_t grr_released;
@@ -340,6 +355,7 @@ struct ar0521 {
 	bool grr_rearm;
 	bool grr_faulted;
 	int grr_last_ret;
+	int grr_reclose_ret;
 	u64 grr_pwm_call_ns;
 	u64 grr_start_ns;
 	u64 grr_end_ns;
@@ -353,6 +369,24 @@ struct ar0521 {
 	u16 grr_gate_actual;
 	int grr_gate_write_ret;
 	int grr_gate_read_ret;
+
+	spinlock_t ers_irq_lock;
+	atomic_t ers_phase;
+	struct completion ers_fs;
+	struct completion ers_fe;
+	struct completion ers_off;
+	struct work_struct ers_stream_off_work;
+	bool ers_protocol_error;
+	int ers_off_ret;
+	int ers_cleanup_ret;
+	int ers_last_ret;
+	u32 ers_fs_count;
+	u32 ers_fe_count;
+	u64 ers_stream_on_ns;
+	u64 ers_first_fs_ns;
+	u64 ers_off_request_ns;
+	u64 ers_first_fe_ns;
+	u64 ers_standby_ns;
 
 	bool streaming;
 	bool power_on;
@@ -849,9 +883,13 @@ static void ar0521_update_exposure_range_locked(struct ar0521 *sensor,
 	if (!sensor->exposure)
 		return;
 
-	if (mode == AR0521_TRIGGER_ONE_SHOT) {
+	if (mode == AR0521_TRIGGER_ONE_SHOT && sensor->grr_rearm) {
 		min_us = ar0521_grr_min_exposure_us();
 		max_us = AR0521_TRIGGER_EXPOSURE_US_MAX;
+	} else if (mode == AR0521_TRIGGER_ONE_SHOT) {
+		min_us = ar0521_lines_to_exposure_us(sensor, 1);
+		max_us = ar0521_lines_to_exposure_us(
+			sensor, AR0521_TOTAL_HEIGHT_MAX - AR0521_CIT_MARGIN);
 	} else {
 		u32 frame_lines = sensor->format.height + vblank;
 		u32 max_lines = frame_lines > AR0521_CIT_MARGIN ?
@@ -1052,13 +1090,27 @@ static int ar0521_apply_exposure_locked(struct ar0521 *sensor,
 	u32 frame_lines = sensor->format.height +
 			  (sensor->vblank ? sensor->vblank->val :
 					    AR0521_HEIGHT_BLANKING_MIN);
-	u32 lines = ar0521_exposure_us_to_lines_locked(sensor, exposure_us,
-						       frame_lines);
-	u32 min_fll = lines + AR0521_CIT_MARGIN;
+	u32 lines, min_fll, max_lines;
+	bool grr_trigger = mode == AR0521_TRIGGER_ONE_SHOT &&
+			   sensor->grr_rearm;
 	int ret;
 
-	/* TRIGGER: keep 0x3012 inside current FLL-4; do not grow FLL. */
-	if (mode != AR0521_TRIGGER_ONE_SHOT && frame_lines < min_fll) {
+	if (!grr_trigger) {
+		u64 request_ns = (u64)exposure_us * 1000ULL;
+
+		lines = max_t(u32, 1,
+			      DIV_ROUND_CLOSEST_ULL(request_ns,
+						    ar0521_line_period_ns(sensor)));
+		max_lines = AR0521_TOTAL_HEIGHT_MAX - AR0521_CIT_MARGIN;
+		lines = min_t(u32, lines, max_lines);
+	} else {
+		lines = ar0521_exposure_us_to_lines_locked(sensor, exposure_us,
+							   frame_lines);
+	}
+	min_fll = lines + AR0521_CIT_MARGIN;
+
+	/* ERS grows FLL; GRR keeps 0x3012 inside the current FLL-4. */
+	if (!grr_trigger && frame_lines < min_fll) {
 		frame_lines = min_fll;
 		ret = ar0521_write_reg(sensor, AR0521_REG_FRAME_LENGTH_LINES,
 				       frame_lines);
@@ -1275,11 +1327,23 @@ static int ar0521_exit_slave_locked(struct ar0521 *sensor)
 	return 0;
 }
 
+static int ar0521_config_ers_locked(struct ar0521 *sensor)
+{
+	int ret;
+
+	ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME, 0);
+	if (ret)
+		return ret;
+	return ar0521_write_reg(sensor, AR0521_REG_GLOBAL_SEQ_TRIGGER, 0);
+}
+
 static int ar0521_apply_mode_regs_locked(struct ar0521 *sensor,
 					 enum ar0521_op_mode mode)
 {
-	if (mode == AR0521_TRIGGER_ONE_SHOT)
+	if (mode == AR0521_TRIGGER_ONE_SHOT && sensor->grr_rearm)
 		return ar0521_enter_slave_locked(sensor);
+	if (mode == AR0521_TRIGGER_ONE_SHOT)
+		return ar0521_config_ers_locked(sensor);
 
 	return ar0521_exit_slave_locked(sensor);
 }
@@ -1376,6 +1440,29 @@ static int ar0521_stream_on_bits(struct ar0521 *sensor)
 	return 0;
 }
 
+static int ar0521_prepare_mode_stream_locked(struct ar0521 *sensor,
+					      enum ar0521_op_mode mode)
+{
+	int ret;
+
+	if (mode == AR0521_FREE_RUN)
+		return ar0521_stream_on_bits(sensor);
+	if (mode != AR0521_TRIGGER_ONE_SHOT)
+		return -EINVAL;
+
+	ret = ar0521_exit_lp11_locked(sensor);
+	if (ret)
+		return ret;
+	if (sensor->grr_rearm) {
+		ret = ar0521_stream_bit(sensor, true);
+		if (ret)
+			return ret;
+	}
+	__v4l2_ctrl_grab(sensor->vflip, 1);
+	__v4l2_ctrl_grab(sensor->hflip, 1);
+	return 0;
+}
+
 static int ar0521_stream_off_bits(struct ar0521 *sensor)
 {
 	int ret;
@@ -1413,6 +1500,8 @@ static int ar0521_quick_stream(struct ar0521 *sensor, bool on)
 		if (ret)
 			return ret;
 		if (sensor->active_mode == AR0521_TRIGGER_ONE_SHOT) {
+			if (!sensor->grr_rearm)
+				return 0;
 			ret = ar0521_update_bits(sensor, AR0521_REG_RESET,
 						 AR0521_REG_RESET_GPI,
 						 AR0521_REG_RESET_GPI);
@@ -1430,73 +1519,6 @@ static int ar0521_quick_stream(struct ar0521 *sensor, bool on)
 
 	ar0521_light_source_set_locked(sensor, false);
 	return ar0521_stream_bit(sensor, false);
-}
-
-static int ar0521_trigger_once_locked(struct ar0521 *sensor)
-{
-	struct pwm_state state;
-	u64 duty_ns;
-	u32 pulse_us;
-	u32 advance_us;
-	u32 off_delay_us;
-	int ret;
-
-	if (!sensor->trigger_pwm)
-		return -ENODEV;
-
-	pulse_us = clamp_t(u32, sensor->trigger_pulse_us,
-			   AR0521_TRIGGER_PULSE_US_MIN,
-			   AR0521_TRIGGER_PULSE_US_MAX);
-	duty_ns = (u64)pulse_us * 1000ULL;
-	advance_us = sensor->light_source_enabled ?
-		     sensor->light_source_advance_us : 0;
-	off_delay_us = sensor->light_source_enabled ?
-		       sensor->light_source_off_delay_us : 0;
-
-	if (sensor->light_source_enabled && sensor->light_source_gpio) {
-		ar0521_light_source_set_locked(sensor, true);
-		ar0521_sleep_us(advance_us);
-	}
-
-	pwm_get_state(sensor->trigger_pwm, &state);
-	state.period = ar0521_trigger_period_ns(duty_ns,
-						ar0521_pwm_period_ns(sensor->trigger_pwm));
-	state.duty_cycle = duty_ns;
-	state.polarity = PWM_POLARITY_NORMAL;
-	state.enabled = true;
-
-	ret = pwm_apply_state(sensor->trigger_pwm, &state);
-	if (ret)
-		goto out_light;
-
-	ar0521_sleep_us(pulse_us);
-
-	state.duty_cycle = 0;
-	state.enabled = false;
-	ret = pwm_apply_state(sensor->trigger_pwm, &state);
-	if (ret)
-		goto out_light;
-
-	dev_info(sensor->dev,
-		 "trigger pulse emitted: width=%u us idle=low active=high mode=%s streaming=%u\n",
-		 pulse_us,
-		 ar0521_op_mode_name(sensor->streaming ?
-				     sensor->active_mode :
-				     sensor->pending_mode),
-		 sensor->streaming);
-
-	if (sensor->streaming && sensor->active_mode != AR0521_TRIGGER_ONE_SHOT)
-		dev_warn(sensor->dev,
-			 "trigger pulse was emitted while active mode is %s; switch run_mode to master_fast_trigger for one-shot capture\n",
-			 ar0521_op_mode_name(sensor->active_mode));
-
-out_light:
-	if (sensor->light_source_enabled && sensor->light_source_gpio) {
-		ar0521_sleep_us(off_delay_us);
-		ar0521_light_source_set_locked(sensor, false);
-	}
-
-	return ret;
 }
 
 /* IRQ callback: no sensor mutex, I2C, or sleep. */
@@ -1527,6 +1549,11 @@ static int ar0521_grr_frame_irq(struct v4l2_subdev *sd, u32 status,
 			   AR0521_GRR_DONE) == AR0521_GRR_WAIT_END) {
 		WRITE_ONCE(sensor->grr_end_ns, ktime_get_ns());
 		complete(&sensor->grr_end);
+		if (!queue_work(sensor->grr_reclose_wq,
+				&sensor->grr_reclose_work)) {
+			WRITE_ONCE(sensor->grr_reclose_ret, -EBUSY);
+			complete(&sensor->grr_reclose);
+		}
 		goto unlock;
 	}
 	atomic_set(&sensor->grr_phase, AR0521_GRR_ERROR);
@@ -1534,6 +1561,57 @@ static int ar0521_grr_frame_irq(struct v4l2_subdev *sd, u32 status,
 	complete(&sensor->grr_end);
 unlock:
 	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
+	return 0;
+}
+
+static int ar0521_ers_frame_irq(struct v4l2_subdev *sd, u32 status,
+			      bool *handled)
+{
+	struct ar0521 *sensor = to_ar0521(sd);
+	unsigned long flags;
+	bool queue_off = false;
+	int phase;
+
+	*handled = false;
+	spin_lock_irqsave(&sensor->ers_irq_lock, flags);
+	phase = atomic_read(&sensor->ers_phase);
+	if (phase == AR0521_ERS_IDLE)
+		goto unlock;
+	*handled = true;
+	if (status == RK_CAMERA_FRAME_START) {
+		sensor->ers_fs_count++;
+		if (phase == AR0521_ERS_WAIT_FS &&
+		    sensor->ers_fs_count == 1) {
+			WRITE_ONCE(sensor->ers_first_fs_ns, ktime_get_ns());
+			atomic_set(&sensor->ers_phase, AR0521_ERS_WAIT_FE);
+			complete(&sensor->ers_fs);
+			queue_off = true;
+		} else {
+			sensor->ers_protocol_error = true;
+		}
+	} else if (status == RK_CAMERA_FRAME_END) {
+		sensor->ers_fe_count++;
+		if (phase == AR0521_ERS_WAIT_FE &&
+		    sensor->ers_fe_count == 1) {
+			WRITE_ONCE(sensor->ers_first_fe_ns, ktime_get_ns());
+			atomic_set(&sensor->ers_phase,
+				   AR0521_ERS_WAIT_STANDBY);
+			complete(&sensor->ers_fe);
+		} else {
+			sensor->ers_protocol_error = true;
+		}
+	} else {
+		sensor->ers_protocol_error = true;
+		complete(&sensor->ers_fs);
+		complete(&sensor->ers_fe);
+	}
+	if (queue_off && !queue_work(sensor->grr_reclose_wq,
+				     &sensor->ers_stream_off_work)) {
+		WRITE_ONCE(sensor->ers_off_ret, -EBUSY);
+		complete(&sensor->ers_off);
+	}
+unlock:
+	spin_unlock_irqrestore(&sensor->ers_irq_lock, flags);
 	return 0;
 }
 
@@ -1546,6 +1624,9 @@ static int ar0521_grr_frame_notify(struct notifier_block *nb,
 
 	if (!event->terminal || event->terminal != sensor->sd.fwnode)
 		return NOTIFY_DONE;
+	ar0521_ers_frame_irq(&sensor->sd, event->mask, &handled);
+	if (handled)
+		return NOTIFY_OK;
 	ar0521_grr_frame_irq(&sensor->sd, event->mask, &handled);
 	return handled ? NOTIFY_OK : NOTIFY_DONE;
 }
@@ -1555,6 +1636,7 @@ static int ar0521_grr_gate(struct ar0521 *sensor, u16 value)
 	u16 actual = 0;
 	int write_ret, read_ret = -EINPROGRESS, ret;
 
+	mutex_lock(&sensor->grr_gate_lock);
 	sensor->grr_gate_calls++;
 	write_ret = ar0521_write_reg(sensor, AR0521_REG_VD_TRIG_NEW_FRAME, value);
 	if (!write_ret)
@@ -1569,7 +1651,33 @@ static int ar0521_grr_gate(struct ar0521 *sensor, u16 value)
 		sensor->grr_gate_write_ret = write_ret;
 		sensor->grr_gate_read_ret = read_ret;
 	}
+	mutex_unlock(&sensor->grr_gate_lock);
 	return ret;
+}
+
+/* Close after FRAME_END without depending on the sysfs caller's wakeup. */
+static void ar0521_grr_reclose_work(struct work_struct *work)
+{
+	struct ar0521 *sensor = container_of(work, struct ar0521,
+					     grr_reclose_work);
+	int ret;
+
+	ret = ar0521_grr_gate(sensor, AR0521_SLAVE_VD_TRIG);
+	WRITE_ONCE(sensor->grr_reclose_ns, ktime_get_ns());
+	WRITE_ONCE(sensor->grr_reclose_ret, ret);
+	complete(&sensor->grr_reclose);
+}
+
+static void ar0521_ers_stream_off_work(struct work_struct *work)
+{
+	struct ar0521 *sensor = container_of(work, struct ar0521,
+					     ers_stream_off_work);
+	int ret;
+
+	WRITE_ONCE(sensor->ers_off_request_ns, ktime_get_ns());
+	ret = ar0521_stream_bit(sensor, false);
+	WRITE_ONCE(sensor->ers_off_ret, ret);
+	complete(&sensor->ers_off);
 }
 
 /* Use the rearm edge without host-side settling delays. Timing of the shortened
@@ -1613,6 +1721,7 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 	spin_lock_irqsave(&sensor->grr_irq_lock, flags);
 	reinit_completion(&sensor->grr_start);
 	reinit_completion(&sensor->grr_end);
+	reinit_completion(&sensor->grr_reclose);
 	atomic_set(&sensor->grr_released, 0);
 	atomic_set(&sensor->grr_release_requested, 0);
 	sensor->grr_pwm_call_ns = 0;
@@ -1621,6 +1730,7 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 	sensor->grr_release_ns = 0;
 	sensor->grr_release_request_ns = 0;
 	sensor->grr_reclose_ns = 0;
+	sensor->grr_reclose_ret = -EINPROGRESS;
 	atomic_set(&sensor->grr_phase, AR0521_GRR_WAIT_START);
 	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
 
@@ -1705,20 +1815,31 @@ static int ar0521_grr_trigger_locked(struct ar0521 *sensor)
 		ret = -EPROTO;
 		goto out;
 	}
-	ret = ar0521_grr_gate(sensor, AR0521_SLAVE_VD_TRIG);
-	sensor->grr_reclose_ns = ktime_get_ns();
+	if (!wait_for_completion_timeout(&sensor->grr_reclose,
+					 usecs_to_jiffies(8000))) {
+		ret = -ETIME;
+		goto out;
+	}
+	ret = READ_ONCE(sensor->grr_reclose_ret);
 	if (ret)
 		goto out;
-	if (sensor->grr_reclose_ns - READ_ONCE(sensor->grr_end_ns) > 8000000)
+	if (READ_ONCE(sensor->grr_reclose_ns) -
+	    READ_ONCE(sensor->grr_end_ns) > 8000000)
 		ret = -ETIME;
 
 out:
-	/* Reclose before fault recovery and delayed light-off. */
+	/* Preserve an ERROR seen before out, then fence new work before draining. */
+	spin_lock_irqsave(&sensor->grr_irq_lock, flags);
+	if (!ret && atomic_read(&sensor->grr_phase) != AR0521_GRR_DONE)
+		ret = -EPROTO;
+	atomic_set(&sensor->grr_phase, AR0521_GRR_CLOSING);
+	spin_unlock_irqrestore(&sensor->grr_irq_lock, flags);
+	flush_work(&sensor->grr_reclose_work);
 	close_ret = ar0521_grr_gate(sensor, AR0521_SLAVE_VD_TRIG);
 	if (!ret)
 		ret = close_ret;
 	spin_lock_irqsave(&sensor->grr_irq_lock, flags);
-	if (!ret && atomic_read(&sensor->grr_phase) != AR0521_GRR_DONE)
+	if (!ret && atomic_read(&sensor->grr_phase) != AR0521_GRR_CLOSING)
 		ret = -EPROTO;
 	atomic_set(&sensor->grr_release_requested, 0);
 	atomic_set(&sensor->grr_phase, AR0521_GRR_IDLE);
@@ -1738,6 +1859,160 @@ out:
 		ar0521_light_source_set_locked(sensor, false);
 	}
 	sensor->grr_last_ret = ret;
+	return ret;
+}
+
+static int ar0521_ers_trigger_locked(struct ar0521 *sensor)
+{
+	u16 frame_lines, line_length, integration_lines, status, reset;
+	u64 frame_us, exposure_us;
+	unsigned long fs_timeout, fe_timeout, flags;
+	bool light_on = false;
+	bool late_cleanup = false;
+	int ret, off_ret, close_ret = 0;
+
+	lockdep_assert_held(&sensor->mutex);
+	if (!sensor->streaming || sensor->active_mode != AR0521_TRIGGER_ONE_SHOT ||
+	    sensor->grr_rearm)
+		return -EINVAL;
+	if (sensor->grr_faulted)
+		return -EIO;
+	if (sensor->slave_backup_valid)
+		return -EBUSY;
+
+	ret = ar0521_read_reg(sensor, AR0521_REG_FRAME_STATUS, &status);
+	if (ret)
+		return ret;
+	if (!(status & AR0521_REG_FRAME_STATUS_STANDBY))
+		return -EBUSY;
+	ret = ar0521_read_reg(sensor, AR0521_REG_RESET, &reset);
+	if (ret)
+		return ret;
+	if (reset & AR0521_REG_RESET_STREAM)
+		return -EBUSY;
+
+	ret = ar0521_read_reg(sensor, AR0521_REG_FRAME_LENGTH_LINES,
+			      &frame_lines);
+	if (ret)
+		return ret;
+	ret = ar0521_read_reg(sensor, AR0521_REG_LINE_LENGTH_PCK,
+			      &line_length);
+	if (ret)
+		return ret;
+	ret = ar0521_read_reg(sensor, AR0521_REG_COARSE_INTEGRATION_TIME,
+			      &integration_lines);
+	if (ret)
+		return ret;
+	frame_us = DIV_ROUND_UP_ULL((u64)line_length * frame_lines * 1000000ULL,
+				    AR0521_PIXEL_RATE);
+	exposure_us = DIV_ROUND_UP_ULL((u64)line_length * integration_lines *
+				       1000000ULL, AR0521_PIXEL_RATE);
+	exposure_us = max_t(u64, exposure_us, sensor->exposure->val);
+	fs_timeout = usecs_to_jiffies(frame_us + 100000ULL);
+	fe_timeout = usecs_to_jiffies(frame_us + max_t(u64, frame_us,
+						       exposure_us) + 100000ULL);
+
+	spin_lock_irqsave(&sensor->ers_irq_lock, flags);
+	reinit_completion(&sensor->ers_fs);
+	reinit_completion(&sensor->ers_fe);
+	reinit_completion(&sensor->ers_off);
+	sensor->ers_protocol_error = false;
+	sensor->ers_off_ret = -EINPROGRESS;
+	sensor->ers_cleanup_ret = 0;
+	sensor->ers_fs_count = 0;
+	sensor->ers_fe_count = 0;
+	sensor->ers_stream_on_ns = 0;
+	sensor->ers_first_fs_ns = 0;
+	sensor->ers_off_request_ns = 0;
+	sensor->ers_first_fe_ns = 0;
+	sensor->ers_standby_ns = 0;
+	atomic_set(&sensor->ers_phase, AR0521_ERS_WAIT_FS);
+	spin_unlock_irqrestore(&sensor->ers_irq_lock, flags);
+
+	if (sensor->light_source_enabled && sensor->light_source_gpio) {
+		ar0521_light_source_set_locked(sensor, true);
+		light_on = true;
+		ar0521_sleep_us(sensor->light_source_advance_us);
+	}
+
+	WRITE_ONCE(sensor->ers_stream_on_ns, ktime_get_ns());
+	ret = ar0521_stream_bit(sensor, true);
+	if (ret)
+		goto out;
+	if (!wait_for_completion_timeout(&sensor->ers_fs, fs_timeout)) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	if (READ_ONCE(sensor->ers_protocol_error)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&sensor->ers_off, fs_timeout)) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	off_ret = READ_ONCE(sensor->ers_off_ret);
+	if (off_ret) {
+		ret = off_ret;
+		goto out;
+	}
+	if (READ_ONCE(sensor->ers_protocol_error)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&sensor->ers_fe, fe_timeout)) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	if (READ_ONCE(sensor->ers_protocol_error)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = ar0521_wait_standby_locked(sensor);
+	if (ret)
+		goto out;
+	WRITE_ONCE(sensor->ers_standby_ns, ktime_get_ns());
+
+out:
+	spin_lock_irqsave(&sensor->ers_irq_lock, flags);
+	if (!ret && (READ_ONCE(sensor->ers_protocol_error) ||
+		     sensor->ers_fs_count != 1 || sensor->ers_fe_count != 1))
+		ret = -EPROTO;
+	atomic_set(&sensor->ers_phase, AR0521_ERS_CLOSING);
+	spin_unlock_irqrestore(&sensor->ers_irq_lock, flags);
+	flush_work(&sensor->ers_stream_off_work);
+	spin_lock_irqsave(&sensor->ers_irq_lock, flags);
+	if (!ret && (READ_ONCE(sensor->ers_protocol_error) ||
+		     sensor->ers_fs_count != 1 || sensor->ers_fe_count != 1))
+		ret = -EPROTO;
+	spin_unlock_irqrestore(&sensor->ers_irq_lock, flags);
+	if (ret) {
+		close_ret = ar0521_stream_bit(sensor, false);
+		if (!close_ret)
+			close_ret = ar0521_wait_standby_locked(sensor);
+		sensor->ers_cleanup_ret = close_ret;
+	}
+	spin_lock_irqsave(&sensor->ers_irq_lock, flags);
+	if (!ret && (READ_ONCE(sensor->ers_protocol_error) ||
+		     sensor->ers_fs_count != 1 || sensor->ers_fe_count != 1)) {
+		ret = -EPROTO;
+		late_cleanup = true;
+	}
+	atomic_set(&sensor->ers_phase, AR0521_ERS_IDLE);
+	spin_unlock_irqrestore(&sensor->ers_irq_lock, flags);
+	if (late_cleanup) {
+		close_ret = ar0521_stream_bit(sensor, false);
+		if (!close_ret)
+			close_ret = ar0521_wait_standby_locked(sensor);
+		sensor->ers_cleanup_ret = close_ret;
+	}
+	if (ret)
+		sensor->grr_faulted = true;
+	if (light_on) {
+		ar0521_sleep_us(sensor->light_source_off_delay_us);
+		ar0521_light_source_set_locked(sensor, false);
+	}
+	sensor->ers_last_ret = ret;
 	return ret;
 }
 
@@ -1912,18 +2187,38 @@ static ssize_t trigger_store(struct device *dev, struct device_attribute *attr,
 	if (!sensor)
 		return -ENODEV;
 
-	if (kstrtouint(buf, 0, &val))
+	if (kstrtouint(buf, 0, &val)) {
+		mutex_lock(&sensor->mutex);
+		if (sensor->grr_rearm)
+			sensor->grr_last_ret = -EINVAL;
+		else
+			sensor->ers_last_ret = -EINVAL;
+		mutex_unlock(&sensor->mutex);
 		return -EINVAL;
+	}
 	if (!val)
 		return count;
-	if (val != 1)
+	if (val != 1) {
+		mutex_lock(&sensor->mutex);
+		if (sensor->grr_rearm)
+			sensor->grr_last_ret = -EINVAL;
+		else
+			sensor->ers_last_ret = -EINVAL;
+		mutex_unlock(&sensor->mutex);
 		return -EINVAL;
+	}
 
 	mutex_lock(&sensor->mutex);
-	ret = sensor->grr_faulted ? -EIO :
-		(sensor->grr_rearm ? ar0521_grr_trigger_locked(sensor) :
-		 ar0521_trigger_once_locked(sensor));
-	sensor->grr_last_ret = ret;
+	if (sensor->grr_faulted)
+		ret = -EIO;
+	else if (sensor->grr_rearm)
+		ret = ar0521_grr_trigger_locked(sensor);
+	else
+		ret = ar0521_ers_trigger_locked(sensor);
+	if (sensor->grr_rearm)
+		sensor->grr_last_ret = ret;
+	else
+		sensor->ers_last_ret = ret;
 	mutex_unlock(&sensor->mutex);
 
 	return ret ? ret : count;
@@ -2029,9 +2324,31 @@ static ssize_t grr_last_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(grr_last);
 
+static ssize_t ers_last_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct ar0521 *sensor = ar0521_from_dev(dev);
+	ssize_t len;
+
+	mutex_lock(&sensor->mutex);
+	len = sysfs_emit(buf,
+		"ret=%d faulted=%u stream_on_ns=%llu first_fs_ns=%llu off_request_ns=%llu first_fe_ns=%llu standby_ns=%llu fs_count=%u fe_count=%u protocol_error=%u off_ret=%d cleanup_ret=%d\n",
+		sensor->ers_last_ret, sensor->grr_faulted,
+		sensor->ers_stream_on_ns, sensor->ers_first_fs_ns,
+		sensor->ers_off_request_ns, sensor->ers_first_fe_ns,
+		sensor->ers_standby_ns, sensor->ers_fs_count,
+		sensor->ers_fe_count, sensor->ers_protocol_error,
+		sensor->ers_off_ret, sensor->ers_cleanup_ret);
+	mutex_unlock(&sensor->mutex);
+	return len;
+}
+
+static DEVICE_ATTR_RO(ers_last);
+
 static struct attribute *ar0521_attrs[] = {
 	&dev_attr_grr_rearm.attr,
 	&dev_attr_grr_last.attr,
+	&dev_attr_ers_last.attr,
 	&dev_attr_run_mode.attr,
 	&dev_attr_trigger.attr,
 	&dev_attr_trigger_pulse_us.attr,
@@ -2516,20 +2833,9 @@ static int ar0521_mode_switch(struct ar0521 *sensor, enum ar0521_op_mode new_mod
 	if (ret)
 		goto restore;
 
-	if (new_mode == AR0521_FREE_RUN) {
-		ret = ar0521_stream_on_bits(sensor);
-		if (ret)
-			goto restore;
-	} else {
-		ret = ar0521_exit_lp11_locked(sensor);
-		if (ret)
-			goto restore;
-		ret = ar0521_stream_bit(sensor, true);
-		if (ret)
-			goto restore;
-		__v4l2_ctrl_grab(sensor->vflip, 1);
-		__v4l2_ctrl_grab(sensor->hflip, 1);
-	}
+	ret = ar0521_prepare_mode_stream_locked(sensor, new_mode);
+	if (ret)
+		goto restore;
 
 	sensor->active_mode = new_mode;
 	sensor->streaming = true;
@@ -2547,15 +2853,9 @@ restore:
 	rec_ret = ar0521_apply_mode_regs_locked(sensor, old_active);
 	if (!rec_ret)
 		rec_ret = ar0521_restore_ctrls_for_mode_locked(sensor, old_active);
-	if (!rec_ret) {
-		if (old_active == AR0521_FREE_RUN)
-			rec_ret = ar0521_stream_on_bits(sensor);
-		else {
-			rec_ret = ar0521_exit_lp11_locked(sensor);
-			if (!rec_ret)
-				rec_ret = ar0521_stream_bit(sensor, true);
-		}
-	}
+	if (!rec_ret)
+		rec_ret = ar0521_prepare_mode_stream_locked(sensor,
+							 old_active);
 
 	if (!rec_ret && old_streaming) {
 		sensor->active_mode = old_active;
@@ -2632,13 +2932,14 @@ static int ar0521_set_trigger_shutter_mode_locked(
 		ret = ar0521_restore_ctrls_for_mode_locked(sensor,
 						   AR0521_TRIGGER_ONE_SHOT);
 	if (!ret)
-		ret = ar0521_exit_lp11_locked(sensor);
-	if (!ret)
-		ret = ar0521_stream_bit(sensor, true);
+		ret = ar0521_prepare_mode_stream_locked(sensor,
+							 AR0521_TRIGGER_ONE_SHOT);
 	if (!ret) {
 		atomic_set(&sensor->grr_phase, AR0521_GRR_IDLE);
+		atomic_set(&sensor->ers_phase, AR0521_ERS_IDLE);
 		sensor->grr_faulted = false;
-		ar0521_light_source_set_locked(sensor, sensor->light_source_enabled);
+		ar0521_light_source_set_locked(sensor,
+			(sensor->grr_rearm && sensor->light_source_enabled));
 		dev_info(sensor->dev,
 			 "trigger shutter switch old_mode=%u new_mode=%u streaming=%u faulted=%u\n",
 			 old_mode, sensor->grr_rearm, sensor->streaming,
@@ -2657,14 +2958,15 @@ restore_old:
 		rec_ret = ar0521_restore_ctrls_for_mode_locked(sensor,
 						   AR0521_TRIGGER_ONE_SHOT);
 	if (!rec_ret)
-		rec_ret = ar0521_exit_lp11_locked(sensor);
-	if (!rec_ret)
-		rec_ret = ar0521_stream_bit(sensor, true);
+		rec_ret = ar0521_prepare_mode_stream_locked(sensor,
+							 AR0521_TRIGGER_ONE_SHOT);
 	if (rec_ret)
 		goto stop_failed;
+	atomic_set(&sensor->ers_phase, AR0521_ERS_IDLE);
 
 	sensor->grr_faulted = false;
-	ar0521_light_source_set_locked(sensor, sensor->light_source_enabled);
+	ar0521_light_source_set_locked(sensor,
+		(sensor->grr_rearm && sensor->light_source_enabled));
 	dev_warn(sensor->dev,
 		 "trigger shutter switch rollback old_mode=%u new_mode=%u streaming=%u faulted=%u ret=%d\n",
 		 old_mode, mode, sensor->streaming, sensor->grr_faulted, ret);
@@ -2846,27 +3148,12 @@ static int ar0521_s_stream(struct v4l2_subdev *sd, int enable)
 	if (ret)
 		goto err_pm;
 
-	if (sensor->pending_mode == AR0521_TRIGGER_ONE_SHOT) {
-		ret = ar0521_apply_mode_regs_locked(sensor,
-						    AR0521_TRIGGER_ONE_SHOT);
-		if (ret)
-			goto err_pm;
-		ret = ar0521_exit_lp11_locked(sensor);
-		if (ret)
-			goto err_pm;
-		ret = ar0521_stream_bit(sensor, true);
-		if (ret)
-			goto err_pm;
-		__v4l2_ctrl_grab(sensor->vflip, 1);
-		__v4l2_ctrl_grab(sensor->hflip, 1);
-	} else {
-		ret = ar0521_apply_mode_regs_locked(sensor, AR0521_FREE_RUN);
-		if (ret)
-			goto err_pm;
-		ret = ar0521_stream_on_bits(sensor);
-		if (ret)
-			goto err_pm;
-	}
+	ret = ar0521_apply_mode_regs_locked(sensor, sensor->pending_mode);
+	if (ret)
+		goto err_pm;
+	ret = ar0521_prepare_mode_stream_locked(sensor, sensor->pending_mode);
+	if (ret)
+		goto err_pm;
 
 	sensor->active_mode = sensor->pending_mode;
 	sensor->streaming = true;
@@ -3597,10 +3884,27 @@ static int ar0521_probe(struct i2c_client *client)
 	}
 
 	mutex_init(&sensor->mutex);
+	mutex_init(&sensor->grr_gate_lock);
+	sensor->grr_reclose_wq = alloc_workqueue("ar0521-grr-reclose",
+						 WQ_HIGHPRI | WQ_UNBOUND, 1);
+	if (!sensor->grr_reclose_wq) {
+		ret = -ENOMEM;
+		goto err_destroy_mutex;
+	}
 	spin_lock_init(&sensor->grr_irq_lock);
+	spin_lock_init(&sensor->ers_irq_lock);
 	init_completion(&sensor->grr_start);
 	init_completion(&sensor->grr_end);
+	init_completion(&sensor->grr_reclose);
+	init_completion(&sensor->ers_fs);
+	init_completion(&sensor->ers_fe);
+	init_completion(&sensor->ers_off);
+	INIT_WORK(&sensor->grr_reclose_work, ar0521_grr_reclose_work);
+	INIT_WORK(&sensor->ers_stream_off_work, ar0521_ers_stream_off_work);
+	sensor->grr_reclose_ret = -EINPROGRESS;
+	sensor->ers_last_ret = -EINPROGRESS;
 	atomic_set(&sensor->grr_phase, AR0521_GRR_IDLE);
+	atomic_set(&sensor->ers_phase, AR0521_ERS_IDLE);
 	atomic_set(&sensor->grr_released, 0);
 	atomic_set(&sensor->grr_release_requested, 0);
 
@@ -3706,6 +4010,9 @@ err_pm:
 err_power:
 	ar0521_power_off(sensor);
 err_destroy_mutex:
+	if (sensor->grr_reclose_wq)
+		destroy_workqueue(sensor->grr_reclose_wq);
+	mutex_destroy(&sensor->grr_gate_lock);
 	mutex_destroy(&sensor->mutex);
 	return ret;
 }
@@ -3718,8 +4025,10 @@ static void ar0521_remove(struct i2c_client *client)
 	if (sensor->sysfs_registered)
 		device_remove_group(&client->dev, &ar0521_attr_group);
 	rk_camera_frame_unregister(&sensor->grr_frame_notifier);
+	destroy_workqueue(sensor->grr_reclose_wq);
 	v4l2_async_unregister_subdev(sd);
 	ar0521_subdev_cleanup(sensor);
+	mutex_destroy(&sensor->grr_gate_lock);
 	mutex_destroy(&sensor->mutex);
 
 	pm_runtime_disable(sensor->dev);

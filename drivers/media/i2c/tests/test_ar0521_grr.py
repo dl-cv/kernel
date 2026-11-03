@@ -25,6 +25,7 @@ FUNCTION_NAMES = (
     "ar0521_grr_frame_irq",
     "ar0521_grr_frame_notify",
     "ar0521_grr_gate",
+    "ar0521_grr_reclose_work",
     "ar0521_grr_trigger_locked",
     "trigger_store",
     "grr_rearm_store",
