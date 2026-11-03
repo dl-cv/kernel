@@ -7019,6 +7019,7 @@ int rkcif_update_sensor_info(struct rkcif_stream *stream)
 		terminal_sensor->lanes = terminal_sensor->mbus.bus.mipi_csi2.num_data_lanes;
 	else if (terminal_sensor->mbus.type == V4L2_MBUS_CCP2)
 		terminal_sensor->lanes = terminal_sensor->mbus.bus.mipi_csi1.data_lane;
+	rkcif_set_terminal_sensor_fwnode(stream->cifdev, terminal_sensor->sd->fwnode);
 	return ret;
 }
 

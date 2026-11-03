@@ -47,6 +47,7 @@
 #include <linux/iommu.h>
 #include <media/v4l2-event.h>
 #include <media/media-entity.h>
+#include <media/rk-camera-frame.h>
 
 #include "common.h"
 #include "isp_external.h"
@@ -430,6 +431,8 @@ int rkisp_update_sensor_info(struct rkisp_device *dev)
 	}
 
 	v4l2_subdev_call(sensor->sd, video, g_frame_interval, &sensor->fi);
+	if ((dev->isp_inp & INP_CIF) && sensor->sd)
+		rkisp_set_cif_input_sd(dev, sensor->sd);
 	dev->active_sensor = sensor;
 	i = dev->dev_id;
 	if (sensor->fi.interval.numerator)
@@ -4479,6 +4482,7 @@ int rkisp_register_isp_subdev(struct rkisp_device *isp_dev,
 	spin_lock_init(&isp_dev->cmsk_lock);
 	spin_lock_init(&isp_dev->rdbk_lock);
 	spin_lock_init(&isp_dev->aiisp_lock);
+	spin_lock_init(&isp_dev->cif_input_lock);
 	ret = kfifo_alloc(&isp_dev->rdbk_kfifo,
 		16 * sizeof(struct isp2x_csi_trigger), GFP_KERNEL);
 	if (ret < 0) {
@@ -4707,6 +4711,28 @@ static void rkisp_dvbm_start_event(struct rkisp_device *dev)
 		rkisp_dvbm_event(dev, CIF_ISP_V_START);
 }
 
+static void rkisp_cif_input_frame_event(struct rkisp_device *dev, u32 event)
+{
+	struct v4l2_subdev *input_sd;
+	u32 isp_state;
+	bool handled = false;
+
+	if (!(dev->isp_inp & INP_CIF) || IS_HDR_RDBK(dev->rd_mode))
+		return;
+	if (!(event & RK_CAMERA_FRAME_EVENTS))
+		return;
+	isp_state = READ_ONCE(dev->isp_state);
+	if (!(isp_state & ISP_START) || (isp_state & ISP_STOP))
+		return;
+
+	rcu_read_lock();
+	input_sd = rcu_dereference(dev->cif_input_sd);
+	if (input_sd)
+		v4l2_subdev_call(input_sd, core,
+				 interrupt_service_routine, event, &handled);
+	rcu_read_unlock();
+}
+
 /****************  Interrupter Handler ****************/
 
 void rkisp_mipi_isr(unsigned int mis, struct rkisp_device *dev)
@@ -4825,6 +4851,10 @@ void rkisp_isp_isr(unsigned int isp_mis,
 		ISP2X_3A_RAWAF_SUM | ISP2X_3A_RAWAF_LUM |
 		ISP2X_3A_RAWAWB;
 	bool sof_event_later = false;
+	/* Simultaneous START and END have no provable order for this bridge. */
+	bool frame_irq_error = !!(isp_mis & (CIF_ISP_DATA_LOSS |
+								CIF_ISP_PIC_SIZE_ERROR)) ||
+		((isp_mis & CIF_ISP_V_START) && (isp_mis & CIF_ISP_FRAME));
 
 	if (dev->isp_ver > ISP_V20)
 		si3a_isr_mask = 0;
@@ -4857,6 +4887,8 @@ void rkisp_isp_isr(unsigned int isp_mis,
 	v4l2_dbg(3, rkisp_debug, &dev->v4l2_dev,
 		 "isp isr:0x%x, 0x%x\n", isp_mis, isp3a_mis);
 	dev->isp_isr_cnt++;
+	if (frame_irq_error)
+		rkisp_cif_input_frame_event(dev, RK_CAMERA_FRAME_ERROR);
 	/* start edge of v_sync */
 	if (isp_mis & CIF_ISP_V_START) {
 		if (dev->hw_dev->monitor.is_en) {
@@ -4911,6 +4943,8 @@ void rkisp_isp_isr(unsigned int isp_mis,
 			rkisp_stream_frame_start(dev, isp_mis);
 			if (dev->isp_ver == ISP_V39)
 				rkisp_sditf_sof(dev, isp_mis);
+			if (!frame_irq_error)
+				rkisp_cif_input_frame_event(dev, RK_CAMERA_FRAME_START);
 			rkisp_rockit_frame_start(dev);
 		}
 vs_skip:
@@ -5010,6 +5044,8 @@ vs_skip:
 		dev->isp_err_cnt = 0;
 		dev->isp_state &= ~ISP_ERROR;
 		rkisp_stream_isp_end(dev, isp_mis);
+		if (!frame_irq_error)
+			rkisp_cif_input_frame_event(dev, RK_CAMERA_FRAME_END);
 	}
 
 	if (isp_mis & CIF_ISP_V_START) {
@@ -5077,6 +5113,8 @@ vs_skip:
 		rkisp_rockit_frame_start(dev);
 		if (dev->isp_ver == ISP_V39)
 			rkisp_sditf_sof(dev, isp_mis);
+		if (!frame_irq_error)
+			rkisp_cif_input_frame_event(dev, RK_CAMERA_FRAME_START);
 	}
 
 	if (isp_mis & ISP3X_OUT_FRM_QUARTER) {
