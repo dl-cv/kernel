@@ -36,9 +36,14 @@
 
 AR 已提供实际运行证据：构建编号 `2026110302`，源码 `b009c249399261573ccb36ae15563df4baf0158e` + dirty，后续提交 `435f268f36ed8168c6db12c79638c8d907f9031c`；镜像 19,833,856 字节，SHA-256 `0aea2c043917ba677f38c09f074b32457af5bbf39dd8810fbb17a4cfa16b84a3`。构建证据中的 `ar0521.c`（SHA-256 `a0b93872b192fb56dba0c0d37962e2e384c7495cec11bf7d3f47b8bd2722807a`）与提交 `435f268f` 的文件在换行归一后内容一致。
 
-主 Agent 需实机确认：
+## 实机验证与待验收项
 
-1. 同一 `Image` 分别烧录 IMX 与 AR 包，确认 probe、DTB 绑定和 sensor 地址/lane 与硬件一致。
-2. IMX 回归低频历史尾行、I0CLK reset、FT/V39 绿线及 trigger enable 切换。
-3. AR 回归 GRR 首枪/逐枪重关、ERS 首枪、重启恢复，并确认 IMX 场景下 AR notifier 不消费事件。
-4. 确认两个 boot 包内的 FDT 分别为对应 DTB，且默认 `boot.img` 为 IMX 包。
+2026-11-04，两机均通过正式 Admin 上传、安装并重启，运行 `#2026110401`；flash-result success，设备身份核对通过。以下仅记录旧 CamOS 兼容范围，不代表完整验收。
+
+- IMX（旧 CamOS 2026.11.3.1a0）：13 枪测试通过，包含 200/2000/20000 曝光各 3 枪、等待后 2 枪、trigger ROI/full 各 1 枪；4 并发存图、连续转场、monitor ROI/full 均通过。
+- AR（旧 CamOS 2026.11.2.2a0）：GRR 与 ERS 各 13 枪；曝光、序号、ack、8 并发存图、monitor ROI 通过。
+- AR trigger ROI 的 JPEG 首张 full 项在升级前 `#2026110302` 基线也可复现，待新 CamOS 包复测；该未通过项不纳入 Kernel 已验收结论。
+
+待用户手测：
+
+- Line0 外部输入/触发脚的实际接线、边沿与单帧触发行为尚未完成人工验收。
