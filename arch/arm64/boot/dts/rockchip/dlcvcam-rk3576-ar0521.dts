@@ -1,0 +1,9 @@
+/********************************************************************
+ * SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+ *********************************************************************/
+
+/dts-v1/;
+
+/* Explicit AR0521 board: 4 lanes, 27 MHz clock, normal-polarity trigger. */
+#include "dlcvcam-rk3576-board.dtsi"
+#include "dlcvcam-rk3576-csi0-ar0521.dtsi"

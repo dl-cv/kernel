@@ -632,6 +632,51 @@ err:
 	return ret;
 }
 
+/* Serialize candidate registration and RCU publication for the input bridge. */
+void rkisp_bind_cif_input_sd(struct rkisp_device *dev,
+			     struct v4l2_subdev *sd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->cif_input_lock, flags);
+	if (sd->entity.function == MEDIA_ENT_F_PROC_VIDEO_COMPOSER)
+		dev->cif_input_bound_sd = sd;
+	spin_unlock_irqrestore(&dev->cif_input_lock, flags);
+}
+
+void rkisp_set_cif_input_sd(struct rkisp_device *dev,
+			    struct v4l2_subdev *sd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->cif_input_lock, flags);
+	if (sd && dev->cif_input_bound_sd == sd)
+		rcu_assign_pointer(dev->cif_input_sd, sd);
+	spin_unlock_irqrestore(&dev->cif_input_lock, flags);
+}
+
+void rkisp_unbind_cif_input_sd(struct rkisp_device *dev,
+			       struct v4l2_subdev *sd)
+{
+	unsigned long flags;
+	bool cleared = false;
+
+	spin_lock_irqsave(&dev->cif_input_lock, flags);
+	if (dev->cif_input_bound_sd == sd) {
+		/* Prevent a racing active selection from republishing this subdev. */
+		dev->cif_input_bound_sd = NULL;
+	}
+	/* A rebind can replace the candidate before the old subdev unbinds. */
+	if (rcu_access_pointer(dev->cif_input_sd) == sd) {
+		RCU_INIT_POINTER(dev->cif_input_sd, NULL);
+		cleared = true;
+	}
+	spin_unlock_irqrestore(&dev->cif_input_lock, flags);
+
+	if (cleared)
+		synchronize_rcu();
+}
+
 struct rkisp_async_subdev {
 	struct v4l2_async_subdev asd;
 	struct v4l2_mbus_config mbus;
@@ -649,6 +694,7 @@ static int subdev_notifier_bound(struct v4l2_async_notifier *notifier,
 	if (isp_dev->num_sensors == ARRAY_SIZE(isp_dev->sensors))
 		return -EBUSY;
 
+	rkisp_bind_cif_input_sd(isp_dev, subdev);
 	isp_dev->sensors[isp_dev->num_sensors].mbus = s_asd->mbus;
 	isp_dev->sensors[isp_dev->num_sensors].sd = subdev;
 	++isp_dev->num_sensors;
@@ -687,6 +733,7 @@ static void subdev_notifier_unbind(struct v4l2_async_notifier *notifier,
 	struct v4l2_subdev *isp_sd = &isp_sdev->sd;
 	int i;
 
+	rkisp_unbind_cif_input_sd(isp_dev, subdev);
 	for (i = 0; i < isp_dev->num_sensors; i++) {
 		if (isp_dev->sensors[i].sd == subdev) {
 			media_entity_call(&isp_sd->entity, link_setup,

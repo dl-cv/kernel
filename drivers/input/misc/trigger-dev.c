@@ -59,6 +59,11 @@ struct trigger_dev {
 	struct device		*dev;
 	struct gpio_desc	*input_gpiod;
 	int			irq;
+	/* 外部触发总门闩；默认开启，模式/ROI 切换期间由 sysfs enable 关闭 */
+	bool			enabled;
+	/* Serialize complete enable transitions; workers use gate_mutex per action. */
+	struct mutex		config_mutex;
+	struct mutex		gate_mutex;
 	enum trigger_dev_input_mode input_mode;
 
 	/* Input device */
@@ -89,10 +94,6 @@ struct trigger_dev {
 	bool			mode_use_gpio;
 	struct mutex		mode_mutex;
 
-	/* 外部触发总门闩；默认开启，模式/ROI 切换期间由 sysfs enable 关闭 */
-	bool			enabled;
-	/* Serializes IRQ masking and pending-work cancellation. */
-	struct mutex		enable_mutex;
 
 	/* 结果指示灯：DT ok-led-gpios / ng-led-gpios；逻辑 0=inactive(灭) 1=active(亮) */
 	struct gpio_desc	*ok_led_gpiod;
@@ -109,6 +110,8 @@ struct trigger_dev {
 	atomic64_t		trigger_ok_count;
 	atomic64_t		trigger_fail_count;
 	atomic64_t		trigger_suppressed_count;
+	atomic64_t		gate_pending_dropped;
+	atomic64_t		gate_irq_count;
 	u32			max_pending;
 	u64			last_irq_ns;
 };
@@ -171,13 +174,9 @@ static int trigger_dev_set_input_mode(struct trigger_dev *tdev,
 				      enum trigger_dev_input_mode mode)
 {
 	unsigned int irq_type = trigger_dev_irq_type_for_mode(tdev, mode);
-	bool enabled;
 	int ret;
 
-	mutex_lock(&tdev->enable_mutex);
-	enabled = READ_ONCE(tdev->enabled);
-	if (enabled)
-		disable_irq(tdev->irq);
+	disable_irq(tdev->irq);
 	cancel_delayed_work_sync(&tdev->debounce_work);
 
 	ret = irq_set_irq_type(tdev->irq, irq_type);
@@ -187,31 +186,39 @@ static int trigger_dev_set_input_mode(struct trigger_dev *tdev,
 			WRITE_ONCE(tdev->input_mode, mode);
 	}
 
-	if (enabled)
-		enable_irq(tdev->irq);
-	mutex_unlock(&tdev->enable_mutex);
+	enable_irq(tdev->irq);
 	return ret;
 }
 
-static int trigger_dev_set_enabled(struct trigger_dev *tdev, bool enabled)
+static int trigger_dev_set_enabled(struct trigger_dev *tdev, bool enable)
 {
-	int dropped;
+	int pending;
 	int ret = 0;
 
-	mutex_lock(&tdev->enable_mutex);
-	if (enabled == READ_ONCE(tdev->enabled))
-		goto out;
+	/* Serialize the complete IRQ/work transition; workers take gate_mutex only. */
+	mutex_lock(&tdev->config_mutex);
+	if (enable == READ_ONCE(tdev->enabled)) {
+		mutex_unlock(&tdev->config_mutex);
+		return 0;
+	}
 
-	if (!enabled) {
-		/* Publish the closed gate before waiting for any in-flight handler. */
+	if (!enable) {
+		mutex_lock(&tdev->gate_mutex);
 		WRITE_ONCE(tdev->enabled, false);
-		disable_irq(tdev->irq);
+		mutex_unlock(&tdev->gate_mutex);
+
+		/* Keep IRQs live to avoid core resend; disabled edges are counted. */
+		synchronize_irq(tdev->irq);
 		cancel_delayed_work_sync(&tdev->debounce_work);
 		cancel_work_sync(&tdev->trigger_work);
 
-		dropped = atomic_xchg(&tdev->trigger_pending, 0);
-		if (dropped > 0)
-			atomic64_add(dropped, &tdev->trigger_suppressed_count);
+		mutex_lock(&tdev->gate_mutex);
+		pending = atomic_xchg(&tdev->trigger_pending, 0);
+		if (pending > 0) {
+			atomic64_add(pending, &tdev->trigger_suppressed_count);
+			atomic64_add(pending, &tdev->gate_pending_dropped);
+		}
+		mutex_unlock(&tdev->gate_mutex);
 
 		if (tdev->output_gpiod)
 			gpiod_set_value_cansleep(tdev->output_gpiod, 0);
@@ -222,17 +229,20 @@ static int trigger_dev_set_enabled(struct trigger_dev *tdev, bool enabled)
 			input_sync(tdev->input);
 		}
 	} else {
-		atomic_set(&tdev->trigger_pending, 0);
 		ret = trigger_dev_refresh_pressed_state(tdev);
-		if (ret)
-			goto out;
+		if (ret) {
+			mutex_unlock(&tdev->config_mutex);
+			return ret;
+		}
+
+		mutex_lock(&tdev->gate_mutex);
+		atomic_set(&tdev->trigger_pending, 0);
 		WRITE_ONCE(tdev->enabled, true);
-		enable_irq(tdev->irq);
+		mutex_unlock(&tdev->gate_mutex);
 	}
 
-out:
-	mutex_unlock(&tdev->enable_mutex);
-	return ret;
+	mutex_unlock(&tdev->config_mutex);
+	return 0;
 }
 
 /* Direct GPIO pulse (FSIN): count and interval configurable per external trigger */
@@ -337,13 +347,24 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 	s64 seq;
 	int ret;
 
-	/* Drain pending triggers (presses) */
-	while (atomic_dec_if_positive(&tdev->trigger_pending) >= 0) {
+	/* Drain pending triggers (presses); serialize actions with gate-off. */
+	for (;;) {
+		mutex_lock(&tdev->gate_mutex);
 		if (!READ_ONCE(tdev->enabled)) {
-			atomic64_inc(&tdev->trigger_suppressed_count);
-			continue;
+			pending_left = atomic_xchg(&tdev->trigger_pending, 0);
+			if (pending_left > 0) {
+				atomic64_add(pending_left,
+					     &tdev->trigger_suppressed_count);
+				atomic64_add(pending_left,
+					     &tdev->gate_pending_dropped);
+			}
+			mutex_unlock(&tdev->gate_mutex);
+			break;
 		}
-
+		if (atomic_dec_if_positive(&tdev->trigger_pending) < 0) {
+			mutex_unlock(&tdev->gate_mutex);
+			break;
+		}
 		mutex_lock(&tdev->led_mutex);
 		if (tdev->result_led_enable)
 			trigger_dev_leds_off_locked(tdev);
@@ -383,6 +404,7 @@ static void trigger_dev_trigger_work(struct work_struct *work)
 			 atomic64_read(&tdev->irq_count),
 			 atomic64_read(&tdev->trigger_ok_count),
 			 atomic64_read(&tdev->trigger_fail_count));
+		mutex_unlock(&tdev->gate_mutex);
 	}
 }
 
@@ -422,13 +444,20 @@ static void trigger_dev_debounce_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct trigger_dev, debounce_work);
 	int val;
 
+	mutex_lock(&tdev->gate_mutex);
+	if (!READ_ONCE(tdev->enabled)) {
+		mutex_unlock(&tdev->gate_mutex);
+		return;
+	}
 	val = gpiod_get_value_cansleep(tdev->input_gpiod);
 	if (val < 0) {
 		dev_err(tdev->dev, "failed to read input gpio: %d\n", val);
+		mutex_unlock(&tdev->gate_mutex);
 		return;
 	}
 
 	trigger_dev_handle_state(tdev, !!val);
+	mutex_unlock(&tdev->gate_mutex);
 }
 
 static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
@@ -441,6 +470,7 @@ static irqreturn_t trigger_dev_irq(int irq, void *dev_id)
 	atomic64_inc(&tdev->irq_count);
 	if (!READ_ONCE(tdev->enabled)) {
 		atomic64_inc(&tdev->trigger_suppressed_count);
+		atomic64_inc(&tdev->gate_irq_count);
 		return IRQ_HANDLED;
 	}
 
@@ -584,7 +614,6 @@ static int trigger_dev_probe(struct platform_device *pdev)
 	tdev->dev = dev;
 	platform_set_drvdata(pdev, tdev);
 	mutex_init(&tdev->mode_mutex);
-	mutex_init(&tdev->enable_mutex);
 	mutex_init(&tdev->led_mutex);
 	WRITE_ONCE(tdev->enabled, true);
 
@@ -621,11 +650,16 @@ static int trigger_dev_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&tdev->debounce_work, trigger_dev_debounce_work);
 	INIT_WORK(&tdev->trigger_work, trigger_dev_trigger_work);
+	mutex_init(&tdev->config_mutex);
+	mutex_init(&tdev->gate_mutex);
+	tdev->enabled = true;
 	atomic_set(&tdev->trigger_pending, 0);
 	atomic64_set(&tdev->irq_count, 0);
 	atomic64_set(&tdev->trigger_ok_count, 0);
 	atomic64_set(&tdev->trigger_fail_count, 0);
 	atomic64_set(&tdev->trigger_suppressed_count, 0);
+	atomic64_set(&tdev->gate_pending_dropped, 0);
+	atomic64_set(&tdev->gate_irq_count, 0);
 	tdev->max_pending = 0;
 	tdev->last_irq_ns = 0;
 
@@ -969,6 +1003,30 @@ static ssize_t result_led_enable_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(result_led_enable);
 
+static ssize_t enable_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(tdev->enabled));
+}
+
+static ssize_t enable_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct trigger_dev *tdev = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+	ret = trigger_dev_set_enabled(tdev, enable);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(enable);
+
 static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct trigger_dev *tdev = dev_get_drvdata(dev);
@@ -976,7 +1034,7 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 	u64 ago_us = tdev->last_irq_ns ? div_u64(now - tdev->last_irq_ns, 1000) : 0;
 
 	return sysfs_emit(buf,
-			  "enabled=%d irq=%lld ok=%lld fail=%lld suppressed=%lld pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u\n",
+			  "enabled=%d irq=%lld ok=%lld fail=%lld suppressed=%lld pending=%d max_pending=%u last_irq_ago_us=%llu input_mode=%s debounce_ms=%u gate_irq=%lld gate_pending_dropped=%lld\n",
 			  READ_ONCE(tdev->enabled),
 			  atomic64_read(&tdev->irq_count),
 			  atomic64_read(&tdev->trigger_ok_count),
@@ -986,18 +1044,21 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 			  tdev->max_pending,
 			  ago_us,
 			  trigger_dev_input_mode_name(READ_ONCE(tdev->input_mode)),
-			  tdev->debounce_ms);
+			  tdev->debounce_ms,
+			  READ_ONCE(tdev->enabled),
+			  atomic64_read(&tdev->gate_irq_count),
+			  atomic64_read(&tdev->gate_pending_dropped));
 }
 static DEVICE_ATTR_RO(stats);
 
 static struct attribute *trigger_dev_attrs[] = {
 	&dev_attr_input_mode.attr,
-	&dev_attr_enable.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_pulse_count.attr,
 	&dev_attr_pulse_interval_us.attr,
 	&dev_attr_result.attr,
 	&dev_attr_result_led_enable.attr,
+	&dev_attr_enable.attr,
 	&dev_attr_stats.attr,
 	NULL,
 };

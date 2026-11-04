@@ -179,7 +179,13 @@ sudo rkdeveloptool rd                               # 重启
 ```bash
 cd /path/to/kernel   # 本仓库
 
+# 默认统一构建并打包 IMX296、AR0521 两个板型
 ./build_bootimg.sh
+
+# 只构建指定板型
+./build_bootimg.sh --board imx296
+./build_bootimg.sh --board ar0521
+./build_bootimg.sh --board all
 
 # 内存较小时降低并行度
 ./build_bootimg.sh -j4
@@ -194,16 +200,28 @@ cd /path/to/kernel   # 本仓库
 ./build_bootimg.sh --no-bump
 ```
 
+板型与 DTB 映射：
+
+| `--board` | DTB | CSI0 配置 |
+|-----------|-----|-----------|
+| `imx296`（默认主线） | `dlcvcam-rk3576.dtb` | `0x1a`、1 lane、37.125 MHz 板载时钟、PWM inverted |
+| `ar0521` | `dlcvcam-rk3576-ar0521.dtb` | `0x36`、4 lanes、27 MHz 板载时钟、PWM normal |
+
+`dlcvcam_rk3576_kernel_cut.config` 同时启用 `CONFIG_VIDEO_IMX296=y` 与 `CONFIG_VIDEO_AR0521=y`，统一 `Image` 不因板型重复编译。
+
 ### 4.2 脚本会做什么
 
 1. **构建编号**：按 `DLCVCAM_BUILD_VERSION`（`YYYYMMDDNN`）规则自动 bump（见 §2.1）。  
-2. **配置**：无合适 `.config` 时 `lubancat_linux_rk3576_defconfig` + `dlcvcam_rk3576_kernel_cut.config`。  
-3. **编译打包**：`Image` / `dtbs` / `modules` → `Image.lz4` → `boot.img`（FIT）。  
-4. **交付文件名**（同时保留根目录 `boot.img`）：
+2. **配置**：无合适 `.config` 时 `lubancat_linux_rk3576_defconfig` + `dlcvcam_rk3576_kernel_cut.config`，同时启用两个 sensor 驱动。
+3. **编译打包**：统一编译一次 `Image` / `dtbs` / `modules` → `Image.lz4`，再分别以两个 DTB 生成 FIT `boot.img`。
+4. **交付文件名**（根目录 `boot.img` 保留兼容入口）：
 
 ```text
-boot-rk3576-6.1.99-<YYYYMMDDNN>-<git短sha[.dirty]>.img
+boot-rk3576-6.1.99-<YYYYMMDDNN>-<git短sha[.dirty]>-imx296.img
+boot-rk3576-6.1.99-<YYYYMMDDNN>-<git短sha[.dirty]>-ar0521.img
 ```
+
+默认 `--board all` 时根目录 `boot.img` 是 IMX296 包副本；使用单板参数时是该板型包副本。烧录必须选择与实机 sensor 匹配的 DTB/包。
 
 5. **完整性 sidecar（无签名，仅整包 hash）**：为 `boot.img` 与交付镜像各生成：
 
@@ -226,7 +244,8 @@ FIT 镜像本身在打包时已写入各 image 的内嵌 `sha256`（见 `boot.it
 
 ```bash
 ls -lh boot.img boot-rk3576-*.img boot-rk3576-*.img.sha256
-mkimage -l boot.img
+mkimage -l boot-rk3576-*-imx296.img
+mkimage -l boot-rk3576-*-ar0521.img
 
 # 本地再验一次（打包脚本结束时已自检）
 python3 scripts/dlcvcam_verify_bootimg.py verify boot-rk3576-*.img --require-sidecar

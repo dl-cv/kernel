@@ -2,13 +2,17 @@
 # DLCVCAM RK3576 内核自动编译脚本
 # - 自动判断初次配置 / 增量编译
 # - 若 DLCVCAM_BUILD_VERSION 对应提交与当前 HEAD 不同，则按当天日期自动 bump
-# - 产出带构建编号与短提交的 boot 镜像：boot-rk3576-6.1.99-YYYYMMDDNN-<gitsha>.img
+# - 一次编译同时产出 IMX296 与 AR0521 两个板型 boot 包
+# - 默认 IMX296 包同时写入根目录 boot.img；两个交付包均带板型后缀
 # - 同时生成整包完整性 sidecar（不使用签名，仅 .sha256）：
 #     <img>.sha256          整包 SHA-256（防传错包/截断；FIT 内嵌 hash 另由 verify 检查）
 #   板端烧录前：python3 scripts/dlcvcam_verify_bootimg.py verify <img> --require-sidecar
 #
 # 用法:
-#   ./build_bootimg.sh              # 自动判断配置并编译
+#   ./build_bootimg.sh              # 编译并打包 imx296 + ar0521（默认）
+#   ./build_bootimg.sh --board imx296
+#   ./build_bootimg.sh --board ar0521
+#   ./build_bootimg.sh --board all
 #   ./build_bootimg.sh --force-config   # 强制重新 defconfig + merge
 #   ./build_bootimg.sh --no-bump        # 不自动更新 DLCVCAM_BUILD_VERSION
 #   ./build_bootimg.sh -j4              # 指定并行度
@@ -23,7 +27,10 @@ ARCH=arm64
 CROSS_COMPILE=aarch64-linux-gnu-
 DEFCONFIG=lubancat_linux_rk3576_defconfig
 CUT_CONFIG=arch/arm64/configs/dlcvcam_rk3576_kernel_cut.config
-DTB_NAME=dlcvcam-rk3576.dtb
+DTB_DIR=arch/arm64/boot/dts/rockchip
+DTB_IMX296=dlcvcam-rk3576.dtb
+DTB_AR0521=dlcvcam-rk3576-ar0521.dtb
+BOARD_SELECT=all
 BUILD_VERSION_FILE=DLCVCAM_BUILD_VERSION
 KERNEL_VER_PREFIX="6.1.99"
 JOBS="$(nproc 2>/dev/null || echo 8)"
@@ -37,7 +44,7 @@ warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die()  { printf '\033[1;31m[%s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,12p' "$0" | sed 's/^# \?//'
+	sed -n '2,19p' "$0" | sed 's/^# \?//'
 	exit 0
 }
 
@@ -47,6 +54,14 @@ while [[ $# -gt 0 ]]; do
 		--force-config) FORCE_CONFIG=1; shift ;;
 		--clean-config) CLEAN_CONFIG=1; shift ;;
 		--no-bump) NO_BUMP=1; shift ;;
+		--board)
+			BOARD_SELECT="${2:?--board 需要 imx296|ar0521|all}"
+			shift 2
+			;;
+		--board=*)
+			BOARD_SELECT="${1#*=}"
+			shift
+			;;
 		-j*)
 			if [[ "$1" == "-j" ]]; then
 				JOBS="${2:?-j 需要并行数}"
@@ -70,6 +85,11 @@ need_cmd make
 need_cmd lz4
 need_cmd git
 need_cmd "${CROSS_COMPILE}gcc"
+
+case "${BOARD_SELECT}" in
+	imx296|ar0521|all) ;;
+	*) die "未知板型: ${BOARD_SELECT}（支持 imx296|ar0521|all）" ;;
+esac
 
 # ---------- 构建编号：相对上次提交该文件的 commit 是否变化 ----------
 # 规则：
@@ -161,18 +181,31 @@ do_initial_config() {
 	ok "配置完成"
 }
 
+selected_boards() {
+	case "${BOARD_SELECT}" in
+		imx296) echo imx296 ;;
+		ar0521) echo ar0521 ;;
+		all) echo imx296 ar0521 ;;
+	esac
+}
+
+dtb_for_board() {
+	case "$1" in
+		imx296) echo "${DTB_IMX296}" ;;
+		ar0521) echo "${DTB_AR0521}" ;;
+		*) die "未知板型: $1" ;;
+	esac
+}
+
 do_build() {
-	log "编译 Image / dtbs / modules （-j${JOBS}）..."
+	log "统一编译 Image / dtbs / modules （-j${JOBS}）..."
 	make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" \
 		Image dtbs modules -j"${JOBS}"
 
 	log "压缩 Image -> Image.lz4 ..."
 	lz4 -f arch/arm64/boot/Image arch/arm64/boot/Image.lz4
-
-	log "打包 boot.img （DTB=${DTB_NAME}）..."
-	BOOT_ITS=boot.its ./scripts/mkimg --dtb "${DTB_NAME}"
-
-	[[ -f boot.img ]] || die "未生成 boot.img"
+	[[ -f "${DTB_DIR}/${DTB_IMX296}" && -f "${DTB_DIR}/${DTB_AR0521}" ]] \
+		|| die "统一 dtbs 构建未产出两个板型 DTB"
 }
 
 is_worktree_dirty_except_build_version() {
@@ -229,48 +262,72 @@ write_bootimg_sha256_sidecar() {
 	sha256sum "${img}" | awk -v n="$(basename "${img}")" '{print $1 "  " n}' > "${img}.sha256"
 }
 
-package_named_image() {
-	local build_ver short_sha out_name kernelrelease build_id git_desc
+package_board_image() {
+	local board="$1"
+	local dtb out_name build_ver short_sha
+
+	dtb="$(dtb_for_board "${board}")"
+	[[ -f "${DTB_DIR}/${dtb}" ]] || die "缺少板型 DTB: ${DTB_DIR}/${dtb}"
 
 	build_ver="$(tr -d '[:space:]' < "${BUILD_VERSION_FILE}")"
 	short_sha="$(git rev-parse --short=8 HEAD)"
-	# 除版本文件/编译产物外还有改动时加 -dirty，避免与干净提交产物混淆
 	if is_worktree_dirty_except_build_version; then
 		short_sha="${short_sha}-dirty"
 	fi
+	out_name="boot-rk3576-${KERNEL_VER_PREFIX}-${build_ver}-${short_sha}-${board}.img"
 
-	out_name="boot-rk3576-${KERNEL_VER_PREFIX}-${build_ver}-${short_sha}.img"
-	cp -f boot.img "${out_name}"
+	log "打包 ${board} boot.img （DTB=${dtb}）..."
+	BOOT_ITS=boot.its ./scripts/mkimg --dtb "${dtb}"
+	[[ -f boot.img ]] || die "未生成 ${board} boot.img"
 
 	if command -v mkimage >/dev/null 2>&1; then
-		log "FIT 信息："
+		log "${board} FIT 信息："
 		mkimage -l boot.img || true
 	fi
 
-	kernelrelease="$(make -s ARCH="${ARCH}" kernelrelease 2>/dev/null || true)"
-	build_id="$(make -s ARCH="${ARCH}" dlcvcam-build-version 2>/dev/null || echo "${build_ver}")"
-	git_desc="$(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
-
-	log "生成整包 .sha256 并自检（FIT 内嵌 hash + 整包 sha256）..."
-	write_bootimg_sha256_sidecar "boot.img"
+	cp -f boot.img "${out_name}"
 	write_bootimg_sha256_sidecar "${out_name}"
+	PACKAGED_IMAGE="${out_name}"
+}
+
+package_named_images() {
+	local board out_name first_out="" kernelrelease build_id git_desc
+	local PACKAGED_IMAGE=""
+	local -a outputs=()
+
+	for board in $(selected_boards); do
+		package_board_image "${board}"
+		out_name="${PACKAGED_IMAGE}"
+		outputs+=("${out_name}")
+		[[ -n "${first_out}" ]] || first_out="${out_name}"
+	done
+
+	# 根目录 boot.img 与旧入口兼容：默认 all 时为 IMX296；单板选择时为该板。
+	cp -f "${first_out}" boot.img
+	write_bootimg_sha256_sidecar "boot.img"
+
+	kernelrelease="$(make -s ARCH="${ARCH}" kernelrelease 2>/dev/null || true)"
+	build_id="$(make -s ARCH="${ARCH}" dlcvcam-build-version 2>/dev/null || echo "${BUILD_VERSION_FILE}")"
+	git_desc="$(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 
 	ok "完成"
 	echo
-	echo "  kernelrelease : ${kernelrelease:-n/a}"
-	echo "  build version : ${build_id}"
-	echo "  git           : ${git_desc}"
-	echo "  boot.img      : $(ls -lh boot.img | awk '{print $5}')"
-	echo "  交付镜像      : ${out_name}  ($(ls -lh "${out_name}" | awk '{print $5}'))"
-	echo "  整包校验      : ${out_name}.sha256"
+	echo "  build selection : ${BOARD_SELECT}"
+	echo "  kernelrelease   : ${kernelrelease:-n/a}"
+	echo "  build version   : ${build_id}"
+	echo "  git             : ${git_desc}"
+	echo "  boot.img        : ${first_out}  (默认板型副本)"
+	for out_name in "${outputs[@]}"; do
+		echo "  交付镜像        : ${out_name}  ($(ls -lh "${out_name}" | awk '{print $5}'))"
+		echo "  整包校验        : ${out_name}.sha256"
+	done
 	echo
 	echo "烧录前在板卡上校验（不验签，仅 hash）："
-	echo "  python3 scripts/dlcvcam_verify_bootimg.py verify ${out_name} --require-sidecar"
-	echo "  # 或只验 FIT 内嵌 sha256（无 .sha256 时）："
-	echo "  python3 scripts/dlcvcam_verify_bootimg.py verify ${out_name}"
+	for out_name in "${outputs[@]}"; do
+		echo "  python3 scripts/dlcvcam_verify_bootimg.py verify ${out_name} --require-sidecar"
+	done
 	echo
-	echo "下一步：校验通过后再用 RKDevTool / rkdeveloptool 烧录 ${out_name}"
-	echo "  （或直接烧录 boot.img，内容相同）"
+	echo "选择与实机 sensor 匹配的板型包烧录。"
 }
 
 # ---------- main ----------
@@ -287,4 +344,4 @@ else
 fi
 
 do_build
-package_named_image
+package_named_images
