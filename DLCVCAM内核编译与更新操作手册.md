@@ -207,7 +207,7 @@ cd /path/to/kernel   # 本仓库
 | `imx296`（默认主线） | `dlcvcam-rk3576.dtb` | `0x1a`、1 lane、37.125 MHz 板载时钟、PWM inverted |
 | `ar0521` | `dlcvcam-rk3576-ar0521.dtb` | `0x36`、4 lanes、27 MHz 板载时钟、PWM normal |
 
-`dlcvcam_rk3576_kernel_cut.config` 同时启用 `CONFIG_VIDEO_IMX296=y` 与 `CONFIG_VIDEO_AR0521=y`，统一 `Image` 不因板型重复编译。
+`dlcvcam_rk3576_kernel_cut.config` 同时启用 `CONFIG_VIDEO_IMX296=y` 与 `CONFIG_VIDEO_AR0521=y`，统一 `Image` 不因板型重复编译。正式入口在编译前自动补齐并校验这两项配置，编译后再次校验两项配置和两个 DTB，通过后才打包。
 
 ### 4.2 脚本会做什么
 

@@ -168,6 +168,26 @@ need_initial_config() {
 	return 1
 }
 
+config_has_both_sensors() {
+	grep -q '^CONFIG_VIDEO_IMX296=y$' .config 2>/dev/null &&
+		grep -q '^CONFIG_VIDEO_AR0521=y$' .config 2>/dev/null
+}
+
+ensure_sensor_config() {
+	if config_has_both_sensors; then
+		log "确认 .config 同时启用 IMX296 与 AR0521"
+		return
+	fi
+
+	warn ".config 未同时启用 IMX296/AR0521，按裁剪配置补齐并 olddefconfig"
+	[[ -f "${CUT_CONFIG}" ]] || die "缺少裁剪配置: ${CUT_CONFIG}"
+	./scripts/kconfig/merge_config.sh -m .config "${CUT_CONFIG}"
+	make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
+	config_has_both_sensors ||
+		die ".config 仍未同时启用 CONFIG_VIDEO_IMX296=y 与 CONFIG_VIDEO_AR0521=y"
+	ok "双 sensor 配置补齐完成"
+}
+
 do_initial_config() {
 	log "初次配置：${DEFCONFIG} + ${CUT_CONFIG}"
 	if [[ "${CLEAN_CONFIG}" -eq 1 && -f .config ]]; then
@@ -204,8 +224,17 @@ do_build() {
 
 	log "压缩 Image -> Image.lz4 ..."
 	lz4 -f arch/arm64/boot/Image arch/arm64/boot/Image.lz4
-	[[ -f "${DTB_DIR}/${DTB_IMX296}" && -f "${DTB_DIR}/${DTB_AR0521}" ]] \
-		|| die "统一 dtbs 构建未产出两个板型 DTB"
+}
+
+verify_build_outputs() {
+	config_has_both_sensors ||
+		die "打包前校验失败: .config 未同时启用 IMX296/AR0521"
+	[[ -s "arch/arm64/boot/Image" ]] || die "缺少 arch/arm64/boot/Image"
+	[[ -s "${DTB_DIR}/${DTB_IMX296}" ]] ||
+		die "缺少 IMX296 DTB: ${DTB_DIR}/${DTB_IMX296}"
+	[[ -s "${DTB_DIR}/${DTB_AR0521}" ]] ||
+		die "缺少 AR0521 DTB: ${DTB_DIR}/${DTB_AR0521}"
+	ok "打包前校验通过：双 sensor 配置 + 双板型 DTB"
 }
 
 is_worktree_dirty_except_build_version() {
@@ -343,5 +372,7 @@ else
 	log "检测到已有 .config，走增量编译"
 fi
 
+ensure_sensor_config
 do_build
+verify_build_outputs
 package_named_images

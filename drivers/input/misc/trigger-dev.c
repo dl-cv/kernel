@@ -1003,30 +1003,6 @@ static ssize_t result_led_enable_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(result_led_enable);
 
-static ssize_t enable_show(struct device *dev,
-			   struct device_attribute *attr, char *buf)
-{
-	struct trigger_dev *tdev = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%u\n", READ_ONCE(tdev->enabled));
-}
-
-static ssize_t enable_store(struct device *dev,
-			    struct device_attribute *attr,
-			    const char *buf, size_t count)
-{
-	struct trigger_dev *tdev = dev_get_drvdata(dev);
-	bool enable;
-	int ret;
-
-	ret = kstrtobool(buf, &enable);
-	if (ret)
-		return ret;
-	ret = trigger_dev_set_enabled(tdev, enable);
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_RW(enable);
-
 static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct trigger_dev *tdev = dev_get_drvdata(dev);
@@ -1045,7 +1021,6 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 			  ago_us,
 			  trigger_dev_input_mode_name(READ_ONCE(tdev->input_mode)),
 			  tdev->debounce_ms,
-			  READ_ONCE(tdev->enabled),
 			  atomic64_read(&tdev->gate_irq_count),
 			  atomic64_read(&tdev->gate_pending_dropped));
 }

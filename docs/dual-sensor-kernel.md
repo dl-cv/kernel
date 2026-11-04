@@ -15,7 +15,7 @@
 | IMX296（默认） | `dlcvcam-rk3576.dts` | `dlcvcam-rk3576-csi0.dtsi` | `*-imx296.img`，默认同时写入根目录 `boot.img` |
 | AR0521 | `dlcvcam-rk3576-ar0521.dts` | `dlcvcam-rk3576-csi0-ar0521.dtsi` | `*-ar0521.img` |
 
-统一 `Image` 同时启用 `CONFIG_VIDEO_IMX296=y` 和 `CONFIG_VIDEO_AR0521=y`。IMX 保持 `0x1a`、1 lane、板载 37.125 MHz、PWM inverted；AR 保持 `0x36`、4 lanes、板载 27 MHz、PWM normal。
+统一 `Image` 同时启用 `CONFIG_VIDEO_IMX296=y` 和 `CONFIG_VIDEO_AR0521=y`。正式构建入口在编译前检查 `.config`，缺失任一驱动时自动合并裁剪配置并执行 `olddefconfig`；编译后再校验两项配置和两个 DTB，全部通过才打包。IMX 保持 `0x1a`、1 lane、板载 37.125 MHz、PWM inverted；AR 保持 `0x36`、4 lanes、板载 27 MHz、PWM normal。
 
 ## 冲突与共享路径
 

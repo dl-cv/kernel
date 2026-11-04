@@ -68,6 +68,12 @@ class DualSensorIntegrationTest(unittest.TestCase):
         self.assertIn("imx296", script)
         self.assertIn("ar0521", script)
         self.assertIn("boot-rk3576-", script)
+        self.assertIn("config_has_both_sensors", script)
+        self.assertIn("ensure_sensor_config", script)
+        self.assertIn("verify_build_outputs", script)
+        self.assertIn("CONFIG_VIDEO_IMX296=y", script)
+        self.assertIn("CONFIG_VIDEO_AR0521=y", script)
+        self.assertIn("merge_config.sh -m .config", script)
 
     def test_trigger_gate_is_one_shared_implementation(self):
         source = read("drivers/input/misc/trigger-dev.c")
@@ -80,6 +86,12 @@ class DualSensorIntegrationTest(unittest.TestCase):
         self.assertIn("struct mutex\t\tgate_mutex;", source)
         self.assertIn("synchronize_irq(tdev->irq);", source)
         self.assertEqual(source.count("&dev_attr_enable.attr"), 1)
+        self.assertEqual(source.count("static ssize_t enable_show("), 1)
+        self.assertEqual(source.count("static ssize_t enable_store("), 1)
+        self.assertEqual(source.count("static DEVICE_ATTR_RW(enable);"), 1)
+        stats = source[source.index("static ssize_t stats_show"):]
+        stats = stats[:stats.index("static DEVICE_ATTR_RO(stats);")]
+        self.assertEqual(stats.count("READ_ONCE(tdev->enabled)"), 1)
         self.assertIn("gate_pending_dropped", source)
         self.assertIn("gate_irq_count", source)
         self.assertIn("gpiod_set_value_cansleep(tdev->output_gpiod, 0);", source)
@@ -100,6 +112,7 @@ class DualSensorIntegrationTest(unittest.TestCase):
         self.assertIn("ar0521_config_ers_locked", ar)
         self.assertIn("AR0521_ERS_CLOSING", ar)
         self.assertIn("event->terminal != sensor->sd.fwnode", ar)
+        self.assertEqual(read(".version").strip(), "20")
 
         isp = read("drivers/media/platform/rockchip/isp/rkisp.c")
         self.assertIn("rkisp_cif_input_frame_event", isp)
