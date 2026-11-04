@@ -1039,6 +1039,96 @@ static ssize_t rkcif_store_get_exp_mode(struct device *dev,
 static DEVICE_ATTR(is_support_get_exp, 0600,
 		   rkcif_show_get_exp_mode, rkcif_store_get_exp_mode);
 
+static ssize_t rkcif_store_vicap_i0clk_reset_now(struct device *dev,
+						 struct device_attribute *attr,
+						 const char *buf, size_t len)
+{
+	struct rkcif_device *cif_dev = dev_get_drvdata(dev);
+	struct rkcif_hw *hw;
+	int cif_pm_ref;
+	int hw_pm_ref;
+	int ret;
+	int val;
+	int i;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+	if (!cif_dev || cif_dev->chip_id != CHIP_RK3576_CIF ||
+	    cif_dev->inf_id != RKCIF_MIPI_LVDS ||
+	    !cif_dev->active_sensor || !cif_dev->hw_dev)
+		return -EOPNOTSUPP;
+
+	hw = cif_dev->hw_dev;
+	mutex_lock(&cif_dev->stream_lock);
+
+	if (hw->dev_num != 1 || hw->is_in_reset ||
+	    atomic_read(&cif_dev->pipe.stream_cnt)) {
+		ret = -EBUSY;
+		goto unlock_stream;
+	}
+	for (i = 0; i < RKCIF_MAX_STREAM_MIPI; i++) {
+		struct rkcif_stream *stream = &cif_dev->stream[i];
+
+		if (stream->state != RKCIF_STATE_READY ||
+		    stream->cur_stream_mode != RKCIF_STREAM_MODE_NONE ||
+		    stream->dma_en || stream->to_en_dma ||
+		    stream->to_stop_dma || stream->stopping) {
+			ret = -EBUSY;
+			goto unlock_stream;
+		}
+	}
+	for (i = 0; i < cif_dev->sditf_cnt; i++) {
+		if (cif_dev->sditf[i] &&
+		    atomic_read(&cif_dev->sditf[i]->stream_cnt)) {
+			ret = -EBUSY;
+			goto unlock_stream;
+		}
+	}
+
+	cif_pm_ref = pm_runtime_get_if_in_use(cif_dev->dev);
+	if (cif_pm_ref <= 0) {
+		ret = cif_pm_ref < 0 ? cif_pm_ref : -EHOSTDOWN;
+		goto unlock_stream;
+	}
+	hw_pm_ref = pm_runtime_get_if_in_use(hw->dev);
+	if (hw_pm_ref <= 0) {
+		ret = hw_pm_ref < 0 ? hw_pm_ref : -EHOSTDOWN;
+		goto put_cif_pm;
+	}
+
+	mutex_lock(&hw->dev_lock);
+	if (hw->dev_num != 1 || hw->is_in_reset ||
+	    !pm_runtime_active(cif_dev->dev) || !pm_runtime_active(hw->dev) ||
+	    atomic_read(&cif_dev->power_cnt) <= 0 ||
+	    atomic_read(&hw->power_cnt) <= 0 ||
+	    atomic_read(&cif_dev->pipe.stream_cnt)) {
+		ret = -EBUSY;
+		goto unlock_hw;
+	}
+
+	ret = rkcif_hw_reset_vicap_i0clk(hw);
+	if (!ret) {
+		dev_info(cif_dev->dev, "VICAP I0CLK reset completed at READY boundary\n");
+		ret = len;
+	}
+
+unlock_hw:
+	mutex_unlock(&hw->dev_lock);
+	pm_runtime_put(hw->dev);
+put_cif_pm:
+	pm_runtime_put(cif_dev->dev);
+unlock_stream:
+	mutex_unlock(&cif_dev->stream_lock);
+	return ret;
+}
+
+static DEVICE_ATTR(vicap_i0clk_reset_now, S_IWUSR, NULL,
+		   rkcif_store_vicap_i0clk_reset_now);
+
 static struct attribute *dev_attrs[] = {
 	&dev_attr_compact_test.attr,
 	&dev_attr_wait_line.attr,
@@ -1059,6 +1149,7 @@ static struct attribute *dev_attrs[] = {
 	&dev_attr_low_latency.attr,
 	&dev_attr_reg_dbg.attr,
 	&dev_attr_is_support_get_exp.attr,
+	&dev_attr_vicap_i0clk_reset_now.attr,
 	NULL,
 };
 

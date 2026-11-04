@@ -91,7 +91,7 @@ u64 rkisp_debug_reg = 0xFFFFFFFFFLL;
 module_param_named(debug_reg, rkisp_debug_reg, ullong, 0644);
 MODULE_PARM_DESC(debug_reg, "rkisp debug register");
 
-static unsigned int rkisp_wait_line;
+unsigned int rkisp_wait_line;
 module_param_named(wait_line, rkisp_wait_line, uint, 0644);
 MODULE_PARM_DESC(wait_line, "rkisp wait line to buf done early");
 

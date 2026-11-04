@@ -993,6 +993,8 @@ static const char * const rk3576_cif_rsts[] = {
 	"rst_cif_iclk4",
 };
 
+enum { RK3576_VICAP_I0CLK_RESET_INDEX = 3 };
+
 static const struct cif_reg rk3576_cif_regs[] = {
 	[CIF_REG_DVP_CTRL] = CIF_REG(DVP_CTRL),
 	[CIF_REG_DVP_INTEN] = CIF_REG(DVP_INTEN),
@@ -1483,6 +1485,28 @@ void rkcif_hw_soft_reset(struct rkcif_hw *cif_hw, bool is_rst_iommu)
 
 	if (cif_hw->iommu_en && is_rst_iommu)
 		rkcif_iommu_enable(cif_hw);
+}
+
+int rkcif_hw_reset_vicap_i0clk(struct rkcif_hw *cif_hw)
+{
+	struct reset_control *rst;
+	int ret;
+
+	if (!cif_hw || cif_hw->chip_id != CHIP_RK3576_CIF ||
+	    !cif_hw->match_data ||
+	    cif_hw->match_data->rsts_num <= RK3576_VICAP_I0CLK_RESET_INDEX)
+		return -EOPNOTSUPP;
+
+	rst = cif_hw->cif_rst[RK3576_VICAP_I0CLK_RESET_INDEX];
+	if (!rst)
+		return -ENODEV;
+
+	ret = reset_control_assert(rst);
+	if (ret)
+		return ret;
+	udelay(5);
+
+	return reset_control_deassert(rst);
 }
 
 static int rkcif_get_efuse_value(struct device_node *np, char *porp_name,
