@@ -13,6 +13,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/pm_runtime.h>
 #include <linux/pinctrl/consumer.h>
@@ -1039,6 +1040,96 @@ static ssize_t rkcif_store_get_exp_mode(struct device *dev,
 static DEVICE_ATTR(is_support_get_exp, 0600,
 		   rkcif_show_get_exp_mode, rkcif_store_get_exp_mode);
 
+static ssize_t rkcif_store_vicap_i0clk_reset_now(struct device *dev,
+						 struct device_attribute *attr,
+						 const char *buf, size_t len)
+{
+	struct rkcif_device *cif_dev = dev_get_drvdata(dev);
+	struct rkcif_hw *hw;
+	int cif_pm_ref;
+	int hw_pm_ref;
+	int ret;
+	int val;
+	int i;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+	if (!cif_dev || cif_dev->chip_id != CHIP_RK3576_CIF ||
+	    cif_dev->inf_id != RKCIF_MIPI_LVDS ||
+	    !cif_dev->active_sensor || !cif_dev->hw_dev)
+		return -EOPNOTSUPP;
+
+	hw = cif_dev->hw_dev;
+	mutex_lock(&cif_dev->stream_lock);
+
+	if (hw->dev_num != 1 || hw->is_in_reset ||
+	    atomic_read(&cif_dev->pipe.stream_cnt)) {
+		ret = -EBUSY;
+		goto unlock_stream;
+	}
+	for (i = 0; i < RKCIF_MAX_STREAM_MIPI; i++) {
+		struct rkcif_stream *stream = &cif_dev->stream[i];
+
+		if (stream->state != RKCIF_STATE_READY ||
+		    stream->cur_stream_mode != RKCIF_STREAM_MODE_NONE ||
+		    stream->dma_en || stream->to_en_dma ||
+		    stream->to_stop_dma || stream->stopping) {
+			ret = -EBUSY;
+			goto unlock_stream;
+		}
+	}
+	for (i = 0; i < cif_dev->sditf_cnt; i++) {
+		if (cif_dev->sditf[i] &&
+		    atomic_read(&cif_dev->sditf[i]->stream_cnt)) {
+			ret = -EBUSY;
+			goto unlock_stream;
+		}
+	}
+
+	cif_pm_ref = pm_runtime_get_if_in_use(cif_dev->dev);
+	if (cif_pm_ref <= 0) {
+		ret = cif_pm_ref < 0 ? cif_pm_ref : -EHOSTDOWN;
+		goto unlock_stream;
+	}
+	hw_pm_ref = pm_runtime_get_if_in_use(hw->dev);
+	if (hw_pm_ref <= 0) {
+		ret = hw_pm_ref < 0 ? hw_pm_ref : -EHOSTDOWN;
+		goto put_cif_pm;
+	}
+
+	mutex_lock(&hw->dev_lock);
+	if (hw->dev_num != 1 || hw->is_in_reset ||
+	    !pm_runtime_active(cif_dev->dev) || !pm_runtime_active(hw->dev) ||
+	    atomic_read(&cif_dev->power_cnt) <= 0 ||
+	    atomic_read(&hw->power_cnt) <= 0 ||
+	    atomic_read(&cif_dev->pipe.stream_cnt)) {
+		ret = -EBUSY;
+		goto unlock_hw;
+	}
+
+	ret = rkcif_hw_reset_vicap_i0clk(hw);
+	if (!ret) {
+		dev_info(cif_dev->dev, "VICAP I0CLK reset completed at READY boundary\n");
+		ret = len;
+	}
+
+unlock_hw:
+	mutex_unlock(&hw->dev_lock);
+	pm_runtime_put(hw->dev);
+put_cif_pm:
+	pm_runtime_put(cif_dev->dev);
+unlock_stream:
+	mutex_unlock(&cif_dev->stream_lock);
+	return ret;
+}
+
+static DEVICE_ATTR(vicap_i0clk_reset_now, S_IWUSR, NULL,
+		   rkcif_store_vicap_i0clk_reset_now);
+
 static struct attribute *dev_attrs[] = {
 	&dev_attr_compact_test.attr,
 	&dev_attr_wait_line.attr,
@@ -1059,6 +1150,7 @@ static struct attribute *dev_attrs[] = {
 	&dev_attr_low_latency.attr,
 	&dev_attr_reg_dbg.attr,
 	&dev_attr_is_support_get_exp.attr,
+	&dev_attr_vicap_i0clk_reset_now.attr,
 	NULL,
 };
 
@@ -2066,8 +2158,11 @@ static int subdev_asyn_register_itf(struct rkcif_device *dev)
 	if (!dev->is_notifier_isp) {
 		for (i = 0; i < dev->sditf_cnt; i++) {
 			sditf = dev->sditf[i];
-			if (sditf && (!sditf->is_combine_mode))
+			if (sditf && (!sditf->is_combine_mode)) {
 				ret = v4l2_async_register_subdev_sensor(&sditf->sd);
+				if (!ret)
+					atomic_set(&sditf->is_async_registered, 1);
+			}
 		}
 		dev->is_notifier_isp = true;
 	}
@@ -2820,7 +2915,39 @@ static void rkcif_exp_work(struct work_struct *exp_work)
 	priv->frame_idx.total_frame_idx = stream->frame_idx;
 }
 
-int rkcif_plat_init(struct rkcif_device *cif_dev, struct device_node *node, int inf_id)
+void rkcif_set_terminal_sensor_fwnode(struct rkcif_device *dev,
+				      struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *new = NULL;
+	struct fwnode_handle *old;
+	unsigned long flags;
+
+	if (fwnode)
+		new = fwnode_handle_get(fwnode);
+
+	spin_lock_irqsave(&dev->terminal_fwnode_lock, flags);
+	if (dev->terminal_sensor_dying && new) {
+		spin_unlock_irqrestore(&dev->terminal_fwnode_lock, flags);
+		fwnode_handle_put(new);
+		return;
+	}
+	old = rcu_dereference_protected(dev->terminal_sensor_fwnode, 1);
+	rcu_assign_pointer(dev->terminal_sensor_fwnode, new);
+	spin_unlock_irqrestore(&dev->terminal_fwnode_lock, flags);
+
+	if (old == new) {
+		if (new)
+			fwnode_handle_put(new);
+		return;
+	}
+	if (old) {
+		synchronize_rcu();
+		fwnode_handle_put(old);
+	}
+}
+
+int rkcif_plat_init(struct rkcif_device *cif_dev,
+		    struct device_node *node, int inf_id)
 {
 	struct device *dev = cif_dev->dev;
 	struct v4l2_device *v4l2_dev;
@@ -2837,6 +2964,8 @@ int rkcif_plat_init(struct rkcif_device *cif_dev, struct device_node *node, int 
 	spin_lock_init(&cif_dev->reset_watchdog_timer.timer_lock);
 	spin_lock_init(&cif_dev->reset_watchdog_timer.csi2_err_lock);
 	spin_lock_init(&cif_dev->stream_spinlock);
+	spin_lock_init(&cif_dev->terminal_fwnode_lock);
+	cif_dev->terminal_sensor_dying = false;
 	atomic_set(&cif_dev->pipe.power_cnt, 0);
 	atomic_set(&cif_dev->pipe.stream_cnt, 0);
 	atomic_set(&cif_dev->power_cnt, 0);
@@ -2991,13 +3120,32 @@ err_unreg_v4l2_dev:
 
 int rkcif_plat_uninit(struct rkcif_device *cif_dev)
 {
+	unsigned long flags;
+	u32 mbus_type = 0;
 	int stream_num = 0;
+	int i;
 
-	if (cif_dev->active_sensor->mbus.type == V4L2_MBUS_CCP2)
+	spin_lock_irqsave(&cif_dev->terminal_fwnode_lock, flags);
+	cif_dev->terminal_sensor_dying = true;
+	spin_unlock_irqrestore(&cif_dev->terminal_fwnode_lock, flags);
+	if (cif_dev->active_sensor)
+		mbus_type = cif_dev->active_sensor->mbus.type;
+	rkcif_set_terminal_sensor_fwnode(cif_dev, NULL);
+	for (i = 0; i < cif_dev->sditf_cnt; i++) {
+		if (!cif_dev->sditf[i])
+			continue;
+		sditf_unregister_isp(cif_dev->sditf[i]);
+		cif_dev->sditf[i]->cif_dev = NULL;
+		cif_dev->sditf[i] = NULL;
+	}
+	v4l2_async_nf_unregister(&cif_dev->notifier);
+	v4l2_async_nf_cleanup(&cif_dev->notifier);
+
+	if (mbus_type == V4L2_MBUS_CCP2)
 		rkcif_unregister_lvds_subdev(cif_dev);
 
-	if (cif_dev->active_sensor->mbus.type == V4L2_MBUS_BT656 ||
-	    cif_dev->active_sensor->mbus.type == V4L2_MBUS_PARALLEL)
+	if (mbus_type == V4L2_MBUS_BT656 ||
+	    mbus_type == V4L2_MBUS_PARALLEL)
 		rkcif_unregister_dvp_sof_subdev(cif_dev);
 
 	media_device_unregister(&cif_dev->media_dev);

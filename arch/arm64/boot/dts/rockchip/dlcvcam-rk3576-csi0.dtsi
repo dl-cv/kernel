@@ -62,8 +62,8 @@
 		light-source-exposure-off-delay-us = <0>;
 
 		pinctrl-names = "default", "active-high";
-		pinctrl-0 = <&imx296_light_source_pin>;
-		pinctrl-1 = <&imx296_light_source_active_high_pin>;
+		pinctrl-0 = <&camera_light_source_pin>;
+		pinctrl-1 = <&camera_light_source_active_high_pin>;
 
 		rockchip,camera-module-index = <0>;
 		rockchip,camera-module-facing = "back";
@@ -225,4 +225,8 @@
  *----------------------------------------------------------*/
 &pwm1_6ch_1 {
 	status = "okay";
+};
+/* Explicit sensor trigger endpoint for this board DTB. */
+&trigger_dev {
+	trigger-path = "/sys/bus/i2c/devices/4-001a/trigger";
 };

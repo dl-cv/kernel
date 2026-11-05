@@ -35,6 +35,7 @@
 #ifndef _RKISP_PATH_VIDEO_H
 #define _RKISP_PATH_VIDEO_H
 
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 
 #include "common.h"
@@ -302,6 +303,7 @@ struct rkisp_stream {
 	bool is_crop_upd;
 	bool is_using_resmem;
 	bool frame_early;
+	u64 early_done_sof_ns;
 	bool need_scl_upd;
 	bool is_attach_info;
 	wait_queue_head_t done;
@@ -334,6 +336,60 @@ struct rkisp_capture_device {
 	struct tasklet_struct rd_tasklet;
 	atomic_t refcnt;
 	u32 wait_line;
+	/*
+	 * Fast-trigger early-done (V39 + IMX296):
+	 * Arm at wait_line (OUT_FRM_HALF). Complete only when MI MP Y/CB write
+	 * offsets have ramped live and reached the programmed plane sizes, then
+	 * hold post_mi_us so the last NV12 chroma beats land. ISP_OUT_LINE
+	 * saturates ~8 lines early and must not drive completion.
+	 * residual ceiling may ceiling-force when MI OFFS stay 0 (N-1 fix) but
+	 * still applies force_post_mi hold. First skip_frames SOFs use MI FE;
+	 * drop_left discards dirty MP buffers after free-run/ROI→FT.
+	 */
+	u32 early_done_delay_us;
+	struct hrtimer early_done_timer;
+	atomic_t early_done_pending;
+	/* SOF ns of the frame for which early-done is armed (0 = none). */
+	u64 early_done_armed_sof_ns;
+	u32 early_done_poll_us;
+	u32 early_done_terminal_line;
+	u32 early_done_deadline_ns_lo;
+	u32 early_done_deadline_ns_hi;
+	u32 early_done_mi_y_size;
+	u32 early_done_mi_cb_size;
+	/* SHD offs sampled when early-done was armed (live-decrease baseline). */
+	u32 early_done_mi_y_base;
+	u32 early_done_mi_cb_base;
+	/* Observed live MI activity (ramp / decrease / zero) this arm. */
+	u32 early_done_mi_saw_y;
+	u32 early_done_mi_saw_cb;
+	/* Y+CB live+full; then wait post_mi_us before vb2_done. */
+	u32 early_done_mi_ready;
+	u32 early_done_post_mi_us;
+	/* Floor hold after ceiling-force (unverified MI); >= post_mi_us. */
+	u32 early_done_force_post_mi_us;
+	u32 early_done_warmup_left;
+	u32 early_done_warmup_post_mi_us;
+	/*
+	 * SOFs after FT start that must not arm early-done (use MI FE only).
+	 * Decremented in the drain path; 0 = normal MI-poll early-done.
+	 */
+	u32 early_done_skip_frames;
+	/* Drop next N completed MP buffers (survives stream->skip_frame=0). */
+	u32 early_done_drop_left;
+	/*
+	 * Drop next N MP completes after drop+warm drain (IRQ and WORK).
+	 * 2026-08-10 #1005: warm alone still let ~5 green frames after warm=0.
+	 * 2026-08-12 #1009: must not decrement while warm>0 (IRQ hole in #1008).
+	 */
+	u32 early_done_pub_gate_left;
+	/* N-1 phase diagnostics (FT only): counts published / dropped MP frames. */
+	u32 early_done_diag_pub;
+	u32 early_done_diag_drop;
+	u32 early_done_diag_skip_sof;
+	u32 early_done_diag_arm;
+	u32 early_done_diag_complete;
+	u32 early_done_diag_ceiling;
 	u32 wrap_width;
 	u32 wrap_line;
 	bool is_done_early;
@@ -348,6 +404,13 @@ extern struct rockit_isp_ops rockit_isp_ops;
 
 void rkisp_stream_vir_cpy_image(struct work_struct *work);
 void rkisp_stream_buf_done_early(struct rkisp_device *dev);
+void rkisp_stream_buf_done_early_drain(struct rkisp_device *dev,
+				       u32 ceiling_us);
+/* Legacy name kept for non-IMX296 call sites. */
+void rkisp_stream_buf_done_early_delayed(struct rkisp_device *dev,
+					 u32 delay_us);
+void rkisp_stream_cancel_early_done(struct rkisp_device *dev);
+void rkisp_early_done_clear_state(struct rkisp_device *dev);
 void rkisp_stream_buf_done(struct rkisp_stream *stream,
 			   struct rkisp_buffer *buf);
 void rkisp_unregister_stream_vdev(struct rkisp_stream *stream);

@@ -35,6 +35,9 @@
 #ifndef _RKISP_DEV_H
 #define _RKISP_DEV_H
 
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
+
 #include "capture.h"
 #include "csi.h"
 #include "dmarx.h"
@@ -219,6 +222,9 @@ struct rkisp_device {
 	struct media_device media_dev;
 	struct v4l2_async_notifier notifier;
 	struct rkisp_sensor_info *active_sensor;
+	struct v4l2_subdev *cif_input_bound_sd;
+	struct v4l2_subdev __rcu *cif_input_sd;
+	spinlock_t cif_input_lock;
 	struct rkisp_sensor_info sensors[RKISP_MAX_SENSOR];
 	int num_sensors;
 	struct rkisp_isp_subdev isp_sdev;
@@ -320,6 +326,13 @@ struct rkisp_device {
 	u8 unite_index;
 	u8 unite_div;
 };
+
+void rkisp_bind_cif_input_sd(struct rkisp_device *dev,
+			     struct v4l2_subdev *sd);
+void rkisp_set_cif_input_sd(struct rkisp_device *dev,
+			    struct v4l2_subdev *sd);
+void rkisp_unbind_cif_input_sd(struct rkisp_device *dev,
+			       struct v4l2_subdev *sd);
 
 void rkisp_vicap_hw_link(struct rkisp_device *dev, int on);
 void rkisp_online_update_reg(struct rkisp_device *dev, bool is_init, bool is_reset);

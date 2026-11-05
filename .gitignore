@@ -175,3 +175,22 @@ sphinx_*/
 *.dtb*
 *.scr
 extboot*
+
+# DLCVCAM local build / test artifacts (not sources)
+/bad_packages/
+*.img.sha256
+*.img.dlcvcam.json   # legacy; no longer generated
+/boot-rk3576-*.img
+
+# local worktree junk
+kernel_backup/
+scripts/__pycache__/
+trigger
+*.bak.*
+
+# local IMX296 verification dumps / build logs (not sources)
+/IMX296_verify_*/
+/IMX296_2h_*/
+/IMX296_user_*/
+/IMX296_build_*.log
+/dist/

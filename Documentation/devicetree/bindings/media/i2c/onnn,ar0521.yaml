@@ -13,6 +13,13 @@ description: |-
   The AR0521 is a raw CMOS image sensor with MIPI CSI-2 and
   I2C-compatible control interface.
 
+  Some modules provide their own supplies and a local crystal. In that
+  case vaa-supply, vdd-supply, vdd_io-supply and clocks are optional.
+  When clocks is omitted the driver uses a 27 MHz default for PLL math
+  (AND9573 Table 5 RAW10 Full). Do not put clock-frequency on the
+  sensor node; describe a fixed-clock and reference it from clocks if
+  the rate must be explicit.
+
 properties:
   compatible:
     const: onnn,ar0521
@@ -22,25 +29,99 @@ properties:
 
   clocks:
     maxItems: 1
+    description:
+      External input clock (extclk). Optional on modules with an
+      on-board crystal; enable is then a no-op.
 
   clock-names:
     const: extclk
 
   vaa-supply:
     description:
-      Definition of the regulator used as analog (2.7 V) voltage supply.
+      Analog (2.7 V) voltage supply. Optional when the module is
+      self-powered.
 
   vdd-supply:
     description:
-      Definition of the regulator used as digital core (1.2 V) voltage supply.
+      Digital core (1.2 V) voltage supply. Optional when the module is
+      self-powered.
 
   vdd_io-supply:
     description:
-      Definition of the regulator used as digital I/O (1.8 V) voltage supply.
+      Digital I/O (1.8 V) voltage supply. Optional when the module is
+      self-powered.
 
   reset-gpios:
     description: reset GPIO, usually active low
     maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  pinctrl-names:
+    minItems: 1
+    maxItems: 2
+
+  pinctrl-0: true
+  pinctrl-1: true
+
+  pwms:
+    maxItems: 1
+    description:
+      Single-shot PWM connected to the sensor TRIGGER / GPIO0 pin.
+
+  pwm-names:
+    const: trigger
+
+  rockchip,camera-module-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Rockchip camera module index used by RKMODULE_GET_MODULE_INFO.
+
+  rockchip,camera-module-facing:
+    $ref: /schemas/types.yaml#/definitions/string
+    enum:
+      - back
+      - front
+
+  rockchip,camera-module-name:
+    $ref: /schemas/types.yaml#/definitions/string
+
+  rockchip,camera-module-lens-name:
+    $ref: /schemas/types.yaml#/definitions/string
+
+  trigger-mode:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: |
+      Default operating mode:
+        0 = FREE_RUN
+        1 = TRIGGER_ONE_SHOT (AND9573 slave / GRR)
+
+  rockchip,trigger-pulse-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Software-trigger PWM high pulse width in microseconds. Idle is
+      low; the sensor starts a frame on the rising edge.
+
+  light-source-gpios:
+    maxItems: 1
+    description: Host GPIO that drives the illumination source.
+
+  light-source-active-level:
+    $ref: /schemas/types.yaml#/definitions/string
+    enum:
+      - low
+      - high
+
+  light-source-exposure-advance-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Microseconds to turn the light source on before the trigger pulse.
+
+  light-source-exposure-off-delay-us:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Microseconds to keep the light source on after the trigger pulse.
 
   port:
     $ref: /schemas/graph.yaml#/$defs/port-base
@@ -72,11 +153,6 @@ properties:
 required:
   - compatible
   - reg
-  - clocks
-  - clock-names
-  - vaa-supply
-  - vdd-supply
-  - vdd_io-supply
   - port
 
 additionalProperties: false
@@ -84,7 +160,13 @@ additionalProperties: false
 examples:
   - |
     #include <dt-bindings/gpio/gpio.h>
-    #include <dt-bindings/clock/imx6qdl-clock.h>
+
+    ar0521_extclk: ar0521-extclk {
+            compatible = "fixed-clock";
+            #clock-cells = <0>;
+            clock-frequency = <27000000>;
+            clock-output-names = "ar0521_extclk";
+    };
 
     i2c {
             #address-cells = <1>;
@@ -95,12 +177,9 @@ examples:
                     reg = <0x36>;
                     pinctrl-names = "default";
                     pinctrl-0 = <&pinctrl_mipi_camera>;
-                    clocks = <&clks IMX6QDL_CLK_CKO>;
+                    clocks = <&ar0521_extclk>;
                     clock-names = "extclk";
                     reset-gpios = <&gpio1 7 GPIO_ACTIVE_LOW>;
-                    vaa-supply = <&reg_2p7v>;
-                    vdd-supply = <&reg_1p2v>;
-                    vdd_io-supply = <&reg_1p8v>;
 
                     port {
                            mipi_camera_to_mipi_csi2: endpoint {
